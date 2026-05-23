@@ -243,6 +243,19 @@ func TestInjectOpenCodeTermuxAlsoMergesOpenPetsMCP(t *testing.T) {
 	if !strings.Contains(text, `"--backend"`) || !strings.Contains(text, `"termux"`) {
 		t.Fatal("opencode.json openpets mcp entry missing --backend termux")
 	}
+	if !strings.Contains(text, `"instructions"`) || !strings.Contains(text, `OPENPETS.md`) {
+		t.Fatalf("opencode.json missing OPENPETS.md instruction reference; got:\n%s", text)
+	}
+
+	instructionPath := filepath.Join(home, ".config", "opencode", "OPENPETS.md")
+	instructionContent, err := os.ReadFile(instructionPath)
+	if err != nil {
+		t.Fatalf("ReadFile(OPENPETS.md) error = %v", err)
+	}
+	instructionText := string(instructionContent)
+	if !strings.Contains(instructionText, "<!-- OPENPETS:START -->") || !strings.Contains(instructionText, "<!-- OPENPETS:END -->") {
+		t.Fatal("OPENPETS.md missing managed marker block")
+	}
 }
 
 func TestInjectOpenClawMergesContext7UnderMCPDotServersAndMigratesLegacyMCPServers(t *testing.T) {
