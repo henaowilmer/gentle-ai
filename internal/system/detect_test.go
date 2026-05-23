@@ -11,6 +11,7 @@ func TestIsSupportedOS(t *testing.T) {
 		{name: "darwin is supported", goos: "darwin", want: true},
 		{name: "linux is supported", goos: "linux", want: true},
 		{name: "windows is supported", goos: "windows", want: true},
+		{name: "android is supported", goos: "android", want: true},
 	}
 
 	for _, tc := range tests {
@@ -206,6 +207,10 @@ func TestDetectLinuxDistroMatrix(t *testing.T) {
 }
 
 func TestResolvePlatformProfileMatrix(t *testing.T) {
+	t.Setenv("PREFIX", "")
+	t.Setenv("TERMUX_VERSION", "")
+	t.Setenv("TERMUX_APP_PID", "")
+
 	tests := []struct {
 		name          string
 		goos          string
@@ -277,6 +282,14 @@ func TestResolvePlatformProfileMatrix(t *testing.T) {
 			wantSupported: true,
 		},
 		{
+			name:          "android without termux env is unsupported",
+			goos:          "android",
+			wantOS:        "android",
+			wantPM:        "",
+			wantDistro:    "",
+			wantSupported: false,
+		},
+		{
 			name:          "linux without os-release is unsupported",
 			goos:          "linux",
 			osRelease:     "",
@@ -341,9 +354,65 @@ func TestGoAvailableInPlatformProfile(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			profile := resolvePlatformProfile("linux", "ID=ubuntu\nID_LIKE=debian\n", tc.tools)
 			if profile.GoAvailable != tc.wantGoAvail {
-				t.Fatalf("GoAvailable = %v, want %v", profile.GoAvailable, tc.wantGoAvail)
+			t.Fatalf("GoAvailable = %v, want %v", profile.GoAvailable, tc.wantGoAvail)
 			}
 		})
+	}
+}
+
+func TestResolvePlatformProfileAndroidTermux(t *testing.T) {
+	t.Setenv("PREFIX", "/data/data/com.termux/files/usr")
+
+	profile := resolvePlatformProfile("android", "", nil)
+	if profile.OS != "android" {
+		t.Fatalf("OS = %q, want android", profile.OS)
+	}
+	if profile.LinuxDistro != LinuxDistroTermux {
+		t.Fatalf("LinuxDistro = %q, want %q", profile.LinuxDistro, LinuxDistroTermux)
+	}
+	if profile.PackageManager != "pkg" {
+		t.Fatalf("PackageManager = %q, want pkg", profile.PackageManager)
+	}
+	if !profile.Supported {
+		t.Fatalf("Supported = false, want true")
+	}
+}
+
+func TestResolvePlatformProfileTermuxWithNoOsRelease(t *testing.T) {
+	t.Setenv("PREFIX", "/data/data/com.termux/files/usr")
+
+	profile := resolvePlatformProfile("linux", "", nil)
+	if profile.OS != "linux" {
+		t.Fatalf("OS = %q, want linux", profile.OS)
+	}
+	if profile.LinuxDistro != LinuxDistroTermux {
+		t.Fatalf("LinuxDistro = %q, want %q", profile.LinuxDistro, LinuxDistroTermux)
+	}
+	if profile.PackageManager != "pkg" {
+		t.Fatalf("PackageManager = %q, want pkg", profile.PackageManager)
+	}
+	if !profile.Supported {
+		t.Fatalf("Supported = false, want true")
+	}
+}
+
+func TestResolvePlatformProfilePrefersOsReleaseOverTermuxEnv(t *testing.T) {
+	t.Setenv("PREFIX", "/data/data/com.termux/files/usr")
+
+	profile := resolvePlatformProfile("linux", "ID=ubuntu\nID_LIKE=debian\n", nil)
+	if profile.LinuxDistro != LinuxDistroUbuntu {
+		t.Fatalf("LinuxDistro = %q, want %q", profile.LinuxDistro, LinuxDistroUbuntu)
+	}
+	if profile.PackageManager != "apt" {
+		t.Fatalf("PackageManager = %q, want apt", profile.PackageManager)
+	}
+}
+
+func TestDetectNpmWritableTermuxAlwaysTrue(t *testing.T) {
+	t.Setenv("PREFIX", "/data/data/com.termux/files/usr")
+
+	if !detectNpmWritable("/no/such/home") {
+		t.Fatalf("detectNpmWritable() = false, want true on termux")
 	}
 }
 

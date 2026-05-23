@@ -31,6 +31,7 @@ const (
 	LinuxDistroDebian  = "debian"
 	LinuxDistroArch    = "arch"
 	LinuxDistroFedora  = "fedora"
+	LinuxDistroTermux  = "termux"
 )
 
 type DetectionResult struct {
@@ -41,7 +42,7 @@ type DetectionResult struct {
 }
 
 func IsSupportedOS(goos string) bool {
-	return goos == "darwin" || goos == "linux" || goos == "windows"
+	return goos == "darwin" || goos == "linux" || goos == "windows" || goos == "android"
 }
 
 func Detect(ctx context.Context) (DetectionResult, error) {
@@ -69,6 +70,10 @@ func Detect(ctx context.Context) (DetectionResult, error) {
 // detectNpmWritable checks if npm's global prefix is under the user's home
 // directory (nvm, fnm, volta, etc.), meaning sudo is not needed for global installs.
 func detectNpmWritable(homeDir string) bool {
+	if isTermuxEnvironment() {
+		return true
+	}
+
 	out, err := exec.Command("npm", "config", "get", "prefix").Output()
 	if err != nil {
 		return false
@@ -128,6 +133,13 @@ func resolvePlatformProfile(goos, linuxOSRelease string, tools map[string]ToolSt
 		profile.Supported = true
 		return profile
 	case "linux":
+		if strings.TrimSpace(linuxOSRelease) == "" && isTermuxEnvironment() {
+			profile.LinuxDistro = LinuxDistroTermux
+			profile.PackageManager = "pkg"
+			profile.Supported = true
+			return profile
+		}
+
 		distro := detectLinuxDistro(linuxOSRelease)
 		profile.LinuxDistro = distro
 
@@ -158,10 +170,36 @@ func resolvePlatformProfile(goos, linuxOSRelease string, tools map[string]ToolSt
 		profile.PackageManager = "winget"
 		profile.Supported = true
 		return profile
+	case "android":
+		if isTermuxEnvironment() {
+			profile.LinuxDistro = LinuxDistroTermux
+			profile.PackageManager = "pkg"
+			profile.Supported = true
+			return profile
+		}
+		profile.Supported = false
+		return profile
 	default:
 		profile.Supported = false
 		return profile
 	}
+}
+
+func isTermuxEnvironment() bool {
+	prefix := strings.ToLower(strings.TrimSpace(os.Getenv("PREFIX")))
+	if strings.Contains(prefix, "com.termux") {
+		return true
+	}
+
+	if strings.TrimSpace(os.Getenv("TERMUX_VERSION")) != "" {
+		return true
+	}
+
+	if strings.TrimSpace(os.Getenv("TERMUX_APP_PID")) != "" {
+		return true
+	}
+
+	return false
 }
 
 func detectLinuxDistro(linuxOSRelease string) string {

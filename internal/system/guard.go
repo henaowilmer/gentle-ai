@@ -18,7 +18,7 @@ func EnsureSupportedOS(goos string) error {
 		return nil
 	}
 
-	return fmt.Errorf("%w: only macOS, Linux, and Windows are supported (detected %s)", ErrUnsupportedOS, goos)
+	return fmt.Errorf("%w: only macOS, Linux, Windows, and Android (Termux) are supported (detected %s)", ErrUnsupportedOS, goos)
 }
 
 func EnsureSupportedPlatform(profile PlatformProfile) error {
@@ -27,7 +27,7 @@ func EnsureSupportedPlatform(profile PlatformProfile) error {
 	}
 
 	if profile.OS == "linux" && !profile.Supported {
-		return fmt.Errorf("%w: Linux support is limited to Ubuntu/Debian, Arch, and Fedora/RHEL family (detected %s)", ErrUnsupportedLinuxDistro, profile.LinuxDistro)
+		return fmt.Errorf("%w: Linux support is limited to Ubuntu/Debian, Arch, Fedora/RHEL family, and Termux (detected %s)", ErrUnsupportedLinuxDistro, profile.LinuxDistro)
 	}
 
 	return nil
