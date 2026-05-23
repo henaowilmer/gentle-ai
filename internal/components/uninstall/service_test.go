@@ -675,3 +675,76 @@ func TestComponentOperationsSDD_CodexRemovesSkillRegistryHook(t *testing.T) {
 		t.Fatalf("unrelated hooks should be preserved:\n%s", text)
 	}
 }
+
+func TestContext7OperationsOpenCodeRemovesOpenPetsTermuxMCPEntry(t *testing.T) {
+	homeDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	svc, err := NewService(homeDir, workspaceDir, "dev")
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	adapter, ok := svc.registry.Get(model.AgentOpenCode)
+	if !ok {
+		t.Fatal("openCode adapter not found in registry")
+	}
+
+	settingsPath := adapter.SettingsPath(homeDir)
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(settings dir) error = %v", err)
+	}
+
+	initial := []byte(`{
+	  "mcp": {
+	    "context7": {
+	      "type": "remote",
+	      "url": "https://mcp.context7.com/mcp",
+	      "enabled": true
+	    },
+	    "openpets": {
+	      "type": "local",
+	      "command": ["npx", "-y", "@open-pets/cli@latest", "mcp", "--backend", "termux"],
+	      "enabled": true
+	    },
+	    "custom": {
+	      "type": "local",
+	      "command": ["custom-mcp"]
+	    }
+	  }
+	}`)
+	if err := os.WriteFile(settingsPath, initial, 0o644); err != nil {
+		t.Fatalf("WriteFile(settings) error = %v", err)
+	}
+
+	ops := context7Operations(adapter, homeDir)
+	for _, op := range ops {
+		if _, _, err := op.apply(op.path); err != nil {
+			t.Fatalf("op.apply(%q) error = %v", op.path, err)
+		}
+	}
+
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(settings) error = %v", err)
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("json.Unmarshal(settings) error = %v", err)
+	}
+
+	mcpMap, ok := root["mcp"].(map[string]any)
+	if !ok {
+		t.Fatalf("mcp object missing or invalid: %#v", root["mcp"])
+	}
+	if _, exists := mcpMap["context7"]; exists {
+		t.Fatalf("context7 entry should be removed: %#v", mcpMap)
+	}
+	if _, exists := mcpMap["openpets"]; exists {
+		t.Fatalf("openpets entry should be removed: %#v", mcpMap)
+	}
+	if _, exists := mcpMap["custom"]; !exists {
+		t.Fatalf("custom entry should be preserved: %#v", mcpMap)
+	}
+}

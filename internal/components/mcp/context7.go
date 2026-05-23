@@ -16,6 +16,11 @@ var defaultContext7OverlayJSON = []byte(fmt.Sprintf("{\n  \"mcpServers\": {\n   
 // deep merge into OpenCode/KiloCode's strict MCP schema.
 var openCodeContext7OverlayJSON = []byte("{\n  \"mcp\": {\n    \"context7\": {\n      \"__replace__\": {\n        \"type\": \"remote\",\n        \"url\": \"https://mcp.context7.com/mcp\",\n        \"enabled\": true\n      }\n    }\n  }\n}\n")
 
+// openCodeOpenPetsTermuxOverlayJSON configures OpenPets MCP for Termux.
+// Uses the explicit global npm dist entry to avoid shebang/env edge cases in
+// Termux wrappers while still routing notifications through Termux:API.
+var openCodeOpenPetsTermuxOverlayJSON = []byte("{\n  \"mcp\": {\n    \"openpets\": {\n      \"type\": \"local\",\n      \"command\": [\"node\", \"/data/data/com.termux/files/usr/lib/node_modules/@open-pets/cli/dist/index.js\", \"mcp\", \"--backend\", \"termux\"],\n      \"enabled\": true\n    }\n  }\n}\n")
+
 // openClawContext7OverlayJSON is the OpenClaw openclaw.json overlay.
 // OpenClaw rejects top-level mcpServers and expects MCP entries under
 // mcp.servers.
@@ -51,6 +56,12 @@ func DefaultContext7OverlayJSON() []byte {
 func OpenCodeContext7OverlayJSON() []byte {
 	content := make([]byte, len(openCodeContext7OverlayJSON))
 	copy(content, openCodeContext7OverlayJSON)
+	return content
+}
+
+func OpenCodeOpenPetsTermuxOverlayJSON() []byte {
+	content := make([]byte, len(openCodeOpenPetsTermuxOverlayJSON))
+	copy(content, openCodeOpenPetsTermuxOverlayJSON)
 	return content
 }
 

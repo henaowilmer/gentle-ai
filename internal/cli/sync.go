@@ -588,6 +588,8 @@ func (s componentSyncStep) Run() error {
 		return nil
 
 	case model.ComponentContext7:
+		restoreEnv := withTermuxOpenPetsEnvForSync(s.agents)
+		defer restoreEnv()
 		for _, adapter := range adapters {
 			res, err := mcp.Inject(s.homeDir, adapter)
 			if err != nil {

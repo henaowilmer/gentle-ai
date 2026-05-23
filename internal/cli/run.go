@@ -49,7 +49,9 @@ type InstallResult struct {
 
 var (
 	osUserHomeDir       = os.UserHomeDir
+	osLookupEnv         = os.LookupEnv
 	osSetenv            = os.Setenv
+	osUnsetenv          = os.Unsetenv
 	osStat              = os.Stat
 	runCommand          = executeCommand
 	cmdLookPath         = exec.LookPath
@@ -735,6 +737,8 @@ func (s componentApplyStep) Run() error {
 		}
 		return nil
 	case model.ComponentContext7:
+		restoreEnv := withTermuxOpenPetsEnvForInstall(s.profile, s.agents)
+		defer restoreEnv()
 		for _, adapter := range adapters {
 			if _, err := mcp.Inject(s.homeDir, adapter); err != nil {
 				return fmt.Errorf("inject context7 for %q: %w", adapter.Agent(), err)
@@ -1399,6 +1403,69 @@ func containsAgent(agents []model.AgentID, target model.AgentID) bool {
 			return true
 		}
 	}
+	return false
+}
+
+const termuxOpenPetsEnvKey = "GENTLE_AI_TERMUX_OPENPETS"
+
+func withTermuxOpenPetsEnvForInstall(profile system.PlatformProfile, agentIDs []model.AgentID) func() {
+	if profile.LinuxDistro != system.LinuxDistroTermux {
+		return func() {}
+	}
+	if !containsAgent(agentIDs, model.AgentOpenCode) {
+		return func() {}
+	}
+
+	previous, existed := osLookupEnv(termuxOpenPetsEnvKey)
+	if err := osSetenv(termuxOpenPetsEnvKey, "1"); err != nil {
+		return func() {}
+	}
+
+	return func() {
+		if existed {
+			_ = osSetenv(termuxOpenPetsEnvKey, previous)
+			return
+		}
+		_ = osUnsetenv(termuxOpenPetsEnvKey)
+	}
+}
+
+func withTermuxOpenPetsEnvForSync(agentIDs []model.AgentID) func() {
+	if !isTermuxShellEnvironment() {
+		return func() {}
+	}
+	if !containsAgent(agentIDs, model.AgentOpenCode) {
+		return func() {}
+	}
+
+	previous, existed := osLookupEnv(termuxOpenPetsEnvKey)
+	if err := osSetenv(termuxOpenPetsEnvKey, "1"); err != nil {
+		return func() {}
+	}
+
+	return func() {
+		if existed {
+			_ = osSetenv(termuxOpenPetsEnvKey, previous)
+			return
+		}
+		_ = osUnsetenv(termuxOpenPetsEnvKey)
+	}
+}
+
+func isTermuxShellEnvironment() bool {
+	prefix := strings.ToLower(strings.TrimSpace(os.Getenv("PREFIX")))
+	if strings.Contains(prefix, "com.termux") {
+		return true
+	}
+
+	if strings.TrimSpace(os.Getenv("TERMUX_VERSION")) != "" {
+		return true
+	}
+
+	if strings.TrimSpace(os.Getenv("TERMUX_APP_PID")) != "" {
+		return true
+	}
+
 	return false
 }
 

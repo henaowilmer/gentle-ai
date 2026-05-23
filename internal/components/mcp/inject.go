@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
@@ -114,6 +115,18 @@ func injectMergeIntoSettings(homeDir string, adapter agents.Adapter) (InjectionR
 	overlay := DefaultContext7OverlayJSON()
 	if adapter.Agent() == model.AgentOpenCode || adapter.Agent() == model.AgentKilocode {
 		overlay = OpenCodeContext7OverlayJSON()
+	}
+	if adapter.Agent() == model.AgentOpenCode && isTermuxOpenPetsEnabled() {
+		overlay, err := filemerge.MergeJSONObjects(overlay, OpenCodeOpenPetsTermuxOverlayJSON())
+		if err != nil {
+			return InjectionResult{}, err
+		}
+		settingsWrite, err := mergeJSONFile(settingsPath, overlay)
+		if err != nil {
+			return InjectionResult{}, err
+		}
+
+		return InjectionResult{Changed: settingsWrite.Changed, Files: []string{settingsPath}}, nil
 	}
 	if adapter.Agent() == model.AgentOpenClaw {
 		return injectOpenClawMergeIntoSettings(settingsPath)
@@ -245,4 +258,19 @@ var osReadFile = func(path string) ([]byte, error) {
 	}
 
 	return content, nil
+}
+
+func isTermuxOpenPetsEnabled() bool {
+	value := os.Getenv("GENTLE_AI_TERMUX_OPENPETS")
+	if strings.TrimSpace(value) == "" {
+		return false
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
