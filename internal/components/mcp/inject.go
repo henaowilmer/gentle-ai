@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
@@ -60,16 +61,35 @@ func injectMergeIntoSettings(homeDir string, adapter agents.Adapter) (InjectionR
 		overlay = OpenCodeContext7OverlayJSON()
 	}
 	if adapter.Agent() == model.AgentOpenCode && isTermuxOpenPetsEnabled() {
-		overlay, err := filemerge.MergeJSONObjects(overlay, OpenCodeOpenPetsTermuxOverlayJSON())
-		if err != nil {
-			return InjectionResult{}, err
-		}
-		settingsWrite, err := mergeJSONFile(settingsPath, overlay)
+		instructionPath := filepath.Join(homeDir, ".config", "opencode", "OPENPETS.md")
+		instructionWrite, err := filemerge.WriteFileAtomic(instructionPath, OpenCodeOpenPetsInstructionMarkdown(), 0o644)
 		if err != nil {
 			return InjectionResult{}, err
 		}
 
-		return InjectionResult{Changed: settingsWrite.Changed, Files: []string{settingsPath}}, nil
+		overlay, err := filemerge.MergeJSONObjects(overlay, OpenCodeOpenPetsTermuxOverlayJSON())
+		if err != nil {
+			return InjectionResult{}, err
+		}
+
+		baseJSON, err := osReadFile(settingsPath)
+		if err != nil {
+			return InjectionResult{}, err
+		}
+		merged, err := filemerge.MergeJSONObjects(baseJSON, overlay)
+		if err != nil {
+			return InjectionResult{}, err
+		}
+		withInstructions, err := appendInstructionPath(merged, instructionPath)
+		if err != nil {
+			return InjectionResult{}, err
+		}
+		settingsWrite, err := filemerge.WriteFileAtomic(settingsPath, withInstructions, 0o644)
+		if err != nil {
+			return InjectionResult{}, err
+		}
+
+		return InjectionResult{Changed: settingsWrite.Changed || instructionWrite.Changed, Files: []string{settingsPath, instructionPath}}, nil
 	}
 	if adapter.Agent() == model.AgentOpenClaw {
 		return injectOpenClawMergeIntoSettings(settingsPath)
@@ -216,4 +236,40 @@ func isTermuxOpenPetsEnabled() bool {
 	default:
 		return false
 	}
+}
+
+func appendInstructionPath(raw []byte, instructionPath string) ([]byte, error) {
+	root := map[string]any{}
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &root); err != nil {
+			return nil, err
+		}
+	}
+
+	current, exists := root["instructions"]
+	if !exists {
+		root["instructions"] = []any{instructionPath}
+	} else {
+		list, ok := current.([]any)
+		if !ok {
+			return nil, fmt.Errorf("settings field \"instructions\" is not an array")
+		}
+		for _, item := range list {
+			if s, ok := item.(string); ok && s == instructionPath {
+				encoded, err := json.MarshalIndent(root, "", "  ")
+				if err != nil {
+					return nil, err
+				}
+				return append(encoded, '\n'), nil
+			}
+		}
+		root["instructions"] = append(list, instructionPath)
+	}
+
+	encoded, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	return append(encoded, '\n'), nil
 }

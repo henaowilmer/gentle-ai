@@ -19,6 +19,8 @@ var openCodeContext7OverlayJSON = []byte("{\n  \"mcp\": {\n    \"context7\": {\n
 // Termux wrappers while still routing notifications through Termux:API.
 var openCodeOpenPetsTermuxOverlayJSON = []byte("{\n  \"mcp\": {\n    \"openpets\": {\n      \"type\": \"local\",\n      \"command\": [\"node\", \"/data/data/com.termux/files/usr/lib/node_modules/@open-pets/cli/dist/index.js\", \"mcp\", \"--backend\", \"termux\"],\n      \"enabled\": true\n    }\n  }\n}\n")
 
+var openCodeOpenPetsInstructionMarkdown = []byte("<!-- OPENPETS:START -->\n## OpenPets\nOpenPets MCP tools may be available.\nUse OpenPets as a short visible status channel for meaningful coding progress:\n- Use openpets_say only for brief, user-facing, non-sensitive status updates.\n- Do not include code, logs, secrets, URLs, file paths, prompts, or private data.\n- Use openpets_react for small visual progress changes.\n- Use openpets_status only when checking availability or the targeted pet.\n- Do not spam every internal step.\n<!-- OPENPETS:END -->\n")
+
 // openClawContext7OverlayJSON is the OpenClaw openclaw.json overlay.
 // OpenClaw rejects top-level mcpServers and expects MCP entries under
 // mcp.servers.
@@ -56,6 +58,12 @@ func OpenCodeContext7OverlayJSON() []byte {
 func OpenCodeOpenPetsTermuxOverlayJSON() []byte {
 	content := make([]byte, len(openCodeOpenPetsTermuxOverlayJSON))
 	copy(content, openCodeOpenPetsTermuxOverlayJSON)
+	return content
+}
+
+func OpenCodeOpenPetsInstructionMarkdown() []byte {
+	content := make([]byte, len(openCodeOpenPetsInstructionMarkdown))
+	copy(content, openCodeOpenPetsInstructionMarkdown)
 	return content
 }
 

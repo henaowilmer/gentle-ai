@@ -2,6 +2,7 @@ package uninstall
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -618,8 +619,15 @@ func TestContext7OperationsOpenCodeRemovesOpenPetsTermuxMCPEntry(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll(settings dir) error = %v", err)
 	}
+	instructionPath := filepath.Join(homeDir, ".config", "opencode", "OPENPETS.md")
+  	if err := os.MkdirAll(filepath.Dir(instructionPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(OPENPETS.md dir) error = %v", err)
+	}
+	if err := os.WriteFile(instructionPath, []byte("managed"), 0o644); err != nil {
+		t.Fatalf("WriteFile(OPENPETS.md) error = %v", err)
+	}
 
-	initial := []byte(`{
+	initial := []byte(fmt.Sprintf(`{
 	  "mcp": {
 	    "context7": {
 	      "type": "remote",
@@ -635,8 +643,12 @@ func TestContext7OperationsOpenCodeRemovesOpenPetsTermuxMCPEntry(t *testing.T) {
 	      "type": "local",
 	      "command": ["custom-mcp"]
 	    }
-	  }
-	}`)
+	  },
+	  "instructions": [
+	    "/tmp/keep.md",
+	    %q
+	  ]
+	}`, instructionPath))
 	if err := os.WriteFile(settingsPath, initial, 0o644); err != nil {
 		t.Fatalf("WriteFile(settings) error = %v", err)
 	}
@@ -670,5 +682,19 @@ func TestContext7OperationsOpenCodeRemovesOpenPetsTermuxMCPEntry(t *testing.T) {
 	}
 	if _, exists := mcpMap["custom"]; !exists {
 		t.Fatalf("custom entry should be preserved: %#v", mcpMap)
+	}
+
+	instructionsRaw, ok := root["instructions"].([]any)
+	if !ok {
+		t.Fatalf("instructions should remain an array: %#v", root["instructions"])
+	}
+	if len(instructionsRaw) != 1 {
+		t.Fatalf("instructions length = %d, want 1; got %#v", len(instructionsRaw), instructionsRaw)
+	}
+	if got, _ := instructionsRaw[0].(string); got != "/tmp/keep.md" {
+		t.Fatalf("instructions should preserve non-openpets entry, got %#v", instructionsRaw)
+	}
+	if _, err := os.Stat(instructionPath); !os.IsNotExist(err) {
+		t.Fatalf("OPENPETS.md should be removed; stat err = %v", err)
 	}
 }

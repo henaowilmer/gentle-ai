@@ -659,7 +659,11 @@ func context7Targets(adapter agents.Adapter, homeDir string) []string {
 	case model.StrategySeparateMCPFiles:
 		return []string{adapter.MCPConfigPath(homeDir, "context7")}
 	case model.StrategyMergeIntoSettings, model.StrategyMCPConfigFile:
-		return []string{adapter.MCPConfigPath(homeDir, "context7")}
+		targets := []string{adapter.MCPConfigPath(homeDir, "context7")}
+		if adapter.Agent() == model.AgentOpenCode {
+			targets = append(targets, filepath.Join(homeDir, ".config", "opencode", "OPENPETS.md"))
+		}
+		return targets
 	default:
 		return nil
 	}
@@ -676,6 +680,8 @@ func context7Operations(adapter agents.Adapter, homeDir string) []operation {
 			return []operation{
 				rewriteJSONFile(path, jsonPath{"mcp", "context7"}),
 				rewriteJSONFile(path, jsonPath{"mcp", "openpets"}),
+				rewriteJSONInstructionsWithout(path, filepath.Join(homeDir, ".config", "opencode", "OPENPETS.md")),
+				removeFile(filepath.Join(homeDir, ".config", "opencode", "OPENPETS.md")),
 			}
 		}
 		return []operation{rewriteJSONFile(path, jsonPath{"mcpServers", "context7"})}
@@ -691,6 +697,75 @@ func context7Operations(adapter agents.Adapter, homeDir string) []operation {
 		}
 	default:
 		return nil
+	}
+}
+
+func rewriteJSONInstructionsWithout(path, instructionPath string) operation {
+	return operation{
+		typeID: opRewriteFile,
+		path:   path,
+		apply: func(path string) (bool, bool, error) {
+			raw, err := readManagedFile(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return false, false, nil
+				}
+				return false, false, fmt.Errorf("read json file %q: %w", path, err)
+			}
+
+			root := map[string]any{}
+			if err := json.Unmarshal(raw, &root); err != nil {
+				return false, false, fmt.Errorf("clean json file %q: %w", path, err)
+			}
+
+			value, exists := root["instructions"]
+			if !exists {
+				return false, false, nil
+			}
+
+			entries, ok := value.([]any)
+			if !ok {
+				return false, false, fmt.Errorf("clean json file %q: settings field \"instructions\" is not an array", path)
+			}
+
+			filtered := make([]any, 0, len(entries))
+			for _, entry := range entries {
+				s, ok := entry.(string)
+				if ok && s == instructionPath {
+					continue
+				}
+				filtered = append(filtered, entry)
+			}
+
+			if len(filtered) == len(entries) {
+				return false, false, nil
+			}
+
+			if len(filtered) == 0 {
+				delete(root, "instructions")
+			} else {
+				root["instructions"] = filtered
+			}
+
+			updated, err := json.MarshalIndent(root, "", "  ")
+			if err != nil {
+				return false, false, fmt.Errorf("clean json file %q: %w", path, err)
+			}
+			updated = append(updated, '\n')
+
+			if jsonIsEmptyObject(updated) {
+				if err := removeFileIfExists(path); err != nil {
+					return false, false, err
+				}
+				return true, true, nil
+			}
+
+			_, err = filemerge.WriteFileAtomic(path, updated, 0o644)
+			if err != nil {
+				return false, false, err
+			}
+			return true, false, nil
+		},
 	}
 }
 
