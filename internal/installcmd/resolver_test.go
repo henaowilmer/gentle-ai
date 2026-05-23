@@ -178,6 +178,12 @@ func TestResolveDependencyInstall(t *testing.T) {
 			want:    CommandSequence{{"sudo", "dnf", "install", "-y", "somepkg"}},
 		},
 		{
+			name:    "termux resolves pkg command",
+			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroTermux, PackageManager: "pkg"},
+			dep:     "somepkg",
+			want:    CommandSequence{{"pkg", "install", "-y", "somepkg"}},
+		},
+		{
 			name:    "windows resolves winget command",
 			profile: system.PlatformProfile{OS: "windows", PackageManager: "winget"},
 			dep:     "somepkg",
@@ -355,6 +361,12 @@ func TestResolveAgentInstall(t *testing.T) {
 		{
 			name:    "opencode on fedora nvm skips sudo",
 			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroFedora, PackageManager: "dnf", NpmWritable: true},
+			agent:   model.AgentOpenCode,
+			want:    CommandSequence{{"npm", "install", "-g", "--ignore-scripts", "opencode-ai@" + versions.OpenCode}},
+		},
+		{
+			name:    "opencode on termux uses npm without sudo",
+			profile: system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroTermux, PackageManager: "pkg"},
 			agent:   model.AgentOpenCode,
 			want:    CommandSequence{{"npm", "install", "-g", "--ignore-scripts", "opencode-ai@" + versions.OpenCode}},
 		},
@@ -599,6 +611,16 @@ func TestResolveComponentInstall(t *testing.T) {
 				{"rm", "-rf", "/tmp/gentleman-guardian-angel"},
 				{"git", "clone", "https://github.com/Gentleman-Programming/gentleman-guardian-angel.git", "/tmp/gentleman-guardian-angel"},
 				{"bash", "/tmp/gentleman-guardian-angel/install.sh"},
+			},
+		},
+		{
+			name:      "gga on termux uses termux tmp path and install.sh",
+			profile:   system.PlatformProfile{OS: "linux", LinuxDistro: system.LinuxDistroTermux, PackageManager: "pkg"},
+			component: model.ComponentGGA,
+			want: CommandSequence{
+				{"rm", "-rf", "/data/data/com.termux/files/usr/tmp/gentleman-guardian-angel"},
+				{"git", "clone", "https://github.com/Gentleman-Programming/gentleman-guardian-angel.git", "/data/data/com.termux/files/usr/tmp/gentleman-guardian-angel"},
+				{"bash", "/data/data/com.termux/files/usr/tmp/gentleman-guardian-angel/install.sh"},
 			},
 		},
 		{
