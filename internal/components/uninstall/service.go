@@ -673,7 +673,10 @@ func context7Operations(adapter agents.Adapter, homeDir string) []operation {
 	case model.StrategyMergeIntoSettings:
 		path := adapter.SettingsPath(homeDir)
 		if adapter.Agent() == model.AgentOpenCode {
-			return []operation{rewriteJSONFile(path, jsonPath{"mcp", "context7"})}
+			return []operation{
+				rewriteJSONFile(path, jsonPath{"mcp", "context7"}),
+				rewriteJSONFile(path, jsonPath{"mcp", "openpets"}),
+			}
 		}
 		return []operation{rewriteJSONFile(path, jsonPath{"mcpServers", "context7"})}
 	case model.StrategyMCPConfigFile:

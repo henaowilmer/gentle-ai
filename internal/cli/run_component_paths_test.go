@@ -189,6 +189,18 @@ func TestComponentPathsContext7KimiIncludesMCPConfig(t *testing.T) {
 	}
 }
 
+func TestComponentPathsContext7OpenCodeIncludesSettingsPath(t *testing.T) {
+	home := t.TempDir()
+	adapters := resolveAdapters([]model.AgentID{model.AgentOpenCode})
+
+	paths := componentPaths(home, model.Selection{}, adapters, model.ComponentContext7)
+
+	want := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if !containsPath(paths, want) {
+		t.Fatalf("componentPaths(context7,opencode) missing %q\npaths=%v", want, paths)
+	}
+}
+
 // TestComponentPathsEngramCodexIncludesConfigTOML verifies that componentPaths
 // for ComponentEngram + Codex reports ~/.codex/config.toml as a backup target.
 func TestComponentPathsEngramCodexIncludesConfigTOML(t *testing.T) {

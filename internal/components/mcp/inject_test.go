@@ -70,6 +70,44 @@ func TestInjectOpenCodeMergesContext7AndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestInjectOpenCodeTermuxAlsoMergesOpenPetsMCP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GENTLE_AI_TERMUX_OPENPETS", "1")
+
+	first, err := Inject(home, opencodeAdapter())
+	if err != nil {
+		t.Fatalf("Inject() first error = %v", err)
+	}
+	if !first.Changed {
+		t.Fatalf("Inject() first changed = false")
+	}
+
+	second, err := Inject(home, opencodeAdapter())
+	if err != nil {
+		t.Fatalf("Inject() second error = %v", err)
+	}
+	if second.Changed {
+		t.Fatalf("Inject() second changed = true")
+	}
+
+	configPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(opencode.json) error = %v", err)
+	}
+
+	text := string(config)
+	if !strings.Contains(text, `"openpets"`) {
+		t.Fatal("opencode.json missing openpets mcp entry")
+	}
+	if !strings.Contains(text, `"/data/data/com.termux/files/usr/lib/node_modules/@open-pets/cli/dist/index.js"`) {
+		t.Fatal("opencode.json openpets mcp entry missing global open-pets cli dist path")
+	}
+	if !strings.Contains(text, `"--backend"`) || !strings.Contains(text, `"termux"`) {
+		t.Fatal("opencode.json openpets mcp entry missing --backend termux")
+	}
+}
+
 func TestInjectOpenClawMergesContext7UnderMCPDotServersAndMigratesLegacyMCPServers(t *testing.T) {
 	home := t.TempDir()
 	adapter := openclawAdapter()
