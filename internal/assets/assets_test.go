@@ -23,7 +23,10 @@ func TestAllEmbeddedAssetsAreReadable(t *testing.T) {
 		"claude/commands/sdd-init.md",
 		"claude/commands/sdd-new.md",
 		"claude/commands/sdd-onboard.md",
+		"claude/commands/sdd-status.md",
 		"claude/commands/sdd-verify.md",
+		"claude/agents/sdd-init.md",
+		"claude/agents/sdd-onboard.md",
 
 		// OpenCode agent files
 		"opencode/persona-gentleman.md",
@@ -38,6 +41,7 @@ func TestAllEmbeddedAssetsAreReadable(t *testing.T) {
 		"opencode/commands/sdd-init.md",
 		"opencode/commands/sdd-new.md",
 		"opencode/commands/sdd-onboard.md",
+		"opencode/commands/sdd-status.md",
 		"opencode/commands/sdd-verify.md",
 		"opencode/plugins/background-agents.ts",
 
@@ -107,6 +111,7 @@ func TestAllEmbeddedAssetsAreReadable(t *testing.T) {
 		"skills/_shared/engram-convention.md",
 		"skills/_shared/openspec-convention.md",
 		"skills/_shared/sdd-phase-common.md",
+		"skills/_shared/sdd-status-contract.md",
 
 		// Foundation skills
 		"skills/go-testing/SKILL.md",
@@ -156,8 +161,8 @@ func TestOpenCodeEmbeddedAssetLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir(opencode/commands) error = %v", err)
 	}
-	if len(commandEntries) != 9 {
-		t.Fatalf("opencode commands count = %d, want 9", len(commandEntries))
+	if len(commandEntries) != 10 {
+		t.Fatalf("opencode commands count = %d, want 10", len(commandEntries))
 	}
 
 	pluginEntries, err := FS.ReadDir("opencode/plugins")
@@ -214,6 +219,48 @@ func TestModelVariantsPluginContract(t *testing.T) {
 	}
 }
 
+// TestBackgroundAgentsVariantForwarding verifies that background-agents.ts reads
+// the "variant" field from the agent config and forwards it as a top-level
+// sibling of "model" in the session.prompt body (issue #606).
+//
+// Contract rules:
+//  1. resolveAgentModel must read variant from the agent config entry.
+//  2. The session.prompt call must spread variant at the body's top level,
+//     NOT nest it inside the model object.
+//  3. The model object must only contain providerID and modelID.
+func TestBackgroundAgentsVariantForwarding(t *testing.T) {
+	source, err := Read("opencode/plugins/background-agents.ts")
+	if err != nil {
+		t.Fatalf("Read(background-agents.ts) error = %v", err)
+	}
+	src := string(source)
+
+	// resolveAgentModel must read variant from the agent config object.
+	if !strings.Contains(src, `variant?: string`) {
+		t.Errorf("background-agents.ts resolveAgentModel must declare variant in the agent config type")
+	}
+	if !strings.Contains(src, `variant`) {
+		t.Errorf("background-agents.ts must reference variant")
+	}
+
+	// The return type of resolveAgentModel must carry variant.
+	if !strings.Contains(src, "AgentModelResolution") {
+		t.Errorf("background-agents.ts must use a named resolution type (AgentModelResolution) that includes variant")
+	}
+
+	// variant must be forwarded at the TOP LEVEL of the session.prompt body,
+	// not nested inside the model object.
+	if !strings.Contains(src, `variant: agentModel.variant`) {
+		t.Errorf("background-agents.ts must spread variant as a top-level body field (variant: agentModel.variant)")
+	}
+
+	// The model object in session.prompt must only contain providerID and modelID —
+	// variant must NOT be nested inside it.
+	if strings.Contains(src, `model: agentModel`) {
+		t.Errorf("background-agents.ts must not spread agentModel directly into model — variant must remain top-level, not nested in model")
+	}
+}
+
 func TestClaudeEmbeddedAssetLayout(t *testing.T) {
 	entries, err := FS.ReadDir("claude")
 	if err != nil {
@@ -225,7 +272,7 @@ func TestClaudeEmbeddedAssetLayout(t *testing.T) {
 		seen[entry.Name()] = true
 	}
 
-	for _, name := range []string{"commands", "engram-protocol.md", "persona-gentleman.md", "sdd-orchestrator.md"} {
+	for _, name := range []string{"agents", "commands", "engram-protocol.md", "persona-gentleman.md", "sdd-orchestrator.md"} {
 		if !seen[name] {
 			t.Fatalf("claude embedded assets missing %q", name)
 		}
@@ -235,8 +282,16 @@ func TestClaudeEmbeddedAssetLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir(claude/commands) error = %v", err)
 	}
-	if len(commandEntries) != 9 {
-		t.Fatalf("claude commands count = %d, want 9", len(commandEntries))
+	if len(commandEntries) != 10 {
+		t.Fatalf("claude commands count = %d, want 10", len(commandEntries))
+	}
+
+	agentEntries, err := FS.ReadDir("claude/agents")
+	if err != nil {
+		t.Fatalf("ReadDir(claude/agents) error = %v", err)
+	}
+	if len(agentEntries) != 13 {
+		t.Fatalf("claude agents count = %d, want 13", len(agentEntries))
 	}
 }
 
@@ -255,9 +310,10 @@ func TestOpenCodeSDDOrchestratorRequiresSessionPreflight(t *testing.T) {
 		"Ask the user directly with a compact, numbered preflight prompt",
 		"Match the user's current language",
 		"Do NOT mix languages inside one preflight prompt",
-		"If the current language is Spanish, use the Spanish localized shape below verbatim",
+		"If the current language is Spanish, use the Spanish localized shape below as the neutral fallback",
+		"adapt only user-facing prose to that persona",
 		"translate user-facing prose to the user's current language",
-		"¿Querés ajustar algo o continuamos?",
+		"¿Quiere ajustar algo o continuamos?",
 		"B. Artefactos",
 		"D. Revisión",
 		"la estimación supera el presupuesto",
@@ -267,6 +323,10 @@ func TestOpenCodeSDDOrchestratorRequiresSessionPreflight(t *testing.T) {
 		"Never launch `sdd-apply` just because the user asked to implement a feature",
 		"In **Interactive** mode, between phases",
 		"Ask before launching the next phase",
+		"Interactive approval is phase-scoped",
+		"approve only the immediate next phase",
+		"Before the `sdd-propose` phase in interactive mode",
+		"proposal question round",
 	} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("opencode/sdd-orchestrator.md missing required preflight wording %q", required)
@@ -293,26 +353,33 @@ func TestOpenCodeSDDOrchestratorSpanishPreflightIsLocalized(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSDDFFHonorsInteractiveMode(t *testing.T) {
-	content := MustRead("opencode/commands/sdd-ff.md")
-
-	for _, forbidden := range []string{
-		"Present a combined summary after ALL phases complete (not between each one).",
+func TestSDDFFCommandsHonorInteractiveMode(t *testing.T) {
+	for _, path := range []string{
+		"opencode/commands/sdd-ff.md",
+		"claude/commands/sdd-ff.md",
 	} {
-		if strings.Contains(content, forbidden) {
-			t.Fatalf("opencode/commands/sdd-ff.md must not contain unqualified back-to-back planning instruction %q", forbidden)
-		}
-	}
+		t.Run(path, func(t *testing.T) {
+			content := MustRead(path)
 
-	for _, required := range []string{
-		"Honor the cached execution mode from SDD Session Preflight",
-		"In `interactive` mode: run only the next planning phase",
-		"Do not launch the following phase until the user confirms",
-		"In `auto` mode: run all planning phases back-to-back",
-	} {
-		if !strings.Contains(content, required) {
-			t.Fatalf("opencode/commands/sdd-ff.md missing interactive/auto guard wording %q", required)
-		}
+			for _, forbidden := range []string{
+				"Present a combined summary after ALL phases complete (not between each one).",
+			} {
+				if strings.Contains(content, forbidden) {
+					t.Fatalf("%s must not contain unqualified back-to-back planning instruction %q", path, forbidden)
+				}
+			}
+
+			for _, required := range []string{
+				"Honor the cached execution mode from SDD Session Preflight",
+				"In `interactive` mode: run only the next planning phase",
+				"Do not launch the following phase until the user confirms",
+				"In `auto` mode: run all planning phases back-to-back",
+			} {
+				if !strings.Contains(content, required) {
+					t.Fatalf("%s missing interactive/auto guard wording %q", path, required)
+				}
+			}
+		})
 	}
 }
 
@@ -656,7 +723,7 @@ func TestEmbeddedAssetCount(t *testing.T) {
 			continue
 		}
 		if entry.Name() == "_shared" {
-			for _, sharedFile := range []string{"persistence-contract.md", "engram-convention.md", "openspec-convention.md", "sdd-phase-common.md", "skill-resolver.md"} {
+			for _, sharedFile := range []string{"persistence-contract.md", "engram-convention.md", "openspec-convention.md", "sdd-phase-common.md", "sdd-status-contract.md", "skill-resolver.md"} {
 				sharedPath := "skills/_shared/" + sharedFile
 				if _, err := Read(sharedPath); err != nil {
 					t.Fatalf("shared directory missing %q: %v", sharedFile, err)
@@ -698,6 +765,51 @@ func TestSDDPhaseCommonEnforcesExecutorBoundary(t *testing.T) {
 	} {
 		if strings.Contains(content, forbidden) {
 			t.Fatalf("sdd-phase-common should not contain delegation instruction %q", forbidden)
+		}
+	}
+}
+
+func TestSDDStatusContractMatchesNativeShape(t *testing.T) {
+	content := MustRead("skills/_shared/sdd-status-contract.md")
+
+	for _, want := range []string{
+		"schemaName: gentle-ai.sdd-status",
+		"schemaVersion: 1",
+		"changeName: <change-name-or-null>",
+		"artifactStore: openspec",
+		"mode: repo-local",
+		"path: <absolute path to openspec>",
+		"changeRoot: <absolute path to openspec/changes/<change> or null>",
+		"completed: 0",
+		"pending: 0",
+		"allComplete: false",
+		"proposal: blocked | ready | all_done",
+		"specs: blocked | ready | all_done",
+		"design: blocked | ready | all_done",
+		"tasks: blocked | ready | all_done",
+		"relationships:",
+		"dependsOn: []",
+		"sameDomainActiveChanges: []",
+		"phaseInstructions:",
+		"blockedReasons: []",
+		"Manual fallback status MUST stay shape-compatible with native `gentle-ai.sdd-status` JSON",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("sdd-status-contract missing native-shape field %q", want)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"schemaName: spec-driven",
+		"root: <project-or-openspec-root>",
+		"changesDir: <openspec/changes or engram topic prefix>",
+		"complete: 0",
+		"remaining: 0",
+		"unchecked: []",
+		"warnings: []",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("sdd-status-contract contains legacy field %q", forbidden)
 		}
 	}
 }
@@ -765,8 +877,43 @@ func TestCommandsDoNotUseEchoNPwd(t *testing.T) {
 			path := dir + "/" + entry.Name()
 			content := MustRead(path)
 			if strings.Contains(content, forbidden) {
-				t.Errorf("%s contains banned pattern %q — use !`pwd` or !`basename \"$(pwd)\"` instead", path, forbidden)
+				t.Errorf("%s contains banned pattern %q — use a safer detection mechanism instead", path, forbidden)
 			}
+		}
+	}
+}
+
+// TestOpenCodeCommandsDetectWorkspaceAgentSide guards against parse-time shell
+// interpolation for the working directory in OpenCode command files. In
+// OpenCode Desktop (Electron), patterns like !pwd and !basename $(pwd) evaluate
+// against the Electron app data directory rather than the project workspace
+// (issue #74). Command files must instruct the agent to detect the workspace
+// via its bash tool (e.g. git rev-parse --show-toplevel) and treat that
+// returned path as authoritative.
+func TestOpenCodeCommandsDetectWorkspaceAgentSide(t *testing.T) {
+	forbiddenPatterns := []string{
+		"!`pwd`",
+		"!`basename \"$(pwd)\"`",
+	}
+	const requiredHint = "git rev-parse --show-toplevel"
+
+	entries, err := FS.ReadDir("opencode/commands")
+	if err != nil {
+		t.Fatalf("ReadDir(opencode/commands) error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		path := "opencode/commands/" + entry.Name()
+		content := MustRead(path)
+		for _, pat := range forbiddenPatterns {
+			if strings.Contains(content, pat) {
+				t.Errorf("%s contains banned shell interpolation %q — detect the workspace via the agent's bash tool instead (see #74)", path, pat)
+			}
+		}
+		if strings.Contains(content, "Working directory:") && !strings.Contains(content, requiredHint) {
+			t.Errorf("%s mentions \"Working directory:\" without the agent-side detection hint %q (see #74)", path, requiredHint)
 		}
 	}
 }

@@ -9,9 +9,11 @@ type Selection struct {
 	SDDMode                SDDModeID
 	SDDProfileStrategy     SDDProfileStrategyID
 	StrictTDD              bool
+	CodexMultiAgent        bool                        // deprecated: Codex now always writes features.multi_agent = true; retained for state/back-compat
 	ModelAssignments       map[string]ModelAssignment  // key = sub-agent name (e.g., "sdd-init")
 	ClaudeModelAssignments map[string]ClaudeModelAlias // key = phase name; value = opus|sonnet|haiku
-	KiroModelAssignments   map[string]ClaudeModelAlias // key = phase name; value = opus|sonnet|haiku (Kiro-only)
+	KiroModelAssignments   map[string]KiroModelAlias   // key = phase name; value = Kiro-native model alias
+	CodexModelAssignments  map[string]CodexEffort      // key = phase name; value = low|medium|high|xhigh
 	Profiles               []Profile                   // named SDD profiles to generate/update during sync
 	OpenCodePlugins        []OpenCodeCommunityPluginID // optional community OpenCode TUI plugins
 }
@@ -49,7 +51,8 @@ type SyncOverrides struct {
 	TargetAgents           []AgentID
 	ModelAssignments       map[string]ModelAssignment  // nil = no override; empty map = reset to defaults
 	ClaudeModelAssignments map[string]ClaudeModelAlias // nil = no override; empty map = reset to defaults
-	KiroModelAssignments   map[string]ClaudeModelAlias // nil = no override; empty map = reset to defaults
+	KiroModelAssignments   map[string]KiroModelAlias   // nil = no override; empty map = reset to defaults
+	CodexModelAssignments  map[string]CodexEffort      // nil = no override; empty map = reset to defaults
 	SDDMode                SDDModeID                   // "" = no override; when non-empty, overrides the sync's default SDD mode
 	SDDProfileStrategy     SDDProfileStrategyID        // "" = auto; otherwise explicit sync profile strategy
 	StrictTDD              *bool                       // nil = no override; non-nil = override strict TDD mode

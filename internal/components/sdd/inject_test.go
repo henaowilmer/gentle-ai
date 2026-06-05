@@ -12,6 +12,7 @@ import (
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/claude"
+	"github.com/gentleman-programming/gentle-ai/internal/agents/kilocode"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/kimi"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/openclaw"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/opencode"
@@ -22,6 +23,7 @@ import (
 )
 
 func claudeAdapter() agents.Adapter   { return claude.NewAdapter() }
+func kilocodeAdapter() agents.Adapter { return kilocode.NewAdapter() }
 func kimiAdapter() agents.Adapter     { return kimi.NewAdapter() }
 func openclawAdapter() agents.Adapter { return openclaw.NewAdapter() }
 func opencodeAdapter() agents.Adapter { return opencode.NewAdapter() }
@@ -34,6 +36,79 @@ func mockNoPackageManager(t *testing.T) {
 		return "", fmt.Errorf("not found")
 	}
 	t.Cleanup(func() { npmLookPath = orig })
+}
+
+func TestSDDOrchestratorAssetSelectionCoversSupportedAgents(t *testing.T) {
+	tests := []struct {
+		agent model.AgentID
+		want  string
+	}{
+		{model.AgentClaudeCode, "claude/sdd-orchestrator.md"},
+		{model.AgentOpenCode, "opencode/sdd-orchestrator.md"},
+		{model.AgentKilocode, "opencode/sdd-orchestrator.md"},
+		{model.AgentGeminiCLI, "gemini/sdd-orchestrator.md"},
+		{model.AgentCursor, "cursor/sdd-orchestrator.md"},
+		{model.AgentVSCodeCopilot, "generic/sdd-orchestrator.md"},
+		{model.AgentCodex, "codex/sdd-orchestrator.md"},
+		{model.AgentAntigravity, "antigravity/sdd-orchestrator.md"},
+		{model.AgentWindsurf, "windsurf/sdd-orchestrator.md"},
+		{model.AgentKimi, "kimi/sdd-orchestrator.md"},
+		{model.AgentQwenCode, "qwen/sdd-orchestrator.md"},
+		{model.AgentKiroIDE, "kiro/sdd-orchestrator.md"},
+		{model.AgentOpenClaw, "generic/sdd-orchestrator.md"},
+		{model.AgentPi, "generic/sdd-orchestrator.md"},
+		{model.AgentTrae, "generic/sdd-orchestrator.md"},
+	}
+
+	for _, tc := range tests {
+		t.Run(string(tc.agent), func(t *testing.T) {
+			if got := sddOrchestratorAsset(tc.agent); got != tc.want {
+				t.Fatalf("sddOrchestratorAsset(%q) = %q, want %q", tc.agent, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInjectOpenCodeAndKilocodeLanguageContractOutputs(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter agents.Adapter
+	}{
+		{name: "opencode", adapter: opencodeAdapter()},
+		{name: "kilocode", adapter: kilocodeAdapter()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			mockNoPackageManager(t)
+
+			if _, err := Inject(home, tc.adapter, model.SDDModeMulti); err != nil {
+				t.Fatalf("Inject() error = %v", err)
+			}
+
+			settingsPath := tc.adapter.SettingsPath(home)
+			content, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatalf("ReadFile(%q) error = %v", settingsPath, err)
+			}
+			text := string(content)
+
+			for _, required := range []string{
+				"Generated technical artifacts default to English",
+				"Public/contextual comments follow the target context language",
+			} {
+				if !strings.Contains(text, required) {
+					t.Fatalf("%s generated settings missing language contract %q", tc.name, required)
+				}
+			}
+			for _, leak := range []string{"elegí", "Respondé", "¿Querés ajustar algo o continuamos?"} {
+				if strings.Contains(text, leak) {
+					t.Fatalf("%s generated settings contains language leak %q", tc.name, leak)
+				}
+			}
+		})
+	}
 }
 
 func TestInjectClaudeWritesSectionMarkers(t *testing.T) {
@@ -133,7 +208,7 @@ func TestInjectClaudeWritesCommandFiles(t *testing.T) {
 
 	expectedCommands := []string{
 		"sdd-apply.md", "sdd-archive.md", "sdd-continue.md", "sdd-explore.md",
-		"sdd-ff.md", "sdd-init.md", "sdd-new.md", "sdd-onboard.md", "sdd-verify.md",
+		"sdd-ff.md", "sdd-init.md", "sdd-new.md", "sdd-onboard.md", "sdd-status.md", "sdd-verify.md",
 	}
 	for _, name := range expectedCommands {
 		path := filepath.Join(home, ".claude", "commands", name)
@@ -444,8 +519,12 @@ func TestInjectOpenCodeMigratesPreservedLegacyOrchestratorPromptReferences(t *te
 		"ask the localized user-facing preflight prompt above and STOP",
 		"Match the user's current language",
 		"Do NOT mix languages inside one preflight prompt",
-		"If the current language is Spanish, use the Spanish localized shape below verbatim",
+		"If the current language is Spanish, use the Spanish localized shape below as the neutral fallback",
+		"adapt only user-facing prose to that persona",
 		"pause after each delegated phase returns",
+		"approve only the immediate next phase",
+		"proposal question round",
+		"business rules, implications, impact, edge cases",
 		"Never launch `sdd-apply` just because the user asked to implement a feature",
 	} {
 		if !strings.Contains(text, wanted) {
@@ -491,17 +570,100 @@ func TestInjectOpenCodeMigratesPartialPreflightPrompt(t *testing.T) {
 	for _, wanted := range []string{
 		"# Custom prompt",
 		"Before continuing with SDD, choose one option per group.",
-		"Antes de continuar con SDD, elegí una opción por grupo.",
+		"Antes de continuar con SDD, elija una opción por grupo.",
 		"### SDD Session Preflight (HARD GATE)",
 		"openspec/config.yaml",
 		"Match the user's current language",
 		"Do NOT mix languages inside one preflight prompt",
-		"If the current language is Spanish, use the Spanish localized shape below verbatim",
+		"If the current language is Spanish, use the Spanish localized shape below as the neutral fallback",
+		"adapt only user-facing prose to that persona",
 		"pause after each delegated phase returns",
+		"approve only the immediate next phase",
+		"proposal question round",
+		"business rules, implications, impact, edge cases",
 		"Never launch `sdd-apply` just because the user asked to implement a feature",
 	} {
 		if !strings.Contains(text, wanted) {
 			t.Fatalf("opencode.json missing migrated partial prompt content %q", wanted)
+		}
+	}
+}
+
+func TestInjectOpenCodeReplacesFullyFormedStalePreflightPrompt(t *testing.T) {
+	home := t.TempDir()
+	mockNoPackageManager(t)
+
+	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(settings dir) error = %v", err)
+	}
+
+	stalePrompt := `# Custom prompt
+
+<!-- gentle-ai:sdd-session-preflight-migration -->
+### SDD Session Preflight (HARD GATE)
+
+Before executing ANY SDD command or natural-language SDD request, ensure this session has an explicit preflight.
+
+Match the user's current language.
+Do NOT mix languages inside one preflight prompt.
+If the current language is Spanish, use the Spanish localized shape below verbatim.
+Before continuing with SDD, choose one option per group.
+Antes de continuar con SDD, elegí una opción por grupo.
+Respondé con "usar recomendado" o con códigos como: A1, B1, C1, D1.
+Hard gate rules:
+- openspec/config.yaml does NOT satisfy session preflight.
+- Never launch ` + "`sdd-apply`" + ` just because the user asked to implement a feature.
+- In interactive mode, pause after each delegated phase returns and ask: "¿Querés ajustar algo o continuamos?".
+<!-- /gentle-ai:sdd-session-preflight-migration -->
+`
+	seed := `{
+  "agent": {
+    "gentle-orchestrator": {
+      "mode": "primary",
+      "prompt": ` + strconv.Quote(stalePrompt) + `
+    }
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(seed), 0o644); err != nil {
+		t.Fatalf("WriteFile(opencode.json) error = %v", err)
+	}
+
+	_, err := Inject(home, opencodeAdapter(), model.SDDModeMulti, InjectOptions{
+		PreserveOpenCodeOrchestratorPrompt: true,
+	})
+	if err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	settingsBytes, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(opencode.json) error = %v", err)
+	}
+	text := string(settingsBytes)
+	for _, leak := range []string{
+		"elegí",
+		"Respondé",
+		"¿Querés ajustar algo o continuamos?",
+		"If the current language is Spanish, use the Spanish localized shape below verbatim",
+	} {
+		if strings.Contains(text, leak) {
+			t.Fatalf("opencode.json retained stale preserved prompt leak %q", leak)
+		}
+	}
+	for _, wanted := range []string{
+		"# Custom prompt",
+		"If the current language is Spanish, use the Spanish localized shape below as the neutral fallback",
+		"adapt only user-facing prose to that persona",
+		"Antes de continuar con SDD, elija una opción por grupo.",
+		"Responda con",
+		"for Spanish neutral fallback ask",
+		"approve only the immediate next phase",
+		"proposal question round",
+		"business rules, implications, impact, edge cases",
+	} {
+		if !strings.Contains(text, wanted) {
+			t.Fatalf("opencode.json missing refreshed preserved prompt content %q", wanted)
 		}
 	}
 }
@@ -1349,9 +1511,9 @@ func TestInjectOpenCodeMultiMode(t *testing.T) {
 		t.Fatalf("agent key has unexpected type: %T", agentRaw)
 	}
 
-	// Multi overlay must contain gentle-orchestrator + 10 sub-agents = 11 agents.
-	if len(agentMap) != 11 {
-		t.Fatalf("agent count = %d, want 11", len(agentMap))
+	// Multi overlay must contain gentle-orchestrator + 10 sub-agents + 3 JD agents = 14 agents.
+	if len(agentMap) != 14 {
+		t.Fatalf("agent count = %d, want 14", len(agentMap))
 	}
 
 	// Verify gentle-orchestrator is present.
@@ -1437,6 +1599,60 @@ func TestInjectOpenCodeMultiModeIdempotent(t *testing.T) {
 	}
 	if string(content) != assets.MustRead("opencode/plugins/background-agents.ts") {
 		t.Fatal("background-agents.ts changed after second multi inject")
+	}
+}
+
+func TestInjectOpenCodeDefaultsShareDisabledForSDDSubagents(t *testing.T) {
+	home := t.TempDir()
+	mockNoPackageManager(t)
+
+	if _, err := Inject(home, opencodeAdapter(), "multi"); err != nil {
+		t.Fatalf("Inject(multi) error = %v", err)
+	}
+
+	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	content, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(opencode.json) error = %v", err)
+	}
+
+	root := map[string]any{}
+	if err := json.Unmarshal(content, &root); err != nil {
+		t.Fatalf("Unmarshal(opencode.json) error = %v", err)
+	}
+	if got, _ := root["share"].(string); got != "disabled" {
+		t.Fatalf("share = %q, want %q", got, "disabled")
+	}
+}
+
+func TestInjectOpenCodePreservesExplicitShareMode(t *testing.T) {
+	home := t.TempDir()
+	mockNoPackageManager(t)
+
+	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(settings dir) error = %v", err)
+	}
+	seed := `{"$schema":"https://opencode.ai/config.json","share":"manual"}`
+	if err := os.WriteFile(settingsPath, []byte(seed), 0o644); err != nil {
+		t.Fatalf("WriteFile(opencode.json) error = %v", err)
+	}
+
+	if _, err := Inject(home, opencodeAdapter(), "multi"); err != nil {
+		t.Fatalf("Inject(multi) error = %v", err)
+	}
+
+	content, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(opencode.json) error = %v", err)
+	}
+
+	root := map[string]any{}
+	if err := json.Unmarshal(content, &root); err != nil {
+		t.Fatalf("Unmarshal(opencode.json) error = %v", err)
+	}
+	if got, _ := root["share"].(string); got != "manual" {
+		t.Fatalf("share = %q, want %q", got, "manual")
 	}
 }
 
@@ -2083,6 +2299,70 @@ func TestInjectOpenCodeMultiModeUsesRootModelForUnassignedAgents(t *testing.T) {
 	}
 }
 
+// TestInjectOpenCodeMultiModeJDAgentsExcludedFromRootModel verifies that JD
+// agents are NOT injected with the root model when no explicit assignment
+// exists, even though SDD agents do receive root model propagation.
+// This preserves model diversity — JD agents inherit the runtime default
+// instead of being coupled to the root model.
+func TestInjectOpenCodeMultiModeJDAgentsExcludedFromRootModel(t *testing.T) {
+	home := t.TempDir()
+	mockNoPackageManager(t)
+
+	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"model":"openai/gpt-5"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(opencode.json) error = %v", err)
+	}
+
+	if _, err := Inject(home, opencodeAdapter(), "multi"); err != nil {
+		t.Fatalf("Inject(multi) error = %v", err)
+	}
+
+	content, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(opencode.json) error = %v", err)
+	}
+
+	root := map[string]any{}
+	if err := json.Unmarshal(content, &root); err != nil {
+		t.Fatalf("Unmarshal(opencode.json) error = %v", err)
+	}
+
+	agentMap, ok := root["agent"].(map[string]any)
+	if !ok {
+		t.Fatal("opencode.json missing agent map")
+	}
+
+	// JD agents must NOT have a "model" field when only root model is set.
+	// They should be excluded from root model propagation to preserve diversity.
+	for _, jd := range []string{"jd-judge-a", "jd-judge-b", "jd-fix-agent"} {
+		agentDef, ok := agentMap[jd].(map[string]any)
+		if !ok {
+			t.Fatalf("JD agent %q not found or wrong type", jd)
+		}
+		if _, hasModel := agentDef["model"]; hasModel {
+			t.Fatalf("%s must NOT have model field (JD agents excluded from root model propagation for diversity), got model=%v", jd, agentDef["model"])
+		}
+	}
+
+	// Sanity: SDD agents should still get the root model (not excluded).
+	for _, phase := range []string{"sdd-init", "sdd-verify"} {
+		agentDef, ok := agentMap[phase].(map[string]any)
+		if !ok {
+			t.Fatalf("phase %q agent not found or wrong type", phase)
+		}
+		m, hasModel := agentDef["model"]
+		if !hasModel {
+			t.Fatalf("%s should have model field (root model should propagate)", phase)
+		}
+		if m != "openai/gpt-5" {
+			t.Fatalf("%s model = %q, want %q", phase, m, "openai/gpt-5")
+		}
+	}
+}
+
 func TestInjectOpenCodeMultiModeExplicitAssignmentsDoNotSpread(t *testing.T) {
 	home := t.TempDir()
 	mockNoPackageManager(t)
@@ -2315,14 +2595,14 @@ func TestInjectOpenCodeMultiModeExistingAgentWithNoModelIsNotTouched(t *testing.
 }
 
 // ---------------------------------------------------------------------------
-// Fix 1: sdd-phase-common.md — all 4 shared files written to disk
+// Fix 1: shared SDD support files written to disk
 // ---------------------------------------------------------------------------
 
-// TestInjectWritesAllFourSharedFilesToDisk verifies that all four _shared
-// convention files (including the recently-added sdd-phase-common.md) are
+// TestInjectWritesAllSharedFilesToDisk verifies that all _shared
+// convention files (including SDD phase/status contracts) are
 // actually written to the agent's skills/_shared/ directory during Inject().
 // This is a disk-level test; assets_test.go only checks the embedded FS.
-func TestInjectWritesAllFourSharedFilesToDisk(t *testing.T) {
+func TestInjectWritesAllSharedFilesToDisk(t *testing.T) {
 	home := t.TempDir()
 
 	result, err := Inject(home, opencodeAdapter(), "")
@@ -2339,6 +2619,7 @@ func TestInjectWritesAllFourSharedFilesToDisk(t *testing.T) {
 		"engram-convention.md",
 		"openspec-convention.md",
 		"sdd-phase-common.md",
+		"sdd-status-contract.md",
 		"skill-resolver.md",
 	}
 
@@ -2368,7 +2649,7 @@ func TestInjectWritesAllFourSharedFilesToDisk(t *testing.T) {
 }
 
 // TestInjectSharedDirCreatedWithAllFiles verifies that Inject() creates the
-// _shared directory when it does not exist and writes all four files into it.
+// _shared directory when it does not exist and writes all shared files into it.
 func TestInjectSharedDirCreatedWithAllFiles(t *testing.T) {
 	home := t.TempDir()
 
@@ -2392,7 +2673,7 @@ func TestInjectSharedDirCreatedWithAllFiles(t *testing.T) {
 		names[e.Name()] = true
 	}
 
-	for _, want := range []string{"persistence-contract.md", "engram-convention.md", "openspec-convention.md", "sdd-phase-common.md", "skill-resolver.md"} {
+	for _, want := range []string{"persistence-contract.md", "engram-convention.md", "openspec-convention.md", "sdd-phase-common.md", "sdd-status-contract.md", "skill-resolver.md"} {
 		if !names[want] {
 			t.Errorf("_shared directory missing %q after Inject()", want)
 		}
@@ -3389,8 +3670,9 @@ func TestSDDOrchestratorAssetSelection(t *testing.T) {
 		{agent: model.AgentWindsurf, want: "windsurf/sdd-orchestrator.md"},
 		{agent: model.AgentCursor, want: "cursor/sdd-orchestrator.md"},
 		{agent: model.AgentQwenCode, want: "qwen/sdd-orchestrator.md"},
-		{agent: model.AgentClaudeCode, want: "generic/sdd-orchestrator.md"},
+		{agent: model.AgentClaudeCode, want: "claude/sdd-orchestrator.md"},
 		{agent: model.AgentOpenCode, want: "opencode/sdd-orchestrator.md"},
+		{agent: model.AgentKilocode, want: "opencode/sdd-orchestrator.md"},
 		{agent: model.AgentVSCodeCopilot, want: "generic/sdd-orchestrator.md"},
 	}
 
@@ -3460,8 +3742,8 @@ func TestInjectCodexWritesSDDOrchestratorAndSkills(t *testing.T) {
 		t.Fatal("Inject(codex) changed = false")
 	}
 
-	// Verify SDD orchestrator was injected into agents.md.
-	promptPath := filepath.Join(home, ".codex", "agents.md")
+	// Verify SDD orchestrator was injected into AGENTS.md.
+	promptPath := filepath.Join(home, ".codex", "AGENTS.md")
 	content, readErr := os.ReadFile(promptPath)
 	if readErr != nil {
 		t.Fatalf("ReadFile(%q) error = %v", promptPath, readErr)
@@ -3945,7 +4227,7 @@ func TestInjectKiroFallsBackToClaudeModelAssignmentsWhenKiroMapUnset(t *testing.
 		phase string
 		want  string
 	}{
-		{phase: "sdd-design", want: "model: claude-opus-4.6"},
+		{phase: "sdd-design", want: "model: claude-opus-4.8"},
 		{phase: "sdd-archive", want: "model: claude-haiku-4.5"},
 		// Unspecified phase should use default sonnet.
 		{phase: "sdd-spec", want: "model: claude-sonnet-4.6"},
@@ -3997,7 +4279,7 @@ func TestInjectKiroBalancedPresetAssignmentsEndToEnd(t *testing.T) {
 		if !ok {
 			alias = balance["default"]
 		}
-		wantModelLine := "model: " + model.KiroModelID(alias)
+		wantModelLine := "model: " + model.KiroModelID(model.KiroModelAlias(alias))
 
 		path := filepath.Join(home, ".kiro", "agents", phase+".md")
 		content, readErr := os.ReadFile(path)
@@ -4026,8 +4308,8 @@ func TestInjectKiroModelAssignmentsTakePrecedenceOverClaude(t *testing.T) {
 	// Conflicting values: Kiro says opus for sdd-design, Claude says haiku.
 	// Kiro-specific assignments MUST take precedence.
 	opts := InjectOptions{
-		KiroModelAssignments: map[string]model.ClaudeModelAlias{
-			"sdd-design": model.ClaudeModelOpus,
+		KiroModelAssignments: map[string]model.KiroModelAlias{
+			"sdd-design": model.KiroModelOpus,
 		},
 		ClaudeModelAssignments: map[string]model.ClaudeModelAlias{
 			"sdd-design": model.ClaudeModelHaiku,
@@ -4045,8 +4327,8 @@ func TestInjectKiroModelAssignmentsTakePrecedenceOverClaude(t *testing.T) {
 		t.Fatalf("ReadFile(sdd-design) error = %v", readErr)
 	}
 
-	wantKiro := "model: " + model.KiroModelID(model.ClaudeModelOpus)
-	wantClaude := "model: " + model.KiroModelID(model.ClaudeModelHaiku)
+	wantKiro := "model: " + model.KiroModelID(model.KiroModelOpus)
+	wantClaude := "model: " + model.KiroModelID(model.KiroModelHaiku)
 
 	if !strings.Contains(string(content), wantKiro) {
 		t.Fatalf("expected KiroModelAssignments to take precedence: want %q not found in file", wantKiro)
@@ -4835,5 +5117,140 @@ func TestEnsureClaudeSkillRegistryHookRejectsUnexpectedHookSchema(t *testing.T) 
 	}
 	if string(after) != string(original) {
 		t.Fatalf("settings were modified: %q", after)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Codex inject tests (T3.1)
+// ---------------------------------------------------------------------------
+
+func codexInjectAdapter() agents.Adapter {
+	// Import inline to avoid adding to the import block of existing file
+	// We use agents.NewAdapter to get the codex adapter.
+	a, err := agents.NewAdapter("codex")
+	if err != nil {
+		panic("agents.NewAdapter(codex): " + err.Error())
+	}
+	return a
+}
+
+func TestInject_CodexSubstitutesPhaseEfforts(t *testing.T) {
+	home := t.TempDir()
+	adapter := codexInjectAdapter()
+
+	opts := InjectOptions{
+		CodexModelAssignments: model.CodexModelPresetRecommended(),
+	}
+	result, err := Inject(home, adapter, "", opts)
+	if err != nil {
+		t.Fatalf("Inject(codex, Recommended) error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("Inject(codex, Recommended) changed = false, want true")
+	}
+
+	agentsMD, readErr := os.ReadFile(filepath.Join(home, ".codex", "AGENTS.md"))
+	if readErr != nil {
+		t.Fatalf("ReadFile(AGENTS.md) error = %v", readErr)
+	}
+	text := string(agentsMD)
+	if strings.Contains(text, "{{") {
+		t.Errorf("AGENTS.md contains unresolved placeholder '{{' after Inject:\n%s", text)
+	}
+	// Table should be present.
+	if !strings.Contains(text, "sdd-strong") {
+		t.Error("AGENTS.md missing sdd-strong tier row in rendered table")
+	}
+	if !strings.Contains(text, "sdd-mid") {
+		t.Error("AGENTS.md missing sdd-mid tier row")
+	}
+	if !strings.Contains(text, "sdd-cheap") {
+		t.Error("AGENTS.md missing sdd-cheap tier row")
+	}
+}
+
+func TestInject_CodexNoAssignmentsUsesRecommended(t *testing.T) {
+	home := t.TempDir()
+	adapter := codexInjectAdapter()
+
+	// No CodexModelAssignments → should use Recommended preset as fallback.
+	result, err := Inject(home, adapter, "")
+	if err != nil {
+		t.Fatalf("Inject(codex, nil opts) error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("Inject(codex, nil opts) changed = false")
+	}
+
+	agentsMD, readErr := os.ReadFile(filepath.Join(home, ".codex", "AGENTS.md"))
+	if readErr != nil {
+		t.Fatalf("ReadFile(AGENTS.md) error = %v", readErr)
+	}
+	text := string(agentsMD)
+	if strings.Contains(text, "{{") {
+		t.Errorf("AGENTS.md contains unresolved '{{' with nil assignments:\n%s", text)
+	}
+}
+
+func TestInject_CodexIdempotent(t *testing.T) {
+	home := t.TempDir()
+	adapter := codexInjectAdapter()
+	opts := InjectOptions{
+		CodexModelAssignments: model.CodexModelPresetRecommended(),
+	}
+
+	_, err := Inject(home, adapter, "", opts)
+	if err != nil {
+		t.Fatalf("first Inject(codex) error = %v", err)
+	}
+	second, err := Inject(home, adapter, "", opts)
+	if err != nil {
+		t.Fatalf("second Inject(codex) error = %v", err)
+	}
+	if second.Changed {
+		t.Error("second Inject(codex) Changed = true, want false (idempotent)")
+	}
+}
+
+func TestInject_NonCodexAdapterUnaffected(t *testing.T) {
+	// Kiro, Cursor, and Gemini adapters must not be affected by CodexModelAssignments.
+	adapters := []struct {
+		name    string
+		adapter agents.Adapter
+	}{
+		{"cursor", func() agents.Adapter {
+			a, _ := agents.NewAdapter("cursor")
+			return a
+		}()},
+		{"gemini", func() agents.Adapter {
+			a, _ := agents.NewAdapter("gemini-cli")
+			return a
+		}()},
+	}
+
+	for _, tc := range adapters {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			opts := InjectOptions{
+				CodexModelAssignments: model.CodexModelPresetRecommended(),
+			}
+			result, err := Inject(home, tc.adapter, "", opts)
+			if err != nil {
+				t.Fatalf("Inject(%s) error = %v", tc.name, err)
+			}
+			if !result.Changed {
+				t.Fatalf("Inject(%s) changed = false", tc.name)
+			}
+			// Non-codex adapters must produce no unresolved placeholders.
+			for _, f := range result.Files {
+				data, readErr := os.ReadFile(f)
+				if readErr != nil {
+					continue
+				}
+				if strings.Contains(string(data), "{{CODEX_PHASE_EFFORTS}}") {
+					t.Errorf("%s adapter file %q contains unresolved {{CODEX_PHASE_EFFORTS}}", tc.name, f)
+				}
+			}
+		})
 	}
 }

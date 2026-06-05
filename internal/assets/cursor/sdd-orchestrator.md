@@ -26,6 +26,15 @@ Available subagents (all installed in `~/.cursor/agents/`):
 
 Each subagent runs in its own context window and returns a **structured result**. Collect the result, update DAG state, and present the summary to the user before triggering the next phase.
 
+
+### Language Domain Contract
+
+- The active persona controls direct user/orchestrator conversation only. Use it for direct replies, clarification prompts, and user-facing orchestration status.
+- Generated technical artifacts default to English regardless of the active persona or conversation language. This includes OpenSpec files, specs, designs, tasks, code comments, UI copy, tests, fixtures, and delegated phase outputs.
+- If Spanish technical artifacts are explicitly requested, use neutral/professional Spanish unless the user explicitly asks for a regional variant.
+- Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; Spanish comments default to neutral/professional Spanish unless the user or target context clearly calls for regional tone.
+- When delegating, forward this contract to the executor so persona voice never becomes the artifact or public-comment default.
+
 ### Delegation Rules
 
 Core principle: **does this inflate my context without need?** If yes → delegate. If no → do it inline.
@@ -85,6 +94,7 @@ SDD is the structured planning layer for substantial changes.
 Skills (appear in autocomplete):
 - `/sdd-init` → initialize SDD context; detects stack, bootstraps persistence
 - `/sdd-explore <topic>` → investigate an idea; reads codebase, compares approaches; no files created
+- `/sdd-status [change]` → read-only structured status for active change, artifacts, tasks, and next action
 - `/sdd-apply [change]` → implement tasks in batches; checks off items as it goes
 - `/sdd-verify [change]` → validate implementation against specs; reports CRITICAL / WARNING / SUGGESTION
 - `/sdd-archive [change]` → close a change and persist final state in the active artifact store 
@@ -97,9 +107,13 @@ Meta-commands (type directly — orchestrator handles them, won't appear in auto
 
 `/sdd-new`, `/sdd-continue`, and `/sdd-ff` are meta-commands handled by YOU. Do NOT invoke them as skills. You orchestrate the subagent sequence yourself.
 
+### Native SDD Dispatcher Guard
+
+Before routing, continuing, applying, verifying, or archiving an SDD change, use the native dispatcher when `gentle-ai` is available: `gentle-ai sdd-continue [change] --cwd <repo>` or `gentle-ai sdd-status [change] --cwd <repo> --json --instructions`. Treat native status JSON as authoritative over prompt inference. Route only by `nextRecommended` and dependency states; never infer from free text. If `blockedReasons` is non-empty, do not proceed to apply, archive, or terminal work. If `nextRecommended` is `verify`, verification/remediation may run only to refresh evidence; if `nextRecommended` is `resolve-blockers`, report `blockedReasons` and stop. If the binary is unavailable, fall back to the existing prompt contract and manual status schema.
+
 ### SDD Init Guard (MANDATORY)
 
-Before executing ANY SDD command (`/sdd-new`, `/sdd-ff`, `/sdd-continue`, `/sdd-explore`, `/sdd-apply`, `/sdd-verify`, `/sdd-archive`), check if `sdd-init` has been run for this project:
+Before executing ANY SDD command (`/sdd-new`, `/sdd-ff`, `/sdd-continue`, `/sdd-explore`, `/sdd-status`, `/sdd-apply`, `/sdd-verify`, `/sdd-archive`), check if `sdd-init` has been run for this project:
 
 1. Search Engram: `mem_search(query: "sdd-init/{project}", project: "{project}")`
 2. If found → init was done, proceed normally
@@ -130,6 +144,10 @@ In **Interactive** mode, between phases:
 4. If the user gives feedback, incorporate it before running the next phase
 
 For this agent (inline subagents): phases already run with user visibility between invocations. **Interactive** is the default behavior — show results between subagent calls and ask before proceeding. **Automatic** means invoke subagents sequentially without pausing to ask between phases.
+
+Interactive approval is phase-scoped. Words like "continue", "dale", or "go on" approve only the immediate next phase, not the rest of the SDD pipeline. Do not treat a generated artifact as approved until the user has had a chance to review or explicitly delegate that review.
+
+Before the `sdd-propose` phase in interactive mode, offer the user a proposal question round instead of silently deciding whether the proposal is clear enough. Explain that the questions are meant to improve the PRD/proposal by uncovering business understanding, business rules, implications, impact, edge cases, and product tradeoffs. Prefer 3–5 concrete product questions per round, then summarize the resulting assumptions and ask whether the user wants to correct anything or run a second question round. Cover business/product/PRD decisions: business problem, target users and situations, business rules, product outcome, current-state gap, implications and impact, edge cases, decision gaps, first-slice scope boundaries, non-goals, product constraints, and business tradeoffs. Do not ask about test commands, PR shape, changed-line budget, or other harness mechanics at proposal time unless the user explicitly asks to discuss delivery.
 
 ### Artifact Store Mode
 
@@ -190,6 +208,17 @@ Read this table at session start (or before first delegation), cache it for the 
 | default | sonnet | Non-SDD general delegation |
 
 <!-- /gentle-ai:sdd-model-assignments -->
+
+### Sub-Agent Launch Deduplication (MANDATORY)
+
+Before invoking any subagent, check your in-session launch log:
+
+- Maintain a session-scoped list of `(phase, task-fingerprint)` pairs already invoked this turn.
+- The task fingerprint is a short hash or normalized summary of the instruction text (phase name + key artifact references).
+- If the same `(phase, task-fingerprint)` already appears in the list, **do NOT invoke again**. Emit exactly one invocation per distinct task.
+- After invoking, append the pair to the list.
+
+This prevents duplicate subagent invocations that cause "File X has been modified since it was last read" conflicts and waste tokens.
 
 ### Sub-Agent Launch Pattern
 

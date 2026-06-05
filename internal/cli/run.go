@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
+	codexagent "github.com/gentleman-programming/gentle-ai/internal/agents/codex"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/kimi"
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
@@ -119,7 +120,14 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		return result, fmt.Errorf("resolve user home directory: %w", err)
 	}
 
-	runtime, err := newInstallRuntime(homeDir, input.Selection, resolved, profile)
+	if input.Scope == ScopeGlobal {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: installing with --scope=global (default). Agent config files (system prompts, skills/, agents/, etc.)\n"+
+				"will be written to each selected agent's global config directory and will affect ALL workspaces for those agents on this machine.\n"+
+				"To install only into the current workspace, rerun with --scope=workspace.\n\n")
+	}
+
+	runtime, err := newInstallRuntime(homeDir, input.Scope, input.Selection, resolved, profile)
 	if err != nil {
 		return result, err
 	}
@@ -141,7 +149,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		return result, fmt.Errorf("execute install pipeline: %w", result.Execution.Err)
 	}
 
-	result.Verify = runPostApplyVerification(homeDir, runtime.workspaceDir, input.Selection, resolved)
+	result.Verify = runPostApplyVerification(homeDir, runtime.workspaceDir, input.Scope, input.Selection, resolved)
 	result.Verify = withPostInstallNotes(result.Verify, resolved)
 	if !result.Verify.Ready {
 		return result, fmt.Errorf("post-apply verification failed:\n%s", verify.RenderReport(result.Verify))
@@ -153,13 +161,26 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	for _, a := range input.Selection.Agents {
 		agentIDs = append(agentIDs, string(a))
 	}
-	// Non-fatal: a state write failure must not break an otherwise successful install.
-	_ = state.Write(homeDir, state.InstallState{
+
+	// When the user ran `gentle-ai install --agent X` (explicit agent flag),
+	// merge into the existing state so that previously installed agents and
+	// model assignments are preserved. A full install (no --agent flag) keeps
+	// overwrite semantics so the TUI selection is the source of truth.
+	newState := state.InstallState{
 		InstalledAgents:        agentIDs,
 		ClaudeModelAssignments: claudeAliasesToStrings(input.Selection.ClaudeModelAssignments),
+		KiroModelAssignments:   kiroAliasesToStrings(input.Selection.KiroModelAssignments),
 		ModelAssignments:       modelAssignmentsToState(input.Selection.ModelAssignments),
 		Persona:                string(input.Selection.Persona),
-	})
+	}
+	if len(flags.Agents) > 0 {
+		existing, readErr := state.Read(homeDir)
+		if readErr == nil {
+			newState = state.MergeAgents(existing, agentIDs)
+		}
+	}
+	// Non-fatal: a state write failure must not break an otherwise successful install.
+	_ = state.Write(homeDir, newState)
 
 	return result, nil
 }
@@ -245,6 +266,7 @@ func buildStagePlan(selection model.Selection, resolved planner.ResolvedPlan) pi
 type installRuntime struct {
 	homeDir      string
 	workspaceDir string
+	scope        InstallScope
 	selection    model.Selection
 	resolved     planner.ResolvedPlan
 	profile      system.PlatformProfile
@@ -256,7 +278,7 @@ type runtimeState struct {
 	manifest backup.Manifest
 }
 
-func newInstallRuntime(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (*installRuntime, error) {
+func newInstallRuntime(homeDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (*installRuntime, error) {
 	backupRoot := filepath.Join(homeDir, ".gentle-ai", "backups")
 	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create backup root directory %q: %w", backupRoot, err)
@@ -268,6 +290,7 @@ func newInstallRuntime(homeDir string, selection model.Selection, resolved plann
 	return &installRuntime{
 		homeDir:      homeDir,
 		workspaceDir: workspaceDir,
+		scope:        scope,
 		selection:    selection,
 		resolved:     resolved,
 		profile:      profile,
@@ -277,7 +300,7 @@ func newInstallRuntime(homeDir string, selection model.Selection, resolved plann
 }
 
 func (r *installRuntime) stagePlan() pipeline.StagePlan {
-	targets := backupTargets(r.homeDir, r.workspaceDir, r.selection, r.resolved)
+	targets := backupTargets(r.homeDir, r.workspaceDir, r.scope, r.selection, r.resolved)
 	prepare := []pipeline.Step{
 		checkDependenciesStep{id: "prepare:check-dependencies", profile: r.profile, homeDir: r.homeDir, selection: r.selection},
 		prepareBackupStep{
@@ -321,6 +344,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 			component:    component,
 			homeDir:      r.homeDir,
 			workspaceDir: r.workspaceDir,
+			scope:        r.scope,
 			agents:       r.resolved.Agents,
 			selection:    r.selection,
 			profile:      r.profile,
@@ -500,6 +524,7 @@ type componentApplyStep struct {
 	component    model.ComponentID
 	homeDir      string
 	workspaceDir string
+	scope        InstallScope
 	agents       []model.AgentID
 	selection    model.Selection
 	profile      system.PlatformProfile
@@ -574,7 +599,7 @@ func (s componentApplyStep) Run() error {
 			if adapter.Agent() == model.AgentOpenClaw {
 				_, err = engram.InjectWithPromptDir(s.homeDir, s.workspaceDir, adapter)
 			} else {
-				targetDir := componentInjectionDir(s.homeDir, s.workspaceDir, adapter)
+				targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
 				_, err = engram.Inject(targetDir, adapter)
 			}
 			if err != nil {
@@ -593,7 +618,7 @@ func (s componentApplyStep) Run() error {
 		return nil
 	case model.ComponentPersona:
 		for _, adapter := range adapters {
-			targetDir := componentInjectionDir(s.homeDir, s.workspaceDir, adapter)
+			targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
 			if _, err := persona.Inject(targetDir, adapter, s.selection.Persona); err != nil {
 				return fmt.Errorf("inject persona for %q: %w", adapter.Agent(), err)
 			}
@@ -608,11 +633,12 @@ func (s componentApplyStep) Run() error {
 		return nil
 	case model.ComponentSDD:
 		for _, adapter := range adapters {
-			targetDir := componentInjectionDir(s.homeDir, s.workspaceDir, adapter)
+			targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
 			opts := sdd.InjectOptions{
 				OpenCodeModelAssignments: s.selection.ModelAssignments,
 				ClaudeModelAssignments:   s.selection.ClaudeModelAssignments,
 				KiroModelAssignments:     s.selection.KiroModelAssignments,
+				CodexModelAssignments:    s.selection.CodexModelAssignments,
 				WorkspaceDir:             s.workspaceDir,
 				StrictTDD:                s.selection.StrictTDD,
 			}
@@ -627,7 +653,8 @@ func (s componentApplyStep) Run() error {
 			return nil
 		}
 		for _, adapter := range adapters {
-			if _, err := skills.Inject(s.homeDir, adapter, skillIDs); err != nil {
+			targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
+			if _, err := skills.Inject(targetDir, adapter, skillIDs); err != nil {
 				return fmt.Errorf("inject skills for %q: %w", adapter.Agent(), err)
 			}
 		}
@@ -737,13 +764,14 @@ func windowsGoCandidates() []string {
 
 // BuildRealStagePlan creates a StagePlan with real backup, agent install, and component apply steps.
 // It is used by both the CLI and TUI paths.
-func BuildRealStagePlan(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (pipeline.StagePlan, error) {
+// scope controls where agent config files are written (ScopeGlobal writes to homeDir, ScopeWorkspace writes to cwd).
+func BuildRealStagePlan(homeDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (pipeline.StagePlan, error) {
 	backupRoot := filepath.Join(homeDir, ".gentle-ai", "backups")
 	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
 		return pipeline.StagePlan{}, fmt.Errorf("create backup root directory %q: %w", backupRoot, err)
 	}
 
-	runtime, err := newInstallRuntime(homeDir, selection, resolved, profile)
+	runtime, err := newInstallRuntime(homeDir, scope, selection, resolved, profile)
 	if err != nil {
 		return pipeline.StagePlan{}, err
 	}
@@ -855,12 +883,12 @@ func selectedSkillIDs(selection model.Selection) []model.SkillID {
 	return skills.SkillsForPreset(selection.Preset)
 }
 
-func backupTargets(homeDir, workspaceDir string, selection model.Selection, resolved planner.ResolvedPlan) []string {
+func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan) []string {
 	paths := map[string]struct{}{}
 	adapters := resolveAdapters(resolved.Agents)
 
 	for _, component := range resolved.OrderedComponents {
-		for _, path := range componentPathsWithWorkspace(homeDir, workspaceDir, selection, adapters, component) {
+		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
 			paths[path] = struct{}{}
 		}
 	}
@@ -878,9 +906,13 @@ func componentPaths(homeDir string, selection model.Selection, adapters []agents
 }
 
 func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.Selection, adapters []agents.Adapter, component model.ComponentID) []string {
+	return componentPathsWithWorkspaceScoped(homeDir, workspaceDir, ScopeGlobal, selection, adapters, component)
+}
+
+func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, adapters []agents.Adapter, component model.ComponentID) []string {
 	paths := []string{}
 	for _, adapter := range adapters {
-		targetDir := componentPathDir(homeDir, workspaceDir, adapter, component)
+		targetDir := componentPathDirScoped(homeDir, workspaceDir, scope, adapter, component)
 		switch component {
 		case model.ComponentEngram:
 			switch adapter.MCPStrategy() {
@@ -907,6 +939,10 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 			case model.StrategyTOMLFile:
 				if p := adapter.MCPConfigPath(targetDir, "engram"); p != "" {
 					paths = append(paths, p)
+					// Track the gentle-ai SDD profile files written alongside
+					// the Codex config.toml so they are removed on uninstall.
+					codexHomeDir := filepath.Dir(p)
+					paths = append(paths, codexagent.SddProfilePaths(codexHomeDir)...)
 				}
 			}
 			if adapter.SystemPromptStrategy() == model.StrategyMarkdownSections {
@@ -951,6 +987,7 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 						filepath.Join(skillDir, "_shared", "engram-convention.md"),
 						filepath.Join(skillDir, "_shared", "openspec-convention.md"),
 						filepath.Join(skillDir, "_shared", "sdd-phase-common.md"),
+						filepath.Join(skillDir, "_shared", "sdd-status-contract.md"),
 						filepath.Join(skillDir, "_shared", "skill-resolver.md"),
 						filepath.Join(skillDir, "sdd-init", "SKILL.md"),
 						filepath.Join(skillDir, "sdd-explore", "SKILL.md"),
@@ -988,8 +1025,9 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 					paths = append(paths, p)
 				}
 			case model.StrategyTOMLFile:
-				// Codex uses TOML for Engram but Context7 is not injected via TOML.
-				// No path to report — Context7 injection is skipped for TOML agents.
+				if p := adapter.MCPConfigPath(homeDir, "context7"); p != "" {
+					paths = append(paths, p)
+				}
 			}
 		case model.ComponentPersona:
 			if selection.Persona == model.PersonaCustom {
@@ -1002,7 +1040,7 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 			if adapter.SupportsSystemPrompt() && adapter.SystemPromptStrategy() != model.StrategyJinjaModules {
 				paths = append(paths, adapter.SystemPromptFile(targetDir))
 			}
-			if selection.Persona == model.PersonaGentleman {
+			if isGentlemanConversationPersona(selection.Persona) {
 				if adapter.SupportsOutputStyles() {
 					paths = append(paths, adapter.OutputStyleDir(targetDir)+"/gentleman.md")
 					if p := adapter.SettingsPath(targetDir); p != "" {
@@ -1011,7 +1049,9 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 				}
 			}
 		case model.ComponentPermission:
-			if p := adapter.SettingsPath(homeDir); p != "" {
+			if adapter.Agent() == model.AgentCodex {
+				paths = append(paths, adapter.MCPConfigPath(homeDir, ""))
+			} else if p := adapter.SettingsPath(homeDir); p != "" {
 				paths = append(paths, p)
 			}
 		case model.ComponentGGA:
@@ -1047,10 +1087,18 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 }
 
 func componentInjectionDir(homeDir, workspaceDir string, adapter agents.Adapter) string {
+	return componentInjectionDirScoped(homeDir, workspaceDir, ScopeGlobal, adapter)
+}
+
+// componentInjectionDirScoped returns the directory to inject component files for the given adapter,
+// taking the install scope into account. When scope is ScopeWorkspace, agent-scoped
+// components write to workspaceDir instead of the selected agent's global config root.
+// OpenClaw always uses workspaceDir when set, independent of scope.
+func componentInjectionDirScoped(homeDir, workspaceDir string, scope InstallScope, adapter agents.Adapter) string {
 	if adapter.Agent() == model.AgentOpenClaw && strings.TrimSpace(workspaceDir) != "" {
 		return workspaceDir
 	}
-	return homeDir
+	return ResolveAgentConfigDir(scope, homeDir, workspaceDir)
 }
 
 type openClawWorkspaceConfig struct {
@@ -1092,9 +1140,13 @@ func resolveOpenClawWorkspaceDir(homeDir, fallback string, agentIDs []model.Agen
 }
 
 func componentPathDir(homeDir, workspaceDir string, adapter agents.Adapter, component model.ComponentID) string {
+	return componentPathDirScoped(homeDir, workspaceDir, ScopeGlobal, adapter, component)
+}
+
+func componentPathDirScoped(homeDir, workspaceDir string, scope InstallScope, adapter agents.Adapter, component model.ComponentID) string {
 	switch component {
-	case model.ComponentEngram, model.ComponentSDD, model.ComponentPersona:
-		return componentInjectionDir(homeDir, workspaceDir, adapter)
+	case model.ComponentEngram, model.ComponentSDD, model.ComponentPersona, model.ComponentSkills:
+		return componentInjectionDirScoped(homeDir, workspaceDir, scope, adapter)
 	default:
 		return homeDir
 	}
@@ -1121,14 +1173,14 @@ func sddSubAgentPaths(homeDir string, adapter agents.Adapter) []string {
 	return paths
 }
 
-func runPostApplyVerification(homeDir, workspaceDir string, selection model.Selection, resolved planner.ResolvedPlan) verify.Report {
+func runPostApplyVerification(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan) verify.Report {
 	checks := make([]verify.Check, 0)
 	adapters := resolveAdapters(resolved.Agents)
 
 	seenPath := make(map[string]struct{})
 	var uniqueFilePaths []string
 	for _, component := range resolved.OrderedComponents {
-		for _, path := range componentPathsWithWorkspace(homeDir, workspaceDir, selection, adapters, component) {
+		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
 			if path == "" {
 				continue
 			}
@@ -1393,6 +1445,19 @@ func claudeAliasesToStrings(m map[string]model.ClaudeModelAlias) map[string]stri
 		if k == "orchestrator" {
 			continue
 		}
+		out[k] = string(v)
+	}
+	return out
+}
+
+// kiroAliasesToStrings converts a typed KiroModelAlias map to plain strings
+// for JSON serialisation in state.json.
+func kiroAliasesToStrings(m map[string]model.KiroModelAlias) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
 		out[k] = string(v)
 	}
 	return out

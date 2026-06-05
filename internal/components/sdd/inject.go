@@ -14,6 +14,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/components/skills"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/internal/opencode"
 )
 
 type InjectionResult struct {
@@ -24,7 +25,8 @@ type InjectionResult struct {
 type InjectOptions struct {
 	OpenCodeModelAssignments map[string]model.ModelAssignment
 	ClaudeModelAssignments   map[string]model.ClaudeModelAlias
-	KiroModelAssignments     map[string]model.ClaudeModelAlias
+	KiroModelAssignments     map[string]model.KiroModelAlias
+	CodexModelAssignments    map[string]model.CodexEffort
 
 	// WorkspaceDir is the root of the current workspace (e.g. os.Getwd()).
 	// When non-empty and the adapter implements workflowInjector, native
@@ -72,11 +74,11 @@ type workflowInjector interface {
 }
 
 // kiroModelResolver is an optional adapter capability. When implemented,
-// the subagent copy loop resolves ClaudeModelAlias values to native model IDs
+// the subagent copy loop resolves KiroModelAlias values to native model IDs
 // and stamps them into the agent frontmatter sentinel {{KIRO_MODEL}}.
 // Adapters that do not implement this interface are unaffected.
 type kiroModelResolver interface {
-	KiroModelID(alias model.ClaudeModelAlias) string
+	KiroModelID(alias model.KiroModelAlias) string
 }
 
 // claudeModelResolver is an optional adapter capability. When implemented,
@@ -87,6 +89,17 @@ type kiroModelResolver interface {
 // shape consistent with kiroModelResolver.
 type claudeModelResolver interface {
 	ClaudeModelID(alias model.ClaudeModelAlias) string
+}
+
+// codexModelResolver is an optional adapter capability. When implemented,
+// injectFileAppend will replace the {{CODEX_PHASE_EFFORTS}} placeholder in the
+// Codex SDD orchestrator asset with a rendered per-phase effort table derived
+// from the CodexModelAssignments in InjectOptions.
+//
+// Adapters that do NOT implement this interface are completely unaffected —
+// the substitution only fires when the adapter satisfies this interface.
+type codexModelResolver interface {
+	RenderCodexPhaseEfforts(assignments map[string]model.CodexEffort) string
 }
 
 // monorepoRootMarkers identify files/dirs that ONLY exist at the true root
@@ -236,7 +249,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 			// custom persona, the SDD content must still be injected. We append the
 			// SDD orchestrator section to the existing system prompt file so it is
 			// always present regardless of persona choice.
-			result, err := injectFileAppend(homeDir, adapter)
+			result, err := injectFileAppend(homeDir, adapter, opts)
 			if err != nil {
 				return InjectionResult{}, err
 			}
@@ -411,6 +424,11 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				}
 			}
 
+			overlayBytes, err = defaultOpenCodeShareDisabled(settingsPath, overlayBytes)
+			if err != nil {
+				return InjectionResult{}, fmt.Errorf("default OpenCode share mode: %w", err)
+			}
+
 			agentResult, err := mergeJSONFile(settingsPath, overlayBytes)
 			if err != nil {
 				return InjectionResult{}, err
@@ -459,6 +477,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				"engram-convention.md",
 				"openspec-convention.md",
 				"sdd-phase-common.md",
+				"sdd-status-contract.md",
 				"skill-resolver.md",
 			}
 			sddSkillIDs := []model.SkillID{
@@ -567,7 +586,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 			// Non-Kiro adapters (Cursor, etc.) don't implement kiroModelResolver and are unaffected.
 			if kmr, ok := adapter.(kiroModelResolver); ok {
 				phase := strings.TrimSuffix(entry.Name(), ".md")
-				alias := model.ClaudeModelSonnet // safe default
+				alias := model.KiroModelAuto // safe default
 				if opts.KiroModelAssignments != nil {
 					if a, hasAlias := opts.KiroModelAssignments[phase]; hasAlias {
 						alias = a
@@ -577,9 +596,9 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				} else if opts.ClaudeModelAssignments != nil {
 					// Backward-compatible fallback when Kiro-specific assignments are not provided.
 					if a, hasAlias := opts.ClaudeModelAssignments[phase]; hasAlias {
-						alias = a
+						alias = model.KiroModelAlias(a)
 					} else if d, hasDefault := opts.ClaudeModelAssignments["default"]; hasDefault {
-						alias = d
+						alias = model.KiroModelAlias(d)
 					}
 				}
 				contentStr = strings.ReplaceAll(contentStr, "{{KIRO_MODEL}}", kmr.KiroModelID(alias))
@@ -826,7 +845,7 @@ Required preflight choices: execution mode, artifact store, chained PR strategy,
 
 Ask the user directly with a compact, numbered preflight prompt. Match the user's current language for all user-facing prose. If the user writes Spanish, ask the preflight in Spanish. Keep option codes (` + "`A1`" + `, ` + "`B1`" + `, ` + "`C1`" + `, ` + "`D1`" + `) and canonical values unchanged. Do NOT ask the user to type raw keys like ` + "`execution mode`" + `, ` + "`artifact store`" + `, ` + "`chained PR strategy`" + `, or ` + "`review budget`" + `. Do NOT mention non-existent tools. Do NOT invent informal values; use only the canonical values after the user chooses.
 
-Do NOT mix languages inside one preflight prompt: headings, option titles, descriptions, and follow-up text must all be in the user's current language. If the current language is Spanish, use the Spanish localized shape below verbatim; do not translate only the intro while keeping English labels like ` + "`Pace`" + `, ` + "`Artifacts`" + `, ` + "`Review`" + `, ` + "`recommended`" + `, ` + "`forecast`" + `, or ` + "`budget`" + `.
+Do NOT mix languages inside one preflight prompt: headings, option titles, descriptions, and follow-up text must all be in the user's current language. If the current language is Spanish, use the Spanish localized shape below as the neutral fallback; if an active persona defines a direct-conversation Spanish style, adapt only user-facing prose to that persona while preserving option codes and canonical values. Do not translate only the intro while keeping English labels like ` + "`Pace`" + `, ` + "`Artifacts`" + `, ` + "`Review`" + `, ` + "`recommended`" + `, ` + "`forecast`" + `, or ` + "`budget`" + `.
 
 Use this shape for English users, or translate user-facing prose to the user's current language while preserving option codes. Translation means the whole shape: headings, option titles, and descriptions together.
 
@@ -860,8 +879,8 @@ After asking this, STOP and wait for the user's answer.
 If the user's current language is Spanish, use this localized shape:
 
 ` + "```text" + `
-Antes de continuar con SDD, elegí una opción por grupo.
-Respondé con "usar recomendado" o con códigos como: A1, B1, C1, D1.
+Antes de continuar con SDD, elija una opción por grupo.
+Responda con "usar recomendado" o con códigos como: A1, B1, C1, D1.
 
 A. Ritmo
    A1 Interactivo (recomendado): mostrar cada fase y esperar confirmación antes de continuar.
@@ -891,7 +910,9 @@ Hard gate rules:
 - ` + "`openspec/config.yaml`" + `, existing SDD artifacts, previous ` + "`sdd-init`" + ` results, or installed SDD assets do NOT satisfy session preflight.
 - If the session has no preflight block, ask the localized user-facing preflight prompt above and STOP. Do not run init, delegate phases, edit files, or apply tasks in the same turn.
 - For a new feature request that says to use SDD, start at preflight -> init guard -> explore/proposal. Never launch ` + "`sdd-apply`" + ` just because the user asked to implement a feature.
-- In ` + "`interactive`" + ` mode, pause after each delegated phase returns, summarize the phase, ask before launching the next phase, and STOP. Match the user's language; for Spanish ask: "¿Querés ajustar algo o continuamos?". Do not run /sdd-ff phases back-to-back unless execution mode is ` + "`auto`" + `.
+- In ` + "`interactive`" + ` mode, pause after each delegated phase returns, summarize the phase, ask before launching the next phase, and STOP. Match the user's language and active persona for direct conversation only; for Spanish neutral fallback ask: "¿Quiere ajustar algo o continuamos?". Do not run /sdd-ff phases back-to-back unless execution mode is ` + "`auto`" + `.
+- Interactive approval is phase-scoped. Words like "continue", "dale", or "go on" approve only the immediate next phase, not the rest of the SDD pipeline. Do not treat a generated artifact as approved until the user has had a chance to review or explicitly delegate that review.
+- Before the ` + "`sdd-propose`" + ` phase in interactive mode, offer the user a proposal question round instead of silently deciding whether the proposal is clear enough. Ask 3–5 concrete product questions to improve the PRD/proposal by uncovering business rules, implications, impact, edge cases, product tradeoffs, and decision gaps; then summarize assumptions and ask whether the user wants corrections or a second question round. Do not ask about test commands, PR shape, changed-line budget, or other harness mechanics at proposal time unless the user explicitly asks to discuss delivery.
 <!-- /gentle-ai:sdd-session-preflight-migration -->
 `
 
@@ -900,10 +921,14 @@ Hard gate rules:
 		strings.Contains(prompt, "Never launch `sdd-apply`") &&
 		strings.Contains(prompt, "Match the user's current language") &&
 		strings.Contains(prompt, "Do NOT mix languages inside one preflight prompt") &&
-		strings.Contains(prompt, "If the current language is Spanish, use the Spanish localized shape below verbatim") &&
+		strings.Contains(prompt, "Spanish localized shape below as the neutral fallback") &&
 		strings.Contains(prompt, "pause after each delegated phase returns") &&
+		strings.Contains(prompt, "approve only the immediate next phase") &&
+		strings.Contains(prompt, "proposal question round") &&
+		strings.Contains(prompt, "business rules, implications, impact, edge cases") &&
 		strings.Contains(prompt, "Before continuing with SDD") &&
-		!strings.Contains(prompt, "question` tool") {
+		!strings.Contains(prompt, "question` tool") &&
+		!containsOpenCodeOrchestratorLanguageLeak(prompt) {
 		return prompt
 	}
 
@@ -917,6 +942,20 @@ Hard gate rules:
 	}
 
 	return strings.TrimRight(prompt, "\n") + preflight
+}
+
+func containsOpenCodeOrchestratorLanguageLeak(prompt string) bool {
+	for _, leak := range []string{
+		"elegí",
+		"Respondé",
+		"¿Querés ajustar algo o continuamos?",
+		"If the current language is Spanish, use the Spanish localized shape below verbatim",
+	} {
+		if strings.Contains(prompt, leak) {
+			return true
+		}
+	}
+	return false
 }
 
 func readOpenCodeAgentPrompt(settingsPath, agentKey string) (string, error) {
@@ -1238,6 +1277,49 @@ func mergeJSONFile(path string, overlay []byte) (mergeJSONResult, error) {
 	return mergeJSONResult{writeResult: writeResult, merged: merged}, nil
 }
 
+// defaultOpenCodeShareDisabled adds a defensive OpenCode default for SDD
+// installs: disable session sharing unless the user already chose a share mode.
+//
+// SDD multi-agent mode creates child sessions for native sub-agents. In
+// OpenCode 1.15.x, session creation can route through SessionShare.create when
+// sharing is enabled/automatic, and that path has been observed to fail with a
+// SQLite FOREIGN KEY constraint error for child sessions. Keeping the default
+// local avoids breaking sub-agent startup while preserving explicit user config
+// such as "share": "manual" or "share": "auto".
+func defaultOpenCodeShareDisabled(settingsPath string, overlay []byte) ([]byte, error) {
+	if openCodeSettingsHasShare(settingsPath) {
+		return overlay, nil
+	}
+
+	root := map[string]any{}
+	if err := json.Unmarshal(overlay, &root); err != nil {
+		return nil, fmt.Errorf("unmarshal overlay json: %w", err)
+	}
+	if _, exists := root["share"]; !exists {
+		root["share"] = "disabled"
+	}
+
+	encoded, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal overlay json: %w", err)
+	}
+	return append(encoded, '\n'), nil
+}
+
+func openCodeSettingsHasShare(settingsPath string) bool {
+	content, err := os.ReadFile(settingsPath)
+	if err != nil || len(strings.TrimSpace(string(content))) == 0 {
+		return false
+	}
+
+	root := map[string]any{}
+	if err := json.Unmarshal(content, &root); err != nil {
+		return false
+	}
+	_, exists := root["share"]
+	return exists
+}
+
 // migrateLegacyOpenCodeSDDOrchestrator removes legacy or accidentally renamed
 // base OpenCode SDD conductor agents. The base SDD coordinator is now the
 // gentle-orchestrator primary agent; named profile agents such as
@@ -1412,6 +1494,8 @@ func hasSDDOrchestrator(content string) bool {
 // content based on the agent. Agent-specific assets take priority; generic is fallback.
 func sddOrchestratorAsset(agent model.AgentID) string {
 	switch agent {
+	case model.AgentClaudeCode:
+		return "claude/sdd-orchestrator.md"
 	case model.AgentGeminiCLI:
 		return "gemini/sdd-orchestrator.md"
 	case model.AgentCodex:
@@ -1428,14 +1512,14 @@ func sddOrchestratorAsset(agent model.AgentID) string {
 		return "qwen/sdd-orchestrator.md"
 	case model.AgentKiroIDE:
 		return "kiro/sdd-orchestrator.md"
-	case model.AgentOpenCode:
+	case model.AgentOpenCode, model.AgentKilocode:
 		return "opencode/sdd-orchestrator.md"
 	default:
 		return "generic/sdd-orchestrator.md"
 	}
 }
 
-func injectFileAppend(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
+func injectFileAppend(homeDir string, adapter agents.Adapter, opts InjectOptions) (InjectionResult, error) {
 	promptPath := adapter.SystemPromptFile(homeDir)
 
 	existing, err := readFileOrEmpty(promptPath)
@@ -1453,6 +1537,18 @@ func injectFileAppend(homeDir string, adapter agents.Adapter) (InjectionResult, 
 
 	// Use agent-specific SDD orchestrator content when available; fall back to generic.
 	content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
+
+	// Codex-only: substitute {{CODEX_PHASE_EFFORTS}} with a rendered per-phase
+	// effort table. Only fires when the adapter implements codexModelResolver.
+	// All other FileReplace adapters (Gemini, Cursor, etc.) are unaffected.
+	if cmr, ok := adapter.(codexModelResolver); ok {
+		rendered := cmr.RenderCodexPhaseEfforts(opts.CodexModelAssignments)
+		content = strings.ReplaceAll(content, "{{CODEX_PHASE_EFFORTS}}", rendered)
+		// Post-check: fail loudly if any placeholder token remains unresolved.
+		if strings.Contains(content, "{{") {
+			return InjectionResult{}, fmt.Errorf("inject(codex): unresolved placeholder token '{{' remains in AGENTS.md content after substitution")
+		}
+	}
 
 	// If there is a bare (un-marked) legacy orchestrator block, strip it first
 	// so InjectMarkdownSection can re-inject the current canonical content.
@@ -1647,8 +1743,8 @@ func stripBareOrchestratorSection(content string) string {
 
 func injectMarkdownSections(homeDir string, adapter agents.Adapter, assignments map[string]model.ClaudeModelAlias) (InjectionResult, error) {
 	promptPath := adapter.SystemPromptFile(homeDir)
-	content := assets.MustRead("claude/sdd-orchestrator.md")
-	if len(assignments) > 0 {
+	content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
+	if adapter.Agent() == model.AgentClaudeCode && len(assignments) > 0 {
 		var err error
 		content, err = injectClaudeModelAssignments(content, assignments)
 		if err != nil {
@@ -1690,19 +1786,28 @@ var claudeModelAssignmentRowOrder = []string{
 	"sdd-apply",
 	"sdd-verify",
 	"sdd-archive",
+	"sdd-onboard",
+	"jd-judge-a",
+	"jd-judge-b",
+	"jd-fix-agent",
 	"default",
 }
 
 var claudeModelAssignmentReasons = map[string]string{
-	"sdd-explore": "Reads code, structural - not architectural",
-	"sdd-propose": "Architectural decisions",
-	"sdd-spec":    "Structured writing",
-	"sdd-design":  "Architecture decisions",
-	"sdd-tasks":   "Mechanical breakdown",
-	"sdd-apply":   "Implementation",
-	"sdd-verify":  "Validation against spec",
-	"sdd-archive": "Copy and close",
-	"default":     "Non-SDD general delegation",
+	"orchestrator": "Coordinates, makes decisions",
+	"sdd-explore":  "Reads code, structural - not architectural",
+	"sdd-propose":  "Architectural decisions",
+	"sdd-spec":     "Structured writing",
+	"sdd-design":   "Architecture decisions",
+	"sdd-tasks":    "Mechanical breakdown",
+	"sdd-apply":    "Implementation",
+	"sdd-verify":   "Validation against spec",
+	"sdd-archive":  "Copy and close",
+	"sdd-onboard":  "Guided walkthrough, pedagogical",
+	"jd-judge-a":   "Adversarial review — blind judge A",
+	"jd-judge-b":   "Adversarial review — blind judge B",
+	"jd-fix-agent": "Surgical fixes from confirmed issues",
+	"default":      "Non-SDD general delegation",
 }
 
 func injectClaudeModelAssignments(content string, assignments map[string]model.ClaudeModelAlias) (string, error) {
@@ -1763,6 +1868,26 @@ func renderClaudeModelAssignmentsSection(assignments map[string]model.ClaudeMode
 	return b.String()
 }
 
+// jdAgentSet is a package-level set for O(1) JD agent membership checks,
+// consistent with the sddPhaseSet pattern in read_assignments.go.
+var jdAgentSet = buildJDAgentSet()
+
+func buildJDAgentSet() map[string]bool {
+	phases := opencode.JDPhases()
+	set := make(map[string]bool, len(phases))
+	for _, p := range phases {
+		set[p] = true
+	}
+	return set
+}
+
+// isJDAgent reports whether the agent name is a judgment-day workflow agent.
+// JD agents are excluded from root model fallback to preserve independent
+// model configuration for diversity of perspective between judges.
+func isJDAgent(name string) bool {
+	return jdAgentSet[name]
+}
+
 // injectModelAssignments injects "model" fields into sub-agent definitions
 // within the overlay JSON before it is merged into the settings file.
 //
@@ -1819,8 +1944,12 @@ func injectModelAssignments(overlayBytes []byte, assignments map[string]model.Mo
 			// Also clear variant explicitly so the overlay output stays symmetric
 			// with case 1 — this prevents a stale variant from leaking through if
 			// the embedded overlay or upstream pipeline ever carries a variant.
-			agentMap["model"] = rootModelID
-			agentMap["variant"] = ""
+			// Exception: JD agents are excluded from root model propagation to support
+			// independent model configuration and diversity of perspective between judges.
+			if !isJDAgent(phase) {
+				agentMap["model"] = rootModelID
+				agentMap["variant"] = ""
+			}
 		}
 	}
 

@@ -58,9 +58,15 @@ type SyncResult struct {
 	// either no agents were discovered/provided, or all managed assets
 	// were already current (idempotent re-sync).
 	NoOp bool
-	// FilesChanged is the number of managed files actually written or updated
-	// during this sync. Zero means all assets were already current.
+	// FilesChanged is the number of deduplicated managed file paths
+	// processed during this sync. A file is counted when at least one
+	// component reports it as part of its injection result.
+	// Zero means all assets were already current.
 	FilesChanged int
+	// ChangedFiles lists deduplicated absolute paths of managed files
+	// processed during this sync. Paths appear once even when multiple
+	// components touch the same file. It is nil when no files changed.
+	ChangedFiles []string
 }
 
 // ParseSyncFlags parses the CLI arguments for the sync subcommand.
@@ -376,7 +382,7 @@ type syncRuntime struct {
 	agentIDs     []model.AgentID
 	backupRoot   string
 	state        *runtimeState
-	filesChanged int // accumulates changed-file count across all component steps
+	changedFiles []string // accumulates absolute paths of files that actually changed
 }
 
 func newSyncRuntime(homeDir string, selection model.Selection) (*syncRuntime, error) {
@@ -428,7 +434,7 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 			workspaceDir: r.workspaceDir,
 			agents:       r.agentIDs,
 			selection:    r.selection,
-			filesChanged: &r.filesChanged,
+			changedFiles: &r.changedFiles,
 		})
 	}
 
@@ -502,7 +508,7 @@ func syncPersonaPathsWithWorkspace(homeDir, workspaceDir string, selection model
 		if adapter.SystemPromptStrategy() != model.StrategyJinjaModules {
 			paths = append(paths, adapter.SystemPromptFile(targetDir))
 		}
-		if selection.Persona == model.PersonaGentleman && adapter.SupportsOutputStyles() {
+		if isGentlemanConversationPersona(selection.Persona) && adapter.SupportsOutputStyles() {
 			paths = append(paths, adapter.OutputStyleDir(targetDir)+"/gentleman.md")
 			if p := adapter.SettingsPath(targetDir); p != "" {
 				paths = append(paths, p)
@@ -516,9 +522,10 @@ func syncPersonaPathsWithWorkspace(homeDir, workspaceDir string, selection model
 // Unlike componentApplyStep, it ONLY calls inject functions —
 // no binary install, no engram setup, no persona injection.
 //
-// filesChanged is a shared counter pointer. Each step increments it by the
-// number of files that were actually written (i.e., whose content changed).
-// This lets RunSync detect a true no-op when all assets are already current.
+// changedFiles is a shared slice pointer. Each step appends the file
+// paths from its InjectionResult.Files when InjectionResult.Changed
+// is true. Paths may contain duplicates across components; the caller
+// (RunSync) deduplicates before exposing them via SyncResult.
 type componentSyncStep struct {
 	id           string
 	component    model.ComponentID
@@ -526,7 +533,7 @@ type componentSyncStep struct {
 	workspaceDir string
 	agents       []model.AgentID
 	selection    model.Selection
-	filesChanged *int
+	changedFiles *[]string // accumulates absolute paths of files that actually changed
 }
 
 func (s componentSyncStep) ID() string {
@@ -552,7 +559,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync engram for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -564,7 +571,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync context7 for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -609,6 +616,7 @@ func (s componentSyncStep) Run() error {
 				OpenCodeModelAssignments:           s.selection.ModelAssignments,
 				ClaudeModelAssignments:             s.selection.ClaudeModelAssignments,
 				KiroModelAssignments:               s.selection.KiroModelAssignments,
+				CodexModelAssignments:              s.selection.CodexModelAssignments,
 				WorkspaceDir:                       s.workspaceDir,
 				StrictTDD:                          s.selection.StrictTDD,
 				PreserveOpenCodeOrchestratorPrompt: profileStrategy == model.SDDProfileStrategyExternalSingleActive,
@@ -618,7 +626,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync sdd for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -632,7 +640,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync skills for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -652,7 +660,15 @@ func (s componentSyncStep) Run() error {
 			return fmt.Errorf("sync gga config: %w", err)
 		}
 		// Count GGA files changed based on individual Changed flags.
-		s.countChanged(boolToInt(res.ConfigChanged) + boolToInt(res.AgentsChanged))
+		total := boolToInt(res.ConfigChanged) + boolToInt(res.AgentsChanged)
+		var ggaFiles []string
+		if res.ConfigChanged && res.ConfigFile != "" {
+			ggaFiles = append(ggaFiles, res.ConfigFile)
+		}
+		if res.AgentsChanged && res.AgentsFile != "" {
+			ggaFiles = append(ggaFiles, res.AgentsFile)
+		}
+		s.countChanged(total, ggaFiles...)
 		return nil
 
 	case model.ComponentPermission:
@@ -662,7 +678,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync permissions for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -679,7 +695,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync persona for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -690,7 +706,7 @@ func (s componentSyncStep) Run() error {
 			if err != nil {
 				return fmt.Errorf("sync theme for %q: %w", adapter.Agent(), err)
 			}
-			s.countChanged(boolToInt(res.Changed))
+			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
 		return nil
 
@@ -700,11 +716,30 @@ func (s componentSyncStep) Run() error {
 	}
 }
 
-// countChanged adds n to the shared filesChanged counter (nil-safe).
-func (s componentSyncStep) countChanged(n int) {
-	if s.filesChanged != nil && n > 0 {
-		*s.filesChanged += n
+// countChanged records the file paths that were actually changed (nil-safe).
+func (s componentSyncStep) countChanged(n int, files ...string) {
+	if s.changedFiles != nil && n > 0 {
+		*s.changedFiles = append(*s.changedFiles, files...)
 	}
+}
+
+// dedupPaths removes duplicate and empty paths while preserving first-seen order.
+func dedupPaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if _, ok := seen[p]; !ok {
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // boolToInt converts a boolean to 0 or 1.
@@ -750,7 +785,10 @@ func RunSyncWithSelection(homeDir string, selection model.Selection) (SyncResult
 	}
 
 	// Capture how many managed assets were actually changed.
-	result.FilesChanged = rt.filesChanged
+	// Deduplicate paths — multiple components may touch the same file
+	// (e.g. Engram and Context7 both merge into settings.json).
+	result.ChangedFiles = dedupPaths(rt.changedFiles)
+	result.FilesChanged = len(result.ChangedFiles)
 
 	// True no-op: agents were discovered but all managed assets were already
 	// current — no file was written or updated. Per spec scenario:
@@ -797,7 +835,7 @@ func RunSync(args []string) (SyncResult, error) {
 	// Load persisted model assignments and persona from state when not provided
 	// via flags. Without this, every CLI sync falls back to defaults and would
 	// silently overwrite the user's model choices and persona selection.
-	if len(selection.ClaudeModelAssignments) == 0 || len(selection.ModelAssignments) == 0 || selection.Persona == "" {
+	if len(selection.ClaudeModelAssignments) == 0 || len(selection.KiroModelAssignments) == 0 || len(selection.ModelAssignments) == 0 || selection.Persona == "" {
 		s, readErr := state.Read(homeDir)
 		if readErr == nil {
 			if len(selection.ClaudeModelAssignments) == 0 && len(s.ClaudeModelAssignments) > 0 {
@@ -811,6 +849,13 @@ func RunSync(args []string) (SyncResult, error) {
 					m[k] = model.ClaudeModelAlias(v)
 				}
 				selection.ClaudeModelAssignments = m
+			}
+			if len(selection.KiroModelAssignments) == 0 && len(s.KiroModelAssignments) > 0 {
+				m := make(map[string]model.KiroModelAlias, len(s.KiroModelAssignments))
+				for k, v := range s.KiroModelAssignments {
+					m[k] = model.KiroModelAlias(v)
+				}
+				selection.KiroModelAssignments = m
 			}
 			if len(selection.ModelAssignments) == 0 && len(s.ModelAssignments) > 0 {
 				m := make(map[string]model.ModelAssignment, len(s.ModelAssignments))
@@ -911,6 +956,12 @@ func RenderSyncReport(result SyncResult) string {
 	// FilesChanged is 0 only when all assets were already current (no-op path
 	// above handles that case). A non-zero value here reflects real writes.
 	fmt.Fprintf(&b, "Sync actions executed: %d files changed\n", result.FilesChanged)
+
+	if len(result.ChangedFiles) > 0 {
+		for _, path := range result.ChangedFiles {
+			fmt.Fprintf(&b, "  - %s\n", path)
+		}
+	}
 
 	if !result.Verify.Ready {
 		fmt.Fprintln(&b, "")

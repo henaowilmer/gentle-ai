@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/state"
@@ -217,6 +218,52 @@ func TestRunArgsUninstallBypassesPlatformValidation(t *testing.T) {
 	// If we got here, uninstall bypassed the platform validation.
 }
 
+func TestRunArgsSDDStatusIsDispatchedBeforePlatformValidation(t *testing.T) {
+	origEnsure := ensureCurrentOSSupported
+	t.Cleanup(func() { ensureCurrentOSSupported = origEnsure })
+	ensureCurrentOSSupported = func() error {
+		return fmt.Errorf("unsupported platform")
+	}
+
+	root := t.TempDir()
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "proposal.md"), "# Proposal\n")
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "specs", "auth", "spec.md"), "# Spec\n")
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "design.md"), "# Design\n")
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "tasks.md"), "- [ ] 1.1 Work\n")
+
+	var buf bytes.Buffer
+	err := RunArgs([]string{"sdd-status", "add-auth", "--cwd", root}, &buf)
+	if err != nil {
+		t.Fatalf("RunArgs(sdd-status) error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "## SDD Status: add-auth") {
+		t.Fatalf("sdd-status output missing markdown status:\n%s", buf.String())
+	}
+}
+
+func TestRunArgsSDDContinueIsDispatchedBeforePlatformValidation(t *testing.T) {
+	origEnsure := ensureCurrentOSSupported
+	t.Cleanup(func() { ensureCurrentOSSupported = origEnsure })
+	ensureCurrentOSSupported = func() error {
+		return fmt.Errorf("unsupported platform")
+	}
+
+	root := t.TempDir()
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "proposal.md"), "# Proposal\n")
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "specs", "auth", "spec.md"), "# Spec\n")
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "design.md"), "# Design\n")
+	writeAppSDDStatusFile(t, filepath.Join(root, "openspec", "changes", "add-auth", "tasks.md"), "- [ ] 1.1 Work\n")
+
+	var buf bytes.Buffer
+	err := RunArgs([]string{"sdd-continue", "add-auth", "--cwd", root}, &buf)
+	if err != nil {
+		t.Fatalf("RunArgs(sdd-continue) error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "## Native SDD Dispatcher: add-auth") {
+		t.Fatalf("sdd-continue output missing dispatcher markdown:\n%s", buf.String())
+	}
+}
+
 // TestListBackupsFallsBackGracefullyForOldManifests verifies that old manifests
 // without Source/Description are still returned (not skipped) and can be displayed
 // via DisplayLabel without panicking.
@@ -356,7 +403,7 @@ func TestTuiSyncClaudeModelConfigWritesSelectedAssignments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tuiSync Claude model config error: %v", err)
 	}
-	if changed == 0 {
+	if len(changed) == 0 {
 		t.Fatal("tuiSync Claude model config changed 0 files, want Claude assets written")
 	}
 
@@ -393,17 +440,17 @@ func TestTuiSyncClaudeModelConfigWritesSelectedAssignments(t *testing.T) {
 // replacement semantics as ClaudeModelAssignments — not a key-level merge).
 func TestApplyOverrides_KiroModelAssignments(t *testing.T) {
 	selection := model.Selection{
-		KiroModelAssignments: map[string]model.ClaudeModelAlias{"sdd-apply": model.ClaudeModelSonnet},
+		KiroModelAssignments: map[string]model.KiroModelAlias{"sdd-apply": model.KiroModelSonnet},
 	}
 	overrides := &model.SyncOverrides{
-		KiroModelAssignments: map[string]model.ClaudeModelAlias{"sdd-design": model.ClaudeModelOpus},
+		KiroModelAssignments: map[string]model.KiroModelAlias{"sdd-design": model.KiroModelOpus},
 	}
 
 	applyOverrides(&selection, overrides)
 
 	// The whole map is replaced — prior entries (sdd-apply) are gone.
-	if got := selection.KiroModelAssignments["sdd-design"]; got != model.ClaudeModelOpus {
-		t.Fatalf("KiroModelAssignments[sdd-design] = %q, want %q", got, model.ClaudeModelOpus)
+	if got := selection.KiroModelAssignments["sdd-design"]; got != model.KiroModelOpus {
+		t.Fatalf("KiroModelAssignments[sdd-design] = %q, want %q", got, model.KiroModelOpus)
 	}
 	if _, exists := selection.KiroModelAssignments["sdd-apply"]; exists {
 		t.Fatal("KiroModelAssignments[sdd-apply] should not exist after full-map replacement")
@@ -446,11 +493,11 @@ func TestLoadPersistedAssignmentsPopulatesEmptySelection(t *testing.T) {
 	if got := selection.ClaudeModelAssignments["sdd-apply"]; got != "sonnet" {
 		t.Errorf("ClaudeModelAssignments[sdd-apply] = %q, want %q", got, "sonnet")
 	}
-	if got := selection.KiroModelAssignments["sdd-design"]; got != model.ClaudeModelOpus {
-		t.Errorf("KiroModelAssignments[sdd-design] = %q, want %q", got, model.ClaudeModelOpus)
+	if got := selection.KiroModelAssignments["sdd-design"]; got != model.KiroModelOpus {
+		t.Errorf("KiroModelAssignments[sdd-design] = %q, want %q", got, model.KiroModelOpus)
 	}
-	if got := selection.KiroModelAssignments["sdd-archive"]; got != model.ClaudeModelHaiku {
-		t.Errorf("KiroModelAssignments[sdd-archive] = %q, want %q", got, model.ClaudeModelHaiku)
+	if got := selection.KiroModelAssignments["sdd-archive"]; got != model.KiroModelHaiku {
+		t.Errorf("KiroModelAssignments[sdd-archive] = %q, want %q", got, model.KiroModelHaiku)
 	}
 	ma := selection.ModelAssignments["sdd-init"]
 	if ma.ProviderID != "anthropic" || ma.ModelID != "claude-sonnet-4" {
@@ -539,10 +586,10 @@ func TestPersistAndLoadKiroModelAssignments(t *testing.T) {
 	home := t.TempDir()
 
 	selection := model.Selection{
-		KiroModelAssignments: map[string]model.ClaudeModelAlias{
-			"sdd-design":  model.ClaudeModelOpus,
-			"sdd-archive": model.ClaudeModelHaiku,
-			"default":     model.ClaudeModelSonnet,
+		KiroModelAssignments: map[string]model.KiroModelAlias{
+			"sdd-design":  model.KiroModelGLM,
+			"sdd-archive": model.KiroModelQwen,
+			"default":     model.KiroModelAuto,
 		},
 	}
 	persistAssignments(home, selection)
@@ -550,14 +597,14 @@ func TestPersistAndLoadKiroModelAssignments(t *testing.T) {
 	loaded := model.Selection{}
 	loadPersistedAssignments(home, &loaded)
 
-	if got := loaded.KiroModelAssignments["sdd-design"]; got != model.ClaudeModelOpus {
-		t.Errorf("round-trip KiroModelAssignments[sdd-design] = %q, want %q", got, model.ClaudeModelOpus)
+	if got := loaded.KiroModelAssignments["sdd-design"]; got != model.KiroModelGLM {
+		t.Errorf("round-trip KiroModelAssignments[sdd-design] = %q, want %q", got, model.KiroModelGLM)
 	}
-	if got := loaded.KiroModelAssignments["sdd-archive"]; got != model.ClaudeModelHaiku {
-		t.Errorf("round-trip KiroModelAssignments[sdd-archive] = %q, want %q", got, model.ClaudeModelHaiku)
+	if got := loaded.KiroModelAssignments["sdd-archive"]; got != model.KiroModelQwen {
+		t.Errorf("round-trip KiroModelAssignments[sdd-archive] = %q, want %q", got, model.KiroModelQwen)
 	}
-	if got := loaded.KiroModelAssignments["default"]; got != model.ClaudeModelSonnet {
-		t.Errorf("round-trip KiroModelAssignments[default] = %q, want %q", got, model.ClaudeModelSonnet)
+	if got := loaded.KiroModelAssignments["default"]; got != model.KiroModelAuto {
+		t.Errorf("round-trip KiroModelAssignments[default] = %q, want %q", got, model.KiroModelAuto)
 	}
 }
 
@@ -763,6 +810,50 @@ func TestRunArgs_UpgradeSkipsSelfUpdate(t *testing.T) {
 	}
 }
 
+func TestRunArgs_TUISkipsSelfUpdate(t *testing.T) {
+	// NOTE: modifies package-level vars; must not run in parallel.
+	origSelfUpdate := selfUpdateFn
+	origDetect := detectSystem
+	origEnsure := ensureCurrentOSSupported
+	origRunTUI := runTUI
+	t.Cleanup(func() {
+		selfUpdateFn = origSelfUpdate
+		detectSystem = origDetect
+		ensureCurrentOSSupported = origEnsure
+		runTUI = origRunTUI
+	})
+
+	ensureCurrentOSSupported = func() error { return nil }
+	detectSystem = func(context.Context) (system.DetectionResult, error) {
+		return system.DetectionResult{System: system.SystemInfo{Supported: true}}, nil
+	}
+
+	// Return the same model to avoid nil dereference if RunArgs inspects it.
+	tuiCalled := 0
+	runTUI = func(m tea.Model, _ ...tea.ProgramOption) (tea.Model, error) {
+		tuiCalled++
+		return m, nil
+	}
+
+	selfUpdateCalled := 0
+	selfUpdateFn = func(context.Context, string, system.PlatformProfile, io.Writer) error {
+		selfUpdateCalled++
+		return nil
+	}
+
+	var buf bytes.Buffer
+	err := RunArgs([]string{}, &buf)
+	if err != nil {
+		t.Fatalf("RunArgs(empty args) error = %v", err)
+	}
+	if selfUpdateCalled != 0 {
+		t.Fatalf("selfUpdate should be skipped for TUI flow; got %d call(s)", selfUpdateCalled)
+	}
+	if tuiCalled != 1 {
+		t.Fatalf("runTUI should be called exactly once for TUI flow; got %d call(s)", tuiCalled)
+	}
+}
+
 func TestIsExplicitUpdateFlow(t *testing.T) {
 	tests := []struct {
 		name string
@@ -798,4 +889,95 @@ func setupMockHome(t *testing.T, home string) {
 	})
 	os.Setenv("HOME", home)
 	os.Setenv("USERPROFILE", home)
+}
+
+// TestApplyOverrides_CodexModelAssignments verifies that a non-nil
+// CodexModelAssignments override sets the selection.
+func TestApplyOverrides_CodexModelAssignments(t *testing.T) {
+	sel := model.Selection{}
+	assignments := model.CodexModelPresetPowerful()
+	overrides := &model.SyncOverrides{
+		CodexModelAssignments: assignments,
+	}
+	applyOverrides(&sel, overrides)
+	if len(sel.CodexModelAssignments) != len(assignments) {
+		t.Fatalf("CodexModelAssignments len = %d, want %d", len(sel.CodexModelAssignments), len(assignments))
+	}
+	if sel.CodexModelAssignments["sdd-apply"] != model.CodexEffortHigh {
+		t.Errorf("CodexModelAssignments[sdd-apply] = %q, want high", sel.CodexModelAssignments["sdd-apply"])
+	}
+}
+
+// TestLoadPersistedAssignments_Codex verifies that state with codexModelAssignments
+// populates selection.CodexModelAssignments.
+func TestLoadPersistedAssignments_Codex(t *testing.T) {
+	home := t.TempDir()
+	if err := state.Write(home, state.InstallState{
+		InstalledAgents: []string{"codex"},
+		CodexModelAssignments: map[string]string{
+			"sdd-apply":   "medium",
+			"sdd-explore": "low",
+			"default":     "medium",
+		},
+	}); err != nil {
+		t.Fatalf("state.Write: %v", err)
+	}
+
+	sel := model.Selection{}
+	loadPersistedAssignments(home, &sel)
+
+	if sel.CodexModelAssignments["sdd-apply"] != model.CodexEffortMedium {
+		t.Errorf("CodexModelAssignments[sdd-apply] = %q, want medium", sel.CodexModelAssignments["sdd-apply"])
+	}
+}
+
+// TestLoadPersistedAssignments_CodexMissingKey verifies that a state without
+// codexModelAssignments leaves selection.CodexModelAssignments nil.
+func TestLoadPersistedAssignments_CodexMissingKey(t *testing.T) {
+	home := t.TempDir()
+	if err := state.Write(home, state.InstallState{
+		InstalledAgents: []string{"codex"},
+	}); err != nil {
+		t.Fatalf("state.Write: %v", err)
+	}
+
+	sel := model.Selection{}
+	loadPersistedAssignments(home, &sel)
+
+	if sel.CodexModelAssignments != nil {
+		t.Errorf("CodexModelAssignments = %v, want nil when key absent", sel.CodexModelAssignments)
+	}
+}
+
+// TestPersistAssignments_Codex verifies that non-empty CodexModelAssignments
+// are persisted to state.json.
+func TestPersistAssignments_Codex(t *testing.T) {
+	home := t.TempDir()
+	// Write initial state so state.Read succeeds.
+	if err := state.Write(home, state.InstallState{InstalledAgents: []string{"codex"}}); err != nil {
+		t.Fatalf("state.Write: %v", err)
+	}
+
+	sel := model.Selection{
+		CodexModelAssignments: model.CodexModelPresetLowCost(),
+	}
+	persistAssignments(home, sel)
+
+	s, err := state.Read(home)
+	if err != nil {
+		t.Fatalf("state.Read: %v", err)
+	}
+	if s.CodexModelAssignments["sdd-apply"] != "medium" {
+		t.Errorf("state.CodexModelAssignments[sdd-apply] = %q, want medium", s.CodexModelAssignments["sdd-apply"])
+	}
+}
+
+func writeAppSDDStatusFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
 }

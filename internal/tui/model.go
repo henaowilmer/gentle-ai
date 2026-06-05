@@ -22,6 +22,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/opencode"
 	"github.com/gentleman-programming/gentle-ai/internal/pipeline"
 	"github.com/gentleman-programming/gentle-ai/internal/planner"
+	"github.com/gentleman-programming/gentle-ai/internal/state"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
 	"github.com/gentleman-programming/gentle-ai/internal/tui/screens"
 	"github.com/gentleman-programming/gentle-ai/internal/update"
@@ -142,16 +143,16 @@ type UpgradeDoneMsg struct {
 
 // SyncDoneMsg is sent when the sync operation completes.
 type SyncDoneMsg struct {
-	FilesChanged int
-	Err          error
+	Files []string
+	Err   error
 }
 
 // UninstallDoneMsg is sent when the uninstall operation completes.
 type UninstallDoneMsg struct {
-	Result           componentuninstall.Result
-	Err              error
-	SyncFilesChanged int   // only set for CleanInstall mode
-	SyncErr          error // only set for CleanInstall mode
+	Result    componentuninstall.Result
+	Err       error
+	SyncFiles []string // only set for CleanInstall mode
+	SyncErr   error    // only set for CleanInstall mode
 }
 
 // UpgradePhaseCompletedMsg is sent by startUpgradeSync when the upgrade phase
@@ -202,8 +203,8 @@ type UpgradeFunc func(ctx context.Context, results []update.UpdateResult) upgrad
 
 // SyncFunc is the signature of the function injected to perform config sync.
 // When overrides is non-nil, the sync merges those model assignments into the
-// selection before executing. Returns the number of files changed and any error.
-type SyncFunc func(overrides *model.SyncOverrides) (int, error)
+// selection before executing. Returns the list of changed file paths and any error.
+type SyncFunc func(overrides *model.SyncOverrides) ([]string, error)
 
 // UninstallFunc is the signature of the function injected to perform managed uninstall.
 type UninstallFunc func(agentIDs []model.AgentID, componentIDs []model.ComponentID) (componentuninstall.Result, error)
@@ -245,6 +246,7 @@ const (
 	ScreenPreset
 	ScreenClaudeModelPicker
 	ScreenKiroModelPicker
+	ScreenCodexModelPicker
 	ScreenSDDMode
 	ScreenStrictTDD
 	ScreenOpenCodePlugins
@@ -303,6 +305,7 @@ type Model struct {
 	ModelPicker       screens.ModelPickerState
 	ClaudeModelPicker screens.ClaudeModelPickerState
 	KiroModelPicker   screens.KiroModelPickerState
+	CodexModelPicker  screens.CodexModelPickerState
 	SkillPicker       []model.SkillID
 	Err               error
 
@@ -367,8 +370,8 @@ type Model struct {
 	// nil means the upgrade has not been run yet or is currently running.
 	UpgradeReport *upgrade.UpgradeReport
 
-	// SyncFilesChanged holds the number of files changed during the last sync run.
-	SyncFilesChanged int
+	// SyncFiles holds the list of files changed during the last sync run.
+	SyncFiles []string
 
 	// SyncErr holds the error from the last sync run (nil on success).
 	SyncErr error
@@ -438,8 +441,8 @@ type Model struct {
 	// UninstallErr holds the error from the last uninstall execution.
 	UninstallErr error
 
-	// SyncCleanInstallFilesChanged holds the sync files changed count after a clean install.
-	SyncCleanInstallFilesChanged int
+	// SyncCleanInstallFiles holds the sync file paths changed after a clean install.
+	SyncCleanInstallFiles []string
 
 	// SyncCleanInstallErr holds the sync error from a clean install.
 	SyncCleanInstallErr error
@@ -463,18 +466,30 @@ type Model struct {
 	OpenCodePluginRegistrationErr     error
 }
 
-func NewModel(detection system.DetectionResult, version string) Model {
-	agents := preselectedAgents(detection)
-	components := componentsForPreset(model.PresetFullGentleman)
+// NewModel constructs the initial TUI model for the given detection result.
+// An optional InstallState may be supplied as the third argument; when present,
+// its InstalledAgents list is used as the canonical pre-selection source instead
+// of filesystem detection (which becomes a fallback for first-time installs only).
+// Existing callers that pass only two arguments receive the previous behavior.
+func NewModel(detection system.DetectionResult, version string, installState ...state.InstallState) Model {
+	var s state.InstallState
+	if len(installState) > 0 {
+		s = installState[0]
+	}
+	agents := preselectedAgents(detection, s)
+	components := componentsForPreset(model.PresetFullGentleman, model.PersonaGentleman)
 	if isPiOnlyAgents(agents) {
 		components = piOnlyComponents()
 	}
 
 	selection := model.Selection{
-		Agents:     agents,
-		Persona:    model.PersonaGentleman,
-		Preset:     model.PresetFullGentleman,
-		Components: components,
+		Agents:                 agents,
+		Persona:                model.PersonaGentleman,
+		Preset:                 model.PresetFullGentleman,
+		Components:             components,
+		ClaudeModelAssignments: installStateClaudeAssignments(s.ClaudeModelAssignments),
+		KiroModelAssignments:   installStateKiroAssignments(s.KiroModelAssignments),
+		ModelAssignments:       installStateModelAssignments(s.ModelAssignments),
 	}
 
 	return Model{
@@ -491,6 +506,43 @@ func NewModel(detection system.DetectionResult, version string) Model {
 			"Inject ecosystem components",
 		}),
 	}
+}
+
+func installStateClaudeAssignments(assignments map[string]string) map[string]model.ClaudeModelAlias {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ClaudeModelAlias, len(assignments))
+	for phase, alias := range assignments {
+		out[phase] = model.ClaudeModelAlias(alias)
+	}
+	return out
+}
+
+func installStateKiroAssignments(assignments map[string]string) map[string]model.KiroModelAlias {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string]model.KiroModelAlias, len(assignments))
+	for phase, alias := range assignments {
+		out[phase] = model.KiroModelAlias(alias)
+	}
+	return out
+}
+
+func installStateModelAssignments(assignments map[string]state.ModelAssignmentState) map[string]model.ModelAssignment {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ModelAssignment, len(assignments))
+	for phase, assignment := range assignments {
+		out[phase] = model.ModelAssignment{
+			ProviderID: assignment.ProviderID,
+			ModelID:    assignment.ModelID,
+			Effort:     assignment.Effort,
+		}
+	}
+	return out
 }
 
 func (m Model) Init() tea.Cmd {
@@ -591,7 +643,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.Init()
 	case SyncDoneMsg:
 		m.OperationRunning = false
-		m.SyncFilesChanged = msg.FilesChanged
+		m.SyncFiles = msg.Files
 		m.SyncErr = msg.Err
 		m.HasSyncRun = true
 		m.PendingSyncOverrides = nil
@@ -614,7 +666,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.OperationRunning = false
 		m.UninstallResult = msg.Result
 		m.UninstallErr = msg.Err
-		m.SyncCleanInstallFilesChanged = msg.SyncFilesChanged
+		m.SyncCleanInstallFiles = msg.SyncFiles
 		m.SyncCleanInstallErr = msg.SyncErr
 		m.setScreen(ScreenUninstallResult)
 		return m, nil
@@ -744,7 +796,7 @@ func (m Model) View() string {
 	case ScreenUpgrade:
 		return screens.RenderUpgrade(m.UpdateResults, m.UpgradeReport, m.UpgradeErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame)
 	case ScreenSync:
-		return screens.RenderSync(m.SyncFilesChanged, m.SyncErr, m.OperationRunning, m.HasSyncRun, m.SpinnerFrame)
+		return screens.RenderSync(m.SyncFiles, m.SyncErr, m.OperationRunning, m.HasSyncRun, m.SpinnerFrame)
 	case ScreenModelConfig:
 		return screens.RenderModelConfig(m.Cursor)
 	case ScreenProfiles:
@@ -764,7 +816,7 @@ func (m Model) View() string {
 	case ScreenProfileDelete:
 		return screens.RenderProfileDelete(m.ProfileDeleteTarget, m.Cursor)
 	case ScreenUpgradeSync:
-		return screens.RenderUpgradeSync(m.UpdateResults, m.UpgradeReport, m.SyncFilesChanged, m.UpgradeErr, m.SyncErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame)
+		return screens.RenderUpgradeSync(m.UpdateResults, m.UpgradeReport, m.SyncFiles, m.UpgradeErr, m.SyncErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame)
 	case ScreenUninstallMode:
 		return screens.RenderUninstallMode(m.Cursor)
 	case ScreenUninstall:
@@ -776,7 +828,7 @@ func (m Model) View() string {
 	case ScreenUninstallConfirm:
 		return screens.RenderUninstallConfirm(m.UninstallMode, m.UninstallAgents, m.UninstallComponents, m.UninstallProfilesToRemove, m.UninstallEngramScope, m.UninstallEngramProjectScopeAvailable, m.Cursor, m.OperationRunning, m.SpinnerFrame)
 	case ScreenUninstallResult:
-		return screens.RenderUninstallResult(m.UninstallResult, m.UninstallErr, m.UninstallMode, m.UninstallProfilesToRemove, m.UninstallEngramScope, m.UninstallEngramProjectScopeAvailable, m.SyncCleanInstallFilesChanged, m.SyncCleanInstallErr)
+		return screens.RenderUninstallResult(m.UninstallResult, m.UninstallErr, m.UninstallMode, m.UninstallProfilesToRemove, m.UninstallEngramScope, m.UninstallEngramProjectScopeAvailable, m.SyncCleanInstallFiles, m.SyncCleanInstallErr)
 	case ScreenDetection:
 		return screens.RenderDetection(m.Detection, m.Cursor)
 	case ScreenAgents:
@@ -789,6 +841,8 @@ func (m Model) View() string {
 		return screens.RenderClaudeModelPicker(m.ClaudeModelPicker, m.Cursor)
 	case ScreenKiroModelPicker:
 		return screens.RenderKiroModelPicker(m.KiroModelPicker, m.Cursor)
+	case ScreenCodexModelPicker:
+		return screens.RenderCodexModelPicker(m.CodexModelPicker, m.Cursor)
 	case ScreenSDDMode:
 		return screens.RenderSDDMode(m.Selection.SDDMode, m.Cursor)
 	case ScreenStrictTDD:
@@ -895,8 +949,11 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
 				} else if m.shouldShowKiroModelPickerScreen() {
-					m.KiroModelPicker = screens.NewKiroModelPickerState()
+					m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
 					m.setScreen(ScreenKiroModelPicker)
+				} else if m.shouldShowCodexModelPickerScreen() {
+					m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
+					m.setScreen(ScreenCodexModelPicker)
 				} else if m.shouldShowSDDModeScreen() {
 					m.setScreen(ScreenSDDMode)
 				} else if m.Selection.Preset == model.PresetCustom {
@@ -938,6 +995,47 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.PendingSyncOverrides = &model.SyncOverrides{
 						TargetAgents:         []model.AgentID{model.AgentKiroIDE},
 						KiroModelAssignments: updated,
+					}
+					m = m.withResetSyncState()
+					m.setScreen(ScreenSync)
+				} else if m.shouldShowCodexModelPickerScreen() {
+					m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
+					m.setScreen(ScreenCodexModelPicker)
+				} else if m.shouldShowSDDModeScreen() {
+					m.setScreen(ScreenSDDMode)
+				} else if m.Selection.Preset == model.PresetCustom {
+					if m.shouldShowStrictTDDScreen() {
+						m.setScreen(ScreenStrictTDD)
+					} else if m.shouldShowSkillPickerScreen() {
+						if len(m.SkillPicker) == 0 {
+							m.initSkillPicker()
+						}
+						m.setScreen(ScreenSkillPicker)
+					} else {
+						m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
+						m.setScreen(ScreenReview)
+					}
+				} else if m.shouldShowStrictTDDScreen() {
+					m.setScreen(ScreenStrictTDD)
+				} else {
+					m.buildDependencyPlan()
+					m.setScreen(ScreenDependencyTree)
+				}
+			}
+			return m, nil
+		}
+	}
+
+	if m.Screen == ScreenCodexModelPicker {
+		handled, assignments := screens.HandleCodexModelPickerNav(keyStr, &m.CodexModelPicker, m.Cursor)
+		if handled {
+			if assignments != nil {
+				m.Selection.CodexModelAssignments = assignments
+				if m.ModelConfigMode {
+					m.ModelConfigMode = false
+					m.PendingSyncOverrides = &model.SyncOverrides{
+						TargetAgents:          []model.AgentID{model.AgentCodex},
+						CodexModelAssignments: assignments,
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
@@ -992,6 +1090,10 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.BackupScroll = m.Cursor
 			}
 		}
+		// Skip separator row in model picker — it is not selectable.
+		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() && m.Cursor > 0 {
+			m.Cursor--
+		}
 		return m, nil
 	case "down":
 		// On the preview screen, down arrow scrolls content down.
@@ -1012,6 +1114,12 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.BackupScroll = m.Cursor - screens.BackupMaxVisible + 1
 			}
 		}
+		// Skip separator row in model picker — it is not selectable.
+		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() {
+			if m.Cursor+1 < count {
+				m.Cursor++
+			}
+		}
 		return m, nil
 	case "k":
 		count := m.optionCount()
@@ -1029,6 +1137,10 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.BackupScroll = m.Cursor
 			}
 		}
+		// Skip separator row in model picker — it is not selectable.
+		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() && m.Cursor > 0 {
+			m.Cursor--
+		}
 		return m, nil
 	case "j":
 		count := m.optionCount()
@@ -1042,6 +1154,12 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.Screen == ScreenBackups {
 			if m.Cursor >= m.BackupScroll+screens.BackupMaxVisible {
 				m.BackupScroll = m.Cursor - screens.BackupMaxVisible + 1
+			}
+		}
+		// Skip separator row in model picker — it is not selectable.
+		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() {
+			if m.Cursor+1 < count {
+				m.Cursor++
 			}
 		}
 		return m, nil
@@ -1441,7 +1559,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		switch m.Cursor {
 		case 0: // Configure Claude models
 			m.ModelConfigMode = true
-			m.ClaudeModelPicker = screens.NewClaudeModelPickerState()
+			m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromAssignments(m.Selection.ClaudeModelAssignments)
 			m.setScreen(ScreenClaudeModelPicker)
 		case 1: // Configure OpenCode models
 			m.ModelConfigMode = true
@@ -1468,9 +1586,13 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			m.setScreen(ScreenModelPicker)
 		case 2: // Configure Kiro models
 			m.ModelConfigMode = true
-			m.KiroModelPicker = screens.NewKiroModelPickerState()
+			m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
 			m.setScreen(ScreenKiroModelPicker)
-		default: // Back
+		case 3: // Configure Codex models
+			m.ModelConfigMode = true
+			m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
+			m.setScreen(ScreenCodexModelPicker)
+		case 4: // Back
 			m.setScreen(ScreenWelcome)
 		}
 		return m, nil
@@ -1500,6 +1622,10 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		options := screens.PersonaOptions()
 		if m.Cursor < len(options) {
 			m.Selection.Persona = options[m.Cursor]
+			// Recompute components if a non-custom preset was already chosen
+			if m.Selection.Preset != "" && m.Selection.Preset != model.PresetCustom {
+				m.Selection.Components = componentsForPreset(m.Selection.Preset, m.Selection.Persona)
+			}
 			m.setScreen(ScreenPreset)
 			return m, nil
 		}
@@ -1508,15 +1634,20 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		options := screens.PresetOptions()
 		if m.Cursor < len(options) {
 			m.Selection.Preset = options[m.Cursor]
-			m.Selection.Components = componentsForPreset(options[m.Cursor])
+			m.Selection.Components = componentsForPreset(options[m.Cursor], m.Selection.Persona)
 			if m.shouldShowClaudeModelPickerScreen() {
-				m.ClaudeModelPicker = screens.NewClaudeModelPickerState()
+				m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromAssignments(m.Selection.ClaudeModelAssignments)
 				m.setScreen(ScreenClaudeModelPicker)
 				return m, nil
 			}
 			if m.shouldShowKiroModelPickerScreen() {
-				m.KiroModelPicker = screens.NewKiroModelPickerState()
+				m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
 				m.setScreen(ScreenKiroModelPicker)
+				return m, nil
+			}
+			if m.shouldShowCodexModelPickerScreen() {
+				m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
+				m.setScreen(ScreenCodexModelPicker)
 				return m, nil
 			}
 			if m.shouldShowSDDModeScreen() {
@@ -1568,26 +1699,34 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+	case ScreenCodexModelPicker:
+		if m.Cursor == screens.CodexModelPickerOptionCount()-1 {
+			if m.ModelConfigMode {
+				m.ModelConfigMode = false
+				m.setScreen(ScreenModelConfig)
+				return m, nil
+			}
+			if m.shouldShowKiroModelPickerScreen() {
+				m.setScreen(ScreenKiroModelPicker)
+			} else if m.shouldShowClaudeModelPickerScreen() {
+				m.setScreen(ScreenClaudeModelPicker)
+			} else {
+				m.setScreen(ScreenPreset)
+			}
+			return m, nil
+		}
 	case ScreenSDDMode:
 		options := screens.SDDModeOptions()
 		if m.Cursor < len(options) {
 			m.Selection.SDDMode = options[m.Cursor]
 			if m.Selection.SDDMode == model.SDDModeMulti {
 				cachePath := opencode.DefaultCachePath()
-				if _, err := osStatModelCache(cachePath); err == nil {
-					// Cache exists — OpenCode has been run at least once.
-					// Show the model picker so the user can assign models.
-					m.ModelPicker = screens.NewModelPickerState(cachePath, opencode.DefaultSettingsPath())
-					m.Selection.ModelAssignments = nil
-					m.setScreen(ScreenModelPicker)
-					return m, nil
-				}
-				// Cache missing — OpenCode hasn't been run yet on this machine.
-				// Skip the model picker; models will use OpenCode defaults.
-				// The picker empty-state message explains what to do after install.
-				m.ModelPicker = screens.ModelPickerState{}
+				m.ModelPicker = screens.NewModelPickerState(cachePath, opencode.DefaultSettingsPath())
+				m.Selection.ModelAssignments = nil
+				m.setScreen(ScreenModelPicker)
+				return m, nil
 			}
-			// Clear assignments for both single mode and multi-no-cache paths.
+			// Clear assignments for single mode.
 			m.Selection.ModelAssignments = nil
 			// Show StrictTDD screen when OpenCode + SDD are selected.
 			// This is the next step before the dependency tree.
@@ -1631,20 +1770,41 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			}
 		}
 	case ScreenModelPicker:
-		// When no providers are detected the screen only shows a "Back" option
-		// at cursor 0.  Handle that before the normal row logic.
+		// When no providers are detected the screen offers Continue with defaults
+		// and Back. Handle that before the normal row logic.
 		if len(m.ModelPicker.AvailableIDs) == 0 {
-			if m.ModelConfigMode {
+			if m.ModelConfigMode || m.Cursor == 1 {
 				m.ModelConfigMode = false
 				m.setScreen(ScreenModelConfig)
 				return m, nil
 			}
-			// Go back to SDD mode so the user can switch to single mode.
-			m.setScreen(ScreenSDDMode)
+			// Continue with OpenCode defaults when no providers are available yet.
+			if m.Selection.Preset == model.PresetCustom {
+				if m.shouldShowStrictTDDScreen() {
+					m.setScreen(ScreenStrictTDD)
+				} else if m.shouldShowSkillPickerScreen() {
+					if len(m.SkillPicker) == 0 {
+						m.initSkillPicker()
+					}
+					m.setScreen(ScreenSkillPicker)
+				} else {
+					m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
+					m.setScreen(ScreenReview)
+				}
+			} else if m.shouldShowStrictTDDScreen() {
+				m.setScreen(ScreenStrictTDD)
+			} else {
+				m.buildDependencyPlan()
+				m.setScreen(ScreenDependencyTree)
+			}
 			return m, nil
 		}
 		rows := screens.ModelPickerRows()
 		if m.Cursor < len(rows) {
+			// Skip separator row — it is not actionable.
+			if !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() {
+				return m, nil
+			}
 			// Enter sub-selection: pick provider then model.
 			m.ModelPicker.SelectedPhaseIdx = m.Cursor
 			m.ModelPicker.Mode = screens.ModeProviderSelect
@@ -1765,7 +1925,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.buildDependencyPlan()
 				// Show model picker screens if needed (components are now set).
 				if m.shouldShowClaudeModelPickerScreen() {
-					m.ClaudeModelPicker = screens.NewClaudeModelPickerState()
+					m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromAssignments(m.Selection.ClaudeModelAssignments)
 					m.setScreen(ScreenClaudeModelPicker)
 					return m, nil
 				}
@@ -2070,7 +2230,7 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 // screen (State 3) instead of stale results from a previous run.
 // Unlike withResetOperationState, this preserves PendingSyncOverrides.
 func (m Model) withResetSyncState() Model {
-	m.SyncFilesChanged = 0
+	m.SyncFiles = nil
 	m.SyncErr = nil
 	m.HasSyncRun = false
 	m.OperationRunning = false
@@ -2085,7 +2245,7 @@ func (m Model) withResetSyncState() Model {
 func (m Model) withResetOperationState() Model {
 	m.UpgradeReport = nil
 	m.UpgradeErr = nil
-	m.SyncFilesChanged = 0
+	m.SyncFiles = nil
 	m.SyncErr = nil
 	m.HasSyncRun = false
 	m.OperationRunning = false
@@ -2097,7 +2257,7 @@ func (m Model) withResetOperationState() Model {
 
 func (m Model) withResetUninstallState() Model {
 	m.UninstallMode = model.UninstallModePartial
-	m.UninstallAgents = preselectedAgents(m.Detection)
+	m.UninstallAgents = detectedAgentIDs(m.Detection)
 	m.UninstallComponents = defaultUninstallComponents()
 	m.UninstallProfilesAvailable = nil
 	m.UninstallProfilesToRemove = nil
@@ -2106,7 +2266,7 @@ func (m Model) withResetUninstallState() Model {
 	m.UninstallEngramScope = model.EngramUninstallScopeGlobal
 	m.UninstallResult = componentuninstall.Result{}
 	m.UninstallErr = nil
-	m.SyncCleanInstallFilesChanged = 0
+	m.SyncCleanInstallFiles = nil
 	m.SyncCleanInstallErr = nil
 	m.OperationRunning = false
 	m.OperationMode = ""
@@ -2136,8 +2296,8 @@ func (m Model) startSync(overrides *model.SyncOverrides) tea.Cmd {
 		if syncFn == nil {
 			return SyncDoneMsg{Err: fmt.Errorf("sync function not configured")}
 		}
-		filesChanged, err := syncFn(overrides)
-		return SyncDoneMsg{FilesChanged: filesChanged, Err: err}
+		files, err := syncFn(overrides)
+		return SyncDoneMsg{Files: files, Err: err}
 	}
 }
 
@@ -2205,8 +2365,8 @@ func (m Model) startUninstall() tea.Cmd {
 				msg.SyncErr = fmt.Errorf("sync function not configured")
 				return msg
 			}
-			filesChanged, syncErr := syncFn(nil)
-			msg.SyncFilesChanged = filesChanged
+			files, syncErr := syncFn(nil)
+			msg.SyncFiles = files
 			msg.SyncErr = syncErr
 			return msg
 		}
@@ -2251,9 +2411,10 @@ func (m Model) detectProjectEngramData() bool {
 }
 
 // startUpgradeSync runs upgrade then sync sequentially via tea.Sequence.
-// Design decision: sync runs unconditionally regardless of upgrade outcome.
+// Design decision: sync normally runs regardless of tool-level upgrade outcome.
 // Tool-level upgrade failures are per-tool (in UpgradeReport.Results), not fatal.
-// The user sees both results and can re-run if needed.
+// Exception: if gentle-ai itself was upgraded, sync is skipped so the old
+// running binary cannot rewrite configs after installing a newer binary.
 //
 // The first command runs the upgrade and sends UpgradePhaseCompletedMsg
 // (so the UI can show State 2: sync running). The second command runs sync
@@ -2262,6 +2423,7 @@ func (m Model) startUpgradeSync() tea.Cmd {
 	upgradeFn := m.UpgradeFn
 	syncFn := m.SyncFn
 	updateResults := m.UpdateResults
+	gentleAIUpdated := false
 
 	upgradeCmd := func() tea.Msg {
 		if upgradeFn == nil {
@@ -2269,21 +2431,34 @@ func (m Model) startUpgradeSync() tea.Cmd {
 		}
 		ctx := context.Background()
 		report := upgradeFn(ctx, updateResults)
+		gentleAIUpdated = reportUpgradedGentleAI(report)
 		return UpgradePhaseCompletedMsg{Report: report}
 	}
 
 	syncCmd := func() tea.Msg {
+		if gentleAIUpdated {
+			return SyncDoneMsg{}
+		}
 		if syncFn == nil {
 			return SyncDoneMsg{Err: fmt.Errorf("sync function not configured")}
 		}
 		// Overrides are intentionally nil: upgrade-sync is triggered from
 		// Welcome menu, not ModelConfig. PendingSyncOverrides is cleared
 		// by withResetOperationState before entering this flow.
-		filesChanged, err := syncFn(nil)
-		return SyncDoneMsg{FilesChanged: filesChanged, Err: err}
+		files, err := syncFn(nil)
+		return SyncDoneMsg{Files: files, Err: err}
 	}
 
 	return tea.Sequence(upgradeCmd, syncCmd)
+}
+
+func reportUpgradedGentleAI(report upgrade.UpgradeReport) bool {
+	for _, result := range report.Results {
+		if result.ToolName == "gentle-ai" && result.Status == upgrade.UpgradeSucceeded {
+			return true
+		}
+	}
+	return false
 }
 
 // restoreBackup triggers a backup restore in a goroutine.
@@ -2394,7 +2569,7 @@ func (m Model) goBack() Model {
 	}
 
 	// ModelConfigMode: pickers reached via Model Config shortcut return to ScreenModelConfig.
-	if m.ModelConfigMode && (m.Screen == ScreenClaudeModelPicker || m.Screen == ScreenKiroModelPicker || m.Screen == ScreenModelPicker) {
+	if m.ModelConfigMode && (m.Screen == ScreenClaudeModelPicker || m.Screen == ScreenKiroModelPicker || m.Screen == ScreenCodexModelPicker || m.Screen == ScreenModelPicker) {
 		m.ModelConfigMode = false
 		m.setScreen(ScreenModelConfig)
 		return m
@@ -2473,6 +2648,10 @@ func (m Model) goBack() Model {
 			m.setScreen(ScreenSDDMode)
 			return m
 		}
+		if m.shouldShowCodexModelPickerScreen() {
+			m.setScreen(ScreenCodexModelPicker)
+			return m
+		}
 		if m.shouldShowKiroModelPickerScreen() {
 			m.setScreen(ScreenKiroModelPicker)
 			return m
@@ -2542,6 +2721,18 @@ func (m Model) goBack() Model {
 			} else {
 				m.setScreen(ScreenPreset)
 			}
+		}
+		return m
+	}
+
+	if m.Screen == ScreenCodexModelPicker {
+		// Codex picker back: Kiro (if present) → Claude (if present) → Preset.
+		if m.shouldShowKiroModelPickerScreen() {
+			m.setScreen(ScreenKiroModelPicker)
+		} else if m.shouldShowClaudeModelPickerScreen() {
+			m.setScreen(ScreenClaudeModelPicker)
+		} else {
+			m.setScreen(ScreenPreset)
 		}
 		return m
 	}
@@ -2722,6 +2913,8 @@ func (m Model) optionCount() int {
 		return screens.ClaudeModelPickerOptionCount(m.ClaudeModelPicker)
 	case ScreenKiroModelPicker:
 		return screens.KiroModelPickerOptionCount(m.KiroModelPicker)
+	case ScreenCodexModelPicker:
+		return screens.CodexModelPickerOptionCount()
 	case ScreenSDDMode:
 		return len(screens.SDDModeOptions()) + 1
 	case ScreenStrictTDD:
@@ -2732,7 +2925,7 @@ func (m Model) optionCount() int {
 		return 1
 	case ScreenModelPicker:
 		if len(m.ModelPicker.AvailableIDs) == 0 {
-			return 1 // only "Back to SDD mode"
+			return 2 // Continue with defaults + Back to SDD mode
 		}
 		return len(screens.ModelPickerRows()) + 2 // rows + Continue + Back
 	case ScreenDependencyTree:
@@ -3093,14 +3286,43 @@ func (m *Model) buildDependencyPlan() {
 	m.DependencyPlan = resolved
 }
 
-func preselectedAgents(detection system.DetectionResult) []model.AgentID {
+// agentsToManage returns the canonical list of agents gentle-ai should manage.
+//
+// Priority:
+//  1. state.InstalledAgents is non-empty → use those (persisted user selection).
+//  2. detectedIDs is non-empty          → use those (filesystem detection fallback).
+//  3. Both empty                         → return all catalog agents (first-time install default).
+//
+// This is the single source of truth for both the TUI pre-selection and the
+// pre-upgrade backup scope. It ensures that a user who deliberately un-selected
+// an agent in the TUI does not see it re-selected or backed-up on the next run.
+func agentsToManage(installState state.InstallState, detectedIDs []model.AgentID) []model.AgentID {
+	if len(installState.InstalledAgents) > 0 {
+		ids := make([]model.AgentID, 0, len(installState.InstalledAgents))
+		for _, a := range installState.InstalledAgents {
+			ids = append(ids, model.AgentID(a))
+		}
+		return ids
+	}
+	if len(detectedIDs) > 0 {
+		return detectedIDs
+	}
+	agents := catalog.AllAgents()
+	all := make([]model.AgentID, 0, len(agents))
+	for _, agent := range agents {
+		all = append(all, agent.ID)
+	}
+	return all
+}
+
+// detectedAgentIDs converts a DetectionResult to the agent IDs whose config dirs exist on disk.
+func detectedAgentIDs(detection system.DetectionResult) []model.AgentID {
 	selected := []model.AgentID{}
-	for _, state := range detection.Configs {
-		if !state.Exists {
+	for _, cfg := range detection.Configs {
+		if !cfg.Exists {
 			continue
 		}
-
-		switch strings.TrimSpace(state.Agent) {
+		switch strings.TrimSpace(cfg.Agent) {
 		case string(model.AgentClaudeCode):
 			selected = append(selected, model.AgentClaudeCode)
 		case string(model.AgentOpenCode):
@@ -3123,18 +3345,13 @@ func preselectedAgents(detection system.DetectionResult) []model.AgentID {
 			selected = append(selected, model.AgentPi)
 		}
 	}
-
-	if len(selected) > 0 {
-		return selected
-	}
-
-	agents := catalog.AllAgents()
-	selected = make([]model.AgentID, 0, len(agents))
-	for _, agent := range agents {
-		selected = append(selected, agent.ID)
-	}
-
 	return selected
+}
+
+// preselectedAgents returns the agents that should be pre-selected in the TUI.
+// It delegates to agentsToManage so that persisted state always wins over filesystem detection.
+func preselectedAgents(detection system.DetectionResult, installState state.InstallState) []model.AgentID {
+	return agentsToManage(installState, detectedAgentIDs(detection))
 }
 
 func isPiOnlyAgents(agents []model.AgentID) bool {
@@ -3233,27 +3450,36 @@ func (m Model) shouldShowKiroModelPickerScreen() bool {
 		hasSelectedComponent(m.Selection.Components, model.ComponentSDD)
 }
 
-func componentsForPreset(preset model.PresetID) []model.ComponentID {
+func (m Model) shouldShowCodexModelPickerScreen() bool {
+	return m.Selection.HasAgent(model.AgentCodex) &&
+		hasSelectedComponent(m.Selection.Components, model.ComponentSDD)
+}
+
+func componentsForPreset(preset model.PresetID, persona model.PersonaID) []model.ComponentID {
+	var components []model.ComponentID
 	switch preset {
 	case model.PresetMinimal:
-		return []model.ComponentID{model.ComponentEngram}
+		components = []model.ComponentID{model.ComponentEngram}
 	case model.PresetEcosystemOnly:
-		return []model.ComponentID{model.ComponentEngram, model.ComponentSDD, model.ComponentSkills, model.ComponentContext7, model.ComponentGGA}
+		components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD, model.ComponentSkills, model.ComponentContext7, model.ComponentGGA}
 	case model.PresetCustom:
 		return nil
-	default:
-		return []model.ComponentID{
+	default: // full-gentleman
+		components = []model.ComponentID{
 			model.ComponentEngram,
 			model.ComponentSDD,
 			model.ComponentSkills,
 			model.ComponentContext7,
-			model.ComponentPersona,
 			model.ComponentPermission,
 			model.ComponentGGA,
 			model.ComponentClaudeTheme,
 			model.ComponentOpenCodeGentleLogo,
 		}
 	}
+	if persona != model.PersonaCustom {
+		components = append(components, model.ComponentPersona)
+	}
+	return components
 }
 
 func hasSelectedComponent(components []model.ComponentID, target model.ComponentID) bool {
@@ -3357,6 +3583,7 @@ func (m Model) handleProfileNameInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.ModelPicker = screens.ModelPickerState{}
 		}
+		m.ModelPicker.ForProfile = true
 		m.Cursor = 0
 		return m, nil
 	case tea.KeyEsc:
@@ -3414,13 +3641,15 @@ func (m Model) confirmProfileCreate() (tea.Model, tea.Cmd) {
 			} else {
 				m.ModelPicker = screens.ModelPickerState{}
 			}
+			m.ModelPicker.ForProfile = true
 			m.Cursor = 0
 		}
 		return m, nil
 	case 1:
 		// Model assignment picker: orchestrator + all sub-agent phases in one screen.
 		// Reuse the same enter-on-row logic as ScreenModelPicker.
-		rows := screens.ModelPickerRows()
+		// Profile creation uses filtered rows (no JD agents).
+		rows := screens.ModelPickerRowsForProfile()
 		if m.Cursor < len(rows) {
 			// Enter sub-selection: pick provider then model.
 			m.ModelPicker.SelectedPhaseIdx = m.Cursor
