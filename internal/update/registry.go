@@ -96,4 +96,12 @@ var Tools = []ToolInfo{
 		InstallMethod: InstallOpenCodePlugin,
 		NpmPackage:    "opencode-sdd-engram-manage",
 	},
+	{
+		Name:          "@slkiser/opencode-quota",
+		Owner:         "slkiser",
+		Repo:          "opencode-quota",
+		VersionPrefix: "v",
+		InstallMethod: InstallOpenCodePlugin,
+		NpmPackage:    "@slkiser/opencode-quota",
+	},
 }

@@ -38,6 +38,19 @@ func TestInstallAddsCommunityPluginToTUIConfig(t *testing.T) {
 	}
 }
 
+func TestDefinitionForQuotaPlugin(t *testing.T) {
+	def, ok := DefinitionFor(model.OpenCodePluginQuota)
+	if !ok {
+		t.Fatal("DefinitionFor(quota) should return a definition")
+	}
+	if def.PackageName != "@slkiser/opencode-quota" {
+		t.Fatalf("PackageName = %q, want %q", def.PackageName, "@slkiser/opencode-quota")
+	}
+	if def.RepoURL != "https://github.com/slkiser/opencode-quota" {
+		t.Fatalf("RepoURL = %q, want %q", def.RepoURL, "https://github.com/slkiser/opencode-quota")
+	}
+}
+
 func TestInstallPreservesExistingTUIPluginsAndIsIdempotent(t *testing.T) {
 	home := t.TempDir()
 	configDir := filepath.Join(home, ".config", "opencode")

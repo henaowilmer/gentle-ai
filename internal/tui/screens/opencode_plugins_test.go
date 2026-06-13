@@ -12,6 +12,7 @@ func TestRenderOpenCodePluginsShowsInstallAndRepoOptions(t *testing.T) {
 
 	for _, want := range []string{
 		"Optional OpenCode Community Plugins",
+		"OpenCode Quota",
 		"Sub-agent Statusline",
 		"SDD Engram Manager",
 		"View repo",

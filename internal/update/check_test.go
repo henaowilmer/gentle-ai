@@ -135,8 +135,8 @@ func TestDetectInstalledVersionFallbackPaths(t *testing.T) {
 	}
 
 	tool := ToolInfo{
-		Name:          "mytool",
-		DetectCmd:     []string{binaryName, "--version"},
+		Name:      "mytool",
+		DetectCmd: []string{binaryName, "--version"},
 		FallbackPaths: func(homeDir, localAppData string) []string {
 			return []string{filepath.Join(tmpDir, binaryName)}
 		},
@@ -245,6 +245,25 @@ func TestDetectInstalledVersionFromOpenCodeNodeModulePackageJSON(t *testing.T) {
 	}
 }
 
+func TestDetectInstalledVersionFromScopedOpenCodeNodeModulePackageJSON(t *testing.T) {
+	home := t.TempDir()
+	pkgDir := filepath.Join(home, ".config", "opencode", "node_modules", "@slkiser", "opencode-quota")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(`{"version":"3.8.7"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDir = origHome })
+
+	tool := ToolInfo{Name: "opencode-quota", NpmPackage: "@slkiser/opencode-quota"}
+	if got := detectInstalledVersion(context.Background(), tool, "dev"); got != "3.8.7" {
+		t.Fatalf("detectInstalledVersion() = %q, want 3.8.7", got)
+	}
+}
+
 func TestDetectInstalledVersionFromOpenCodePackageJSONDependency(t *testing.T) {
 	home := t.TempDir()
 	opencodeDir := filepath.Join(home, ".config", "opencode")
@@ -261,6 +280,25 @@ func TestDetectInstalledVersionFromOpenCodePackageJSONDependency(t *testing.T) {
 	tool := ToolInfo{Name: "sdd-engram-plugin", NpmPackage: "opencode-sdd-engram-manage"}
 	if got := detectInstalledVersion(context.Background(), tool, "dev"); got != "1.3.3" {
 		t.Fatalf("detectInstalledVersion() = %q, want 1.3.3", got)
+	}
+}
+
+func TestDetectInstalledVersionFromScopedOpenCodePackageJSONDependency(t *testing.T) {
+	home := t.TempDir()
+	opencodeDir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(opencodeDir, "package.json"), []byte(`{"dependencies":{"@slkiser/opencode-quota":"^3.8.7"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDir = origHome })
+
+	tool := ToolInfo{Name: "opencode-quota", NpmPackage: "@slkiser/opencode-quota"}
+	if got := detectInstalledVersion(context.Background(), tool, "dev"); got != "3.8.7" {
+		t.Fatalf("detectInstalledVersion() = %q, want 3.8.7", got)
 	}
 }
 
@@ -580,6 +618,8 @@ func TestCheckAll(t *testing.T) {
 			release = githubRelease{TagName: "v1.5.0", HTMLURL: "https://github.com/Gentleman-Programming/gentle-ai/releases/tag/v1.5.0"}
 		case contains(path, "gentleman-guardian-angel"):
 			release = githubRelease{TagName: "v2.0.0", HTMLURL: "https://github.com/Gentleman-Programming/gentleman-guardian-angel/releases/tag/v2.0.0"}
+		case contains(path, "opencode-quota"):
+			release = githubRelease{TagName: "v3.8.7", HTMLURL: "https://github.com/slkiser/opencode-quota/releases/tag/v3.8.7"}
 		case contains(path, "sub-agent-statusline"):
 			release = githubRelease{TagName: "v0.4.0", HTMLURL: "https://github.com/Joaquinvesapa/sub-agent-statusline/releases/tag/v0.4.0"}
 		case contains(path, "sdd-engram-plugin"):
@@ -628,8 +668,8 @@ func TestCheckAll(t *testing.T) {
 	profile := system.PlatformProfile{OS: "darwin", PackageManager: "brew", Supported: true}
 	results := CheckAll(context.Background(), "1.5.0", profile)
 
-	if len(results) != 5 {
-		t.Fatalf("len(results) = %d, want 5", len(results))
+	if len(results) != 6 {
+		t.Fatalf("len(results) = %d, want 6", len(results))
 	}
 
 	// gentle-ai: 1.5.0 local == 1.5.0 remote → UpToDate
@@ -642,6 +682,7 @@ func TestCheckAll(t *testing.T) {
 	assertResult(t, results[2], "gga", NotInstalled, "", "2.0.0")
 	assertResult(t, results[3], "opencode-subagent-statusline", NotInstalled, "", "0.4.0")
 	assertResult(t, results[4], "opencode-sdd-engram-manage", NotInstalled, "", "1.1.7")
+	assertResult(t, results[5], "@slkiser/opencode-quota", NotInstalled, "", "3.8.7")
 }
 
 func TestCheckSingleTool_EngramUsesBinaryReleaseChannel(t *testing.T) {
@@ -980,8 +1021,8 @@ func TestParseVersionFromOutput(t *testing.T) {
 
 // TestRegistryContents verifies the registry has all expected tools.
 func TestRegistryContents(t *testing.T) {
-	if len(Tools) != 5 {
-		t.Fatalf("len(Tools) = %d, want 5", len(Tools))
+	if len(Tools) != 6 {
+		t.Fatalf("len(Tools) = %d, want 6", len(Tools))
 	}
 
 	expected := map[string]struct {
@@ -993,6 +1034,7 @@ func TestRegistryContents(t *testing.T) {
 		"gga":                          {owner: "Gentleman-Programming", repo: "gentleman-guardian-angel"},
 		"opencode-subagent-statusline": {owner: "Joaquinvesapa", repo: "sub-agent-statusline"},
 		"opencode-sdd-engram-manage":   {owner: "j0k3r-dev-rgl", repo: "sdd-engram-plugin"},
+		"@slkiser/opencode-quota":      {owner: "slkiser", repo: "opencode-quota"},
 	}
 
 	for _, tool := range Tools {
@@ -1023,7 +1065,7 @@ func TestRegistryContents(t *testing.T) {
 	if Tools[2].DetectCmd == nil {
 		t.Fatalf("gga DetectCmd should not be nil")
 	}
-	if Tools[3].NpmPackage == "" || Tools[4].NpmPackage == "" {
+	if Tools[3].NpmPackage == "" || Tools[4].NpmPackage == "" || Tools[5].NpmPackage == "" {
 		t.Fatalf("OpenCode plugin tools should declare NpmPackage")
 	}
 }

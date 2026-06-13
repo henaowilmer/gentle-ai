@@ -320,6 +320,9 @@ func TestPiCombinedWithOtherAgentsTUIInstallKeepsAllAgentsInPlan(t *testing.T) {
 	if state.Screen != ScreenOpenCodePlugins {
 		t.Fatalf("after preset screen = %v, want %v", state.Screen, ScreenOpenCodePlugins)
 	}
+	if !reflect.DeepEqual(state.Selection.OpenCodePlugins, []model.OpenCodeCommunityPluginID{model.OpenCodePluginQuota}) {
+		t.Fatalf("default OpenCode plugins = %v, want [%v]", state.Selection.OpenCodePlugins, model.OpenCodePluginQuota)
+	}
 
 	state.Cursor = len(opencodepluginDefinitions()) * 2 // Continue without optional plugins.
 	updated, _ = state.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -1357,6 +1360,74 @@ func TestStandaloneOpenCodePluginsContinueRegistersSelectedPlugins(t *testing.T)
 	}
 	if !strings.Contains(string(data), "opencode-subagent-statusline") {
 		t.Fatalf("tui.json missing plugin registration: %s", data)
+	}
+}
+
+func TestStandaloneOpenCodePluginsContinueRegistersDefaultQuotaPlugin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenWelcome
+	m.Cursor = 6
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+	if state.Screen != ScreenOpenCodePlugins {
+		t.Fatalf("screen = %v, want %v", state.Screen, ScreenOpenCodePlugins)
+	}
+	if !reflect.DeepEqual(state.Selection.OpenCodePlugins, []model.OpenCodeCommunityPluginID{model.OpenCodePluginQuota}) {
+		t.Fatalf("default OpenCode plugins = %v, want [%v]", state.Selection.OpenCodePlugins, model.OpenCodePluginQuota)
+	}
+
+	state.Cursor = len(opencodepluginDefinitions()) * 2
+	updated, cmd := state.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state = updated.(Model)
+	if state.Screen != ScreenOpenCodePluginResult {
+		t.Fatalf("screen = %v, want %v", state.Screen, ScreenOpenCodePluginResult)
+	}
+	if cmd == nil {
+		t.Fatal("expected registration command")
+	}
+
+	msg := cmd()
+	done, ok := msg.(OpenCodePluginRegistrationDoneMsg)
+	if !ok {
+		t.Fatalf("message = %T, want OpenCodePluginRegistrationDoneMsg", msg)
+	}
+	if done.Err != nil {
+		t.Fatalf("registration error = %v", done.Err)
+	}
+	if len(done.Results) != 1 || !done.Results[0].Changed {
+		t.Fatalf("results = %#v, want one changed registration", done.Results)
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "tui.json"))
+	if err != nil {
+		t.Fatalf("read tui.json: %v", err)
+	}
+	if !strings.Contains(string(data), "@slkiser/opencode-quota") {
+		t.Fatalf("tui.json missing default quota plugin registration: %s", data)
+	}
+}
+
+func TestStandaloneOpenCodePluginsShortcutPreselectsQuotaPlugin(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenWelcome
+	m.Cursor = 6
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	if state.Screen != ScreenOpenCodePlugins {
+		t.Fatalf("screen = %v, want %v", state.Screen, ScreenOpenCodePlugins)
+	}
+	if !state.OpenCodePluginsStandalone {
+		t.Fatal("standalone mode should be enabled")
+	}
+	if !reflect.DeepEqual(state.Selection.OpenCodePlugins, []model.OpenCodeCommunityPluginID{model.OpenCodePluginQuota}) {
+		t.Fatalf("default OpenCode plugins = %v, want [%v]", state.Selection.OpenCodePlugins, model.OpenCodePluginQuota)
 	}
 }
 

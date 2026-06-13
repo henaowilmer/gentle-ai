@@ -46,6 +46,15 @@ var definitions = []Definition{
 		Repo:        "sdd-engram-plugin",
 		Description: "OpenCode TUI for SDD profiles and Engram memories",
 	},
+	{
+		ID:          model.OpenCodePluginQuota,
+		Name:        "OpenCode Quota",
+		PackageName: "@slkiser/opencode-quota",
+		RepoURL:     "https://github.com/slkiser/opencode-quota",
+		Owner:       "slkiser",
+		Repo:        "opencode-quota",
+		Description: "Quota, usage, and token visibility for OpenCode",
+	},
 }
 
 const gentleLogoPluginFile = "gentle-logo.tsx"
