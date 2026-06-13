@@ -1401,6 +1401,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.OpenCodePluginRegistrationResults = nil
 				m.OpenCodePluginRegistrationErr = nil
 				m.Selection.OpenCodePlugins = nil
+				m.initDefaultOpenCodePlugins()
 				m.setScreen(ScreenOpenCodePlugins)
 				return m, nil
 			}
@@ -1772,6 +1773,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.shouldShowOpenCodePluginsScreen() {
+				m.initDefaultOpenCodePlugins()
 				m.setScreen(ScreenOpenCodePlugins)
 				return m, nil
 			}
@@ -1981,6 +1983,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			// Enable is index 0, Disable is index 1.
 			m.Selection.StrictTDD = (m.Cursor == screens.StrictTDDOptionEnable)
 			if m.shouldShowOpenCodePluginsScreen() {
+				m.initDefaultOpenCodePlugins()
 				m.setScreen(ScreenOpenCodePlugins)
 			} else if m.Selection.Preset == model.PresetCustom {
 				// Custom preset: dependency plan was already built before SDD mode.
@@ -2051,6 +2054,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.shouldShowOpenCodePluginsScreen() {
+					m.initDefaultOpenCodePlugins()
 					m.setScreen(ScreenOpenCodePlugins)
 					return m, nil
 				}
@@ -3348,12 +3352,29 @@ func (m Model) goBackFromOpenCodePlugins() Model {
 	return m
 }
 
+func (m *Model) initDefaultOpenCodePlugins() {
+	if m.Selection.OpenCodePlugins != nil {
+		return
+	}
+	m.Selection.OpenCodePlugins = []model.OpenCodeCommunityPluginID{model.OpenCodePluginQuota}
+}
+
 func opencodepluginDefinitions() []model.OpenCodeCommunityPluginID {
-	return []model.OpenCodeCommunityPluginID{model.OpenCodePluginSubAgentStatusline, model.OpenCodePluginSDDEngramManage}
+	defs := opencodeplugin.Definitions()
+	out := make([]model.OpenCodeCommunityPluginID, 0, len(defs))
+	for _, def := range defs {
+		out = append(out, def.ID)
+	}
+	return out
 }
 
 func opencodepluginRepoURLs() []string {
-	return []string{"https://github.com/Joaquinvesapa/sub-agent-statusline", "https://github.com/j0k3r-dev-rgl/sdd-engram-plugin"}
+	defs := opencodeplugin.Definitions()
+	out := make([]string, 0, len(defs))
+	for _, def := range defs {
+		out = append(out, def.RepoURL)
+	}
+	return out
 }
 
 func openBrowserCmd(url string) tea.Cmd {
