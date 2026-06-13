@@ -79,7 +79,7 @@ func TestInjectOpenCodeCreatesTUIThemeAndThemeFile(t *testing.T) {
 	}
 
 	tuiPath := filepath.Join(home, ".config", "opencode", "tui.json")
-	themePath := filepath.Join(home, ".config", "opencode", "themes", "gentleman-kanagawa.json")
+	themePath := filepath.Join(home, ".config", "opencode", "themes", defaultOpenCodeThemeName+".json")
 	if !first.Changed {
 		t.Fatalf("Inject() changed = false")
 	}
@@ -101,8 +101,8 @@ func TestInjectOpenCodeCreatesTUIThemeAndThemeFile(t *testing.T) {
 	if err := json.Unmarshal(data, &root); err != nil {
 		t.Fatalf("Unmarshal(tui) error = %v", err)
 	}
-	if root.Theme != "gentleman-kanagawa" {
-		t.Fatalf("theme = %q, want gentleman-kanagawa", root.Theme)
+	if root.Theme != defaultOpenCodeThemeName {
+		t.Fatalf("theme = %q, want %s", root.Theme, defaultOpenCodeThemeName)
 	}
 	if root.Schema != "https://opencode.ai/tui.json" {
 		t.Fatalf("schema = %q, want https://opencode.ai/tui.json", root.Schema)
@@ -122,10 +122,13 @@ func TestInjectOpenCodeCreatesTUIThemeAndThemeFile(t *testing.T) {
 	if themeRoot.Schema != "https://opencode.ai/theme.json" {
 		t.Fatalf("theme schema = %q, want https://opencode.ai/theme.json", themeRoot.Schema)
 	}
-	for _, key := range []string{"primary", "secondary", "accent", "text", "textMuted", "background"} {
+	for _, key := range []string{"primary", "secondary", "accent", "text", "textMuted", "background", "diffContextBg"} {
 		if _, ok := themeRoot.Theme[key]; !ok {
 			t.Fatalf("theme missing required key %q", key)
 		}
+	}
+	if got := themeRoot.Theme["background"]; got != "none" {
+		t.Fatalf("theme background = %#v, want \"none\"", got)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".config", "opencode", "opencode.json")); !os.IsNotExist(err) {
 		t.Fatalf("Inject() should not write opencode.json for OpenCode theme; stat error = %v", err)
@@ -154,8 +157,8 @@ func TestInjectOpenCodePreservesExistingTUIConfig(t *testing.T) {
 	if err := json.Unmarshal(data, &root); err != nil {
 		t.Fatalf("Unmarshal(tui) error = %v", err)
 	}
-	if got := root["theme"]; got != "gentleman-kanagawa" {
-		t.Fatalf("theme = %#v, want gentleman-kanagawa", got)
+	if got := root["theme"]; got != defaultOpenCodeThemeName {
+		t.Fatalf("theme = %#v, want %s", got, defaultOpenCodeThemeName)
 	}
 	plugins, ok := root["plugin"].([]any)
 	if !ok || len(plugins) != 1 || plugins[0] != "existing-plugin" {

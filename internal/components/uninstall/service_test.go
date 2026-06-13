@@ -11,6 +11,7 @@ import (
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/components/theme"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 )
 
@@ -439,11 +440,11 @@ func TestComponentOperationsTheme_OpenCodeRemovesManagedThemeAndPreservesUnrelat
 
 	tuiPath := filepath.Join(homeDir, ".config", "opencode", "tui.json")
 	themeDir := filepath.Join(homeDir, ".config", "opencode", "themes")
-	themePath := filepath.Join(themeDir, "gentleman-kanagawa.json")
+	themePath := filepath.Join(themeDir, theme.DefaultOpenCodeThemeFileName())
 	if err := os.MkdirAll(themeDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(theme dir) error = %v", err)
 	}
-	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","theme":"gentleman-kanagawa","plugin":["existing-plugin"],"layout":"compact"}`), 0o644); err != nil {
+	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","theme":"gentleman-midnight","plugin":["existing-plugin"],"layout":"compact"}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(tui) error = %v", err)
 	}
 	if err := os.WriteFile(themePath, []byte(`{"$schema":"https://opencode.ai/theme.json","theme":{"primary":"#fff"}}`), 0o644); err != nil {
@@ -494,16 +495,20 @@ func TestComponentOperationsTheme_OpenCodePreservesNonEmptyThemesDirectory(t *te
 
 	tuiPath := filepath.Join(homeDir, ".config", "opencode", "tui.json")
 	themeDir := filepath.Join(homeDir, ".config", "opencode", "themes")
-	themePath := filepath.Join(themeDir, "gentleman-kanagawa.json")
+	themePath := filepath.Join(themeDir, theme.DefaultOpenCodeThemeFileName())
+	legacyThemePath := filepath.Join(themeDir, theme.LegacyOpenCodeThemeFileName())
 	customThemePath := filepath.Join(themeDir, "custom.json")
 	if err := os.MkdirAll(themeDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(theme dir) error = %v", err)
 	}
-	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","theme":"gentleman-kanagawa","sidebar":"visible"}`), 0o644); err != nil {
+	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","theme":"gentleman-midnight","sidebar":"visible"}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(tui) error = %v", err)
 	}
 	if err := os.WriteFile(themePath, []byte(`{"managed":true}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(managed theme) error = %v", err)
+	}
+	if err := os.WriteFile(legacyThemePath, []byte(`{"legacy":true}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(legacy managed theme) error = %v", err)
 	}
 	if err := os.WriteFile(customThemePath, []byte(`{"custom":true}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(custom theme) error = %v", err)
@@ -513,6 +518,9 @@ func TestComponentOperationsTheme_OpenCodePreservesNonEmptyThemesDirectory(t *te
 
 	if _, err := os.Stat(themePath); !os.IsNotExist(err) {
 		t.Fatalf("managed theme file should be removed; stat err = %v", err)
+	}
+	if _, err := os.Stat(legacyThemePath); !os.IsNotExist(err) {
+		t.Fatalf("legacy managed theme file should be removed; stat err = %v", err)
 	}
 	if _, err := os.Stat(customThemePath); err != nil {
 		t.Fatalf("custom theme file should be preserved; stat err = %v", err)

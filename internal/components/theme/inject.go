@@ -19,7 +19,19 @@ type InjectionResult struct {
 
 var themeOverlayJSON = []byte("{\n  \"theme\": \"gentleman-kanagawa\"\n}\n")
 
-var openCodeTUIOverlayJSON = []byte("{\n  \"$schema\": \"https://opencode.ai/tui.json\",\n  \"theme\": \"gentleman-kanagawa\"\n}\n")
+const defaultOpenCodeThemeName = "gentleman-midnight"
+
+const legacyOpenCodeThemeName = "gentleman-kanagawa"
+
+func DefaultOpenCodeThemeFileName() string {
+	return defaultOpenCodeThemeName + ".json"
+}
+
+func LegacyOpenCodeThemeFileName() string {
+	return legacyOpenCodeThemeName + ".json"
+}
+
+var openCodeTUIOverlayJSON = []byte("{\n  \"$schema\": \"https://opencode.ai/tui.json\",\n  \"theme\": \"gentleman-midnight\"\n}\n")
 
 type claudeTheme struct {
 	Name      string            `json:"name"`
@@ -63,14 +75,14 @@ func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
 func injectOpenCodeTheme(homeDir string) (InjectionResult, error) {
 	opencodeDir := filepath.Join(homeDir, ".config", "opencode")
 	tuiPath := filepath.Join(opencodeDir, "tui.json")
-	themePath := filepath.Join(opencodeDir, "themes", "gentleman-kanagawa.json")
+	themePath := filepath.Join(opencodeDir, "themes", DefaultOpenCodeThemeFileName())
 
 	tuiWrite, err := mergeJSONFile(tuiPath, openCodeTUIOverlayJSON)
 	if err != nil {
 		return InjectionResult{}, err
 	}
 
-	themeWrite, err := filemerge.WriteFileAtomic(themePath, []byte(assets.MustRead("opencode/themes/gentleman-kanagawa.json")), 0o644)
+	themeWrite, err := filemerge.WriteFileAtomic(themePath, []byte(assets.MustRead("opencode/themes/"+DefaultOpenCodeThemeFileName())), 0o644)
 	if err != nil {
 		return InjectionResult{}, err
 	}

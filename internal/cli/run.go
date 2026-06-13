@@ -1207,7 +1207,7 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 			case model.AgentOpenCode:
 				paths = append(paths,
 					filepath.Join(homeDir, ".config", "opencode", "tui.json"),
-					filepath.Join(homeDir, ".config", "opencode", "themes", "gentleman-kanagawa.json"),
+					filepath.Join(homeDir, ".config", "opencode", "themes", theme.DefaultOpenCodeThemeFileName()),
 				)
 			default:
 				if p := adapter.SettingsPath(homeDir); p != "" {
