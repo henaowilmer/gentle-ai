@@ -57,6 +57,7 @@ var (
 	cmdLookPath         = exec.LookPath
 	streamCommandOutput = true
 	goEnv               = defaultGoEnv
+	detectDependencies  = system.DetectDependencies
 
 	// ggaAvailableCheck is an optional override for ggaAvailable behavior.
 	// When set, it is called instead of the default filesystem check.
@@ -708,7 +709,7 @@ func (s componentApplyStep) Run() error {
 		setupStrict := engram.ParseSetupStrict(os.Getenv(engram.SetupStrictEnvVar))
 		attemptedSlugs := make(map[string]struct{}, len(adapters))
 		for _, adapter := range adapters {
-			if engram.ShouldAttemptSetup(setupMode, adapter.Agent()) {
+			if shouldAttemptEngramSetup(s.profile, setupMode, adapter.Agent()) {
 				slug, _ := engram.SetupAgentSlug(adapter.Agent())
 				if _, seen := attemptedSlugs[slug]; !seen {
 					if err := runCommand(engramCommand, "setup", slug); err != nil {
@@ -916,6 +917,13 @@ func BuildRealStagePlan(homeDir string, scope InstallScope, selection model.Sele
 	}
 
 	return runtime.stagePlan(), nil
+}
+
+func shouldAttemptEngramSetup(profile system.PlatformProfile, mode engram.SetupMode, agent model.AgentID) bool {
+	if profile.PackageManager == "pkg" && agent == model.AgentClaudeCode {
+		return false
+	}
+	return engram.ShouldAttemptSetup(mode, agent)
 }
 
 // ResolveInstallProfile returns the platform profile from detection, defaulting to darwin/brew.
@@ -1570,6 +1578,8 @@ type checkDependenciesStep struct {
 	selection model.Selection
 }
 
+var checkDependenciesTimeout = 15 * time.Second
+
 func (s checkDependenciesStep) ID() string {
 	return s.id
 }
@@ -1580,7 +1590,9 @@ func (s checkDependenciesStep) Run() error {
 	// output corrupts the display (see issue #2). Missing deps are
 	// surfaced on the TUI complete screen and by the actual install steps
 	// failing with real error messages.
-	_ = system.DetectDependencies(context.Background(), s.profile)
+	ctx, cancel := context.WithTimeout(context.Background(), checkDependenciesTimeout)
+	defer cancel()
+	_ = detectDependencies(ctx, s.profile)
 	for _, agent := range s.selection.Agents {
 		adapter, err := agents.NewAdapter(agent)
 		if err != nil {

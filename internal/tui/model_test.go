@@ -406,6 +406,60 @@ func TestReviewToInstallingInitializesProgress(t *testing.T) {
 	}
 }
 
+func TestStartInstallingStreamsPipelineProgressEvents(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenReview
+	m.DependencyPlan = planner.ResolvedPlan{
+		OrderedComponents: []model.ComponentID{model.ComponentEngram},
+	}
+	m.ExecuteFn = func(_ model.Selection, _ planner.ResolvedPlan, _ system.DetectionResult, onProgress pipeline.ProgressFunc) pipeline.ExecutionResult {
+		onProgress(pipeline.ProgressEvent{StepID: "component:engram", Status: pipeline.StepStatusRunning})
+		return pipeline.ExecutionResult{
+			Prepare: pipeline.StageResult{Success: true},
+			Apply:   pipeline.StageResult{Success: true},
+		}
+	}
+
+	updated, _ := m.startInstalling()
+	state := updated.(Model)
+	if state.pipelineEvents == nil {
+		t.Fatal("pipelineEvents = nil, want progress event channel")
+	}
+
+	msg := waitPipelineEvent(state.pipelineEvents)()
+	progress, ok := msg.(StepProgressMsg)
+	if !ok {
+		t.Fatalf("first pipeline event = %T, want StepProgressMsg", msg)
+	}
+	if progress.StepID != "component:engram" || progress.Status != pipeline.StepStatusRunning {
+		t.Fatalf("progress event = %#v, want component:engram running", progress)
+	}
+
+	updated, cmd := state.Update(progress)
+	state = updated.(Model)
+	idx := state.findProgressItem("component:engram")
+	if idx < 0 {
+		t.Fatal("component:engram progress item not found")
+	}
+	if state.Progress.Items[idx].Status != ProgressStatusRunning {
+		t.Fatalf("component:engram status = %q, want running", state.Progress.Items[idx].Status)
+	}
+	if cmd == nil {
+		t.Fatal("Update(StepProgressMsg) command = nil, want next pipeline event wait command")
+	}
+
+	doneMsg := cmd()
+	done, ok := doneMsg.(PipelineDoneMsg)
+	if !ok {
+		t.Fatalf("next pipeline event = %T, want PipelineDoneMsg", doneMsg)
+	}
+	updated, _ = state.Update(done)
+	state = updated.(Model)
+	if state.pipelineRunning {
+		t.Fatal("pipelineRunning = true after PipelineDoneMsg, want false")
+	}
+}
+
 func TestStepProgressMsgUpdatesProgressState(t *testing.T) {
 	m := NewModel(system.DetectionResult{}, "dev")
 	m.Screen = ScreenInstalling
