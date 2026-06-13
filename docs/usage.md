@@ -83,7 +83,7 @@ The command scans project skills first (`skills/`, `.opencode/skills/`, `.claude
 
 The command writes `.atl/skill-registry.md` and `.atl/.skill-registry.cache.json`. The cache fingerprint includes schema version plus each discovered `SKILL.md` file path, mtime, and size, so normal startup is a cheap cache-hit when skills have not changed.
 
-Claude Code and OpenCode installs wire this command into startup/plugin hooks. Pi gets the equivalent behavior from `gentle-pi`; keep that extension's scan roots in sync when changing these discovery rules.
+Codex, Claude Code, and OpenCode installs wire this command into startup/plugin hooks. Pi gets the equivalent behavior from `gentle-pi`; keep those hook/plugin scan roots in sync when changing these discovery rules.
 
 See [Skill Registry](skill-registry.md) for the full index-first flow and diagrams.
 
@@ -116,6 +116,8 @@ Sync is safe and idempotent — running it twice produces no changes the second 
 `sync` refreshes the managed component set for the selected agents. It does not support `--component`; use `--include-permissions` or `--include-theme` for the opt-in components that are excluded from the default sync scope.
 
 For OpenClaw, sync reads the active workspace from `~/.openclaw/openclaw.json` (`agents.defaults.workspace`). It writes `AGENTS.md` / `SOUL.md` into that workspace, while MCP servers stay in the global OpenClaw config under `mcp.servers`.
+
+For Hermes, gentle-ai is detect-only: it cannot install Hermes. Install Hermes manually first. Detection is driven by the `~/.hermes` config directory (the binary being on `PATH` is reported separately). Once Hermes is detected, `gentle-ai install --agent hermes` injects context7 and Engram MCP blocks into `~/.hermes/config.yaml`, writes the SDD orchestrator and persona into `~/.hermes/SOUL.md`, and copies skills to `~/.hermes/skills/`. Use `gentle-ai sync --agent hermes` to update the managed configuration after upgrades.
 
 ### uninstall
 
@@ -158,6 +160,18 @@ gentle-ai upgrade
 After upgrading, run `gentle-ai sync` to refresh all managed assets to the new version's content.
 
 If GitHub rate-limits update checks, export `GITHUB_TOKEN` or `GH_TOKEN` before running `gentle-ai update`/`upgrade`.
+
+If Homebrew refuses an upgrade from an untrusted tap, trust only the artifact Homebrew names and retry the upgrade:
+
+```bash
+# Formula tools, for example gentle-ai
+brew trust --formula gentleman-programming/tap/gentle-ai
+brew upgrade gentle-ai
+
+# Cask tools, for example engram
+brew trust --cask gentleman-programming/tap/engram
+brew upgrade engram
+```
 
 Set `GENTLE_AI_CONFIRM_UPDATE=1` to have `gentle-ai` prompt for confirmation (`y/N`) before applying a self-update. Default behavior (no env var) applies the update without an interactive prompt.
 
@@ -272,6 +286,35 @@ gentle-ai uninstall --agent claude-code --component sdd,persona
 # Adding a new agent later
 gentle-ai install --agent windsurf --preset full-gentleman
 ```
+
+### Homebrew upgrade troubleshooting
+
+Homebrew 6 can require explicit trust for non-official taps and, on Linux, can
+sandbox builds with Bubblewrap. `gentle-ai upgrade` and `scripts/install.sh`
+auto-trust only the Gentle AI formula, but manual upgrades may still need this
+one-time command:
+
+```bash
+brew trust --formula gentleman-programming/tap/gentle-ai
+brew upgrade gentle-ai
+```
+
+On Linux, if Homebrew reports that Bubblewrap cannot create a rootless sandbox,
+there is nothing for Gentle AI to install: Bubblewrap is already present, but the
+host blocks the rootless namespace primitives it needs. This is a security
+tradeoff and should be an explicit admin decision. If your policy allows it,
+fix the host namespace policy first:
+
+```bash
+sudo sysctl -w kernel.unprivileged_userns_clone=1
+sudo sysctl -w user.max_user_namespaces=28633
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+```
+
+Use `HOMEBREW_NO_SANDBOX_LINUX=1 brew upgrade gentle-ai` only as a final
+workaround when your distro policy forbids the namespace settings; it disables
+Homebrew's Linux sandbox for that command.
+
 
 ---
 

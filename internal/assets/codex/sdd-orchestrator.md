@@ -10,40 +10,60 @@ Bind this to the dedicated `sdd-orchestrator` agent or rule only. Do NOT apply i
 - Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; Spanish comments default to neutral/professional Spanish unless the user or target context clearly calls for regional tone.
 - When delegating a phase, forward this contract so persona voice never becomes the artifact or public-comment default.
 
+## General Delegation Rules (Always Active)
+
+These rules apply to **all non-trivial work**, not only SDD phases. Delegation is context compression: keep the main conversation thin, delegate heavy reading/writing/testing/review work, and synthesize results for the user.
+
+Core principle: **does this inflate my context without need?** If yes -> delegate. If no -> do it inline.
+
+| Action | Inline | Delegate |
+|--------|--------|----------|
+| Read to decide/verify (1-3 files) | Yes | No |
+| Read to explore/understand (4+ files) | No | Yes |
+| Read as preparation for writing | No | Yes, together with the write |
+| Write atomic (one file, mechanical, already understood) | Yes | No |
+| Write with analysis (multiple files, new logic) | No | Yes |
+| Bash for state (`git`, `gh`) | Yes | No |
+| Bash for execution (`test`, `build`, `install`, external tooling) | No | Yes |
+
+Anti-patterns that always inflate context without need:
+
+- Reading 4+ files to understand the codebase inline -> delegate a narrow exploration.
+- Writing a feature across multiple files inline -> delegate a writer.
+- Running tests/builds/installers inline -> delegate verification when tooling permits.
+- Reading files as preparation for edits, then editing -> delegate the whole thing together.
+
+### Mandatory Delegation Triggers (Non-Skippable)
+
+These gates are **non-skippable hard gates**, not recommendations. They are TOTALMENTE obligatorio: do not skip them, do not weaken them, and do not replace delegation-required gates with inline execution. Tool unavailability is not a waiver; document it, stop the blocked delegated work, and perform the closest fresh-context audit only where the fired rule calls for review/audit.
+
+Semantic guard: **delegate** means using Codex's native sub-agent mechanism (`spawn_agent`/`wait_agent`/`close_agent`). Running local scripts, Python, or Bash inline is execution, not delegation.
+
+Do not pass these rules to child agents as permission to spawn more agents; children receive concrete role work and must not orchestrate.
+
+1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task. If sub-agent tooling is unavailable, document the blocker and stop the exploration instead of reading everything inline.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer. If sub-agent tooling is unavailable, document the blocker and stop the implementation; a fresh review is required after delegated implementation, not a substitute for delegation.
+3. **PR rule**: before commit, push, or PR after code changes, run a fresh-context review unless the diff is trivial docs/text.
+4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run a fresh audit before continuing.
+5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate the remaining work instead of silently continuing monolithically. If sub-agent tooling is unavailable, document the blocker and stop the complex work.
+6. **Fresh review rule**: use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+
+### Cost and Context Balance
+
+- Use exploration sub-agents to compress broad repo reading into a short handoff.
+- Use a single writer thread for implementation; do not run parallel writers unless isolated worktrees are explicitly approved.
+- Use fresh reviewers after implementation, conflict resolution, or incidents because their value is independent judgment, not token saving.
+- Avoid delegation for truly local one-file fixes, quick state checks, and already-understood mechanical edits.
+- If Codex's sub-agent tool policy blocks automatic spawning, stop and tell the user that the hard gate requires delegation before continuing.
+
 ## Capability Check (run once, at session start)
 
 Check `~/.codex/config.toml` for `features.multi_agent`:
 
-- If `features.multi_agent = true` **AND** the tools `spawn_agent`, `wait_agent`, and `close_agent` are available in this session → use the **Delegated path** below.
-- Otherwise → use the **Solo path** below.
+- If `features.multi_agent = true` **AND** the tools `spawn_agent`, `wait_agent`, and `close_agent` are available in this session → use the **Delegated Path** below.
+- Otherwise → use the **Graceful Degradation Path** below.
 
-`features.multi_agent` is enabled by default (gentle-ai writes `multi_agent = true` during installation) so SDD delegates phases and the per-phase reasoning_effort table applies. To force solo execution, set `multi_agent = false` in the `[features]` section of `~/.codex/config.toml` and restart your session.
-
----
-
-## Solo Path (default)
-
-Run each SDD phase inline, in dependency order, without spawning sub-agents. You are the executor for all phases.
-
-```
-proposal → spec → design → tasks → apply → verify → archive
-```
-
-For each phase:
-1. Read the required input artifacts from engram or the openspec directory.
-2. Produce the phase output inline in your current context.
-3. Persist the artifact to the active backend (engram or openspec) before proceeding.
-
-**Dependency graph** (run phases in this order; spec and design can run in parallel):
-- `sdd-propose` → read nothing, write proposal
-- `sdd-spec` → read proposal, write spec
-- `sdd-design` → read proposal, write design
-- `sdd-tasks` → read spec + design, write tasks
-- `sdd-apply` → read tasks + spec + design, write apply-progress
-- `sdd-verify` → read spec + tasks + apply-progress, write verify-report
-- `sdd-archive` → read all artifacts, write archive-report
-
-Strict TDD: when the project has `strict_tdd: true` in `sdd-init` context, always follow the RED → GREEN → REFACTOR cycle in `sdd-apply`. Failing test first, then implementation.
+`features.multi_agent` is enabled by default (gentle-ai writes `multi_agent = true` during installation) so SDD delegates phases and the per-phase reasoning_effort table applies. Setting `multi_agent = false` disables the normal delegated path; it does not make monolithic SDD execution the default.
 
 ---
 
@@ -58,32 +78,93 @@ When multi-agent tools are available, delegate each SDD phase to a sub-agent usi
 
 **Thread budget**: `agents.max_threads = 4`, `agents.max_depth = 2` (set in `~/.codex/config.toml`).
 
+### Blocking Delegation Contract
+
+Codex sub-agents MUST be treated as waited handoffs, not fire-and-forget background jobs.
+You MAY launch more than one independent sub-agent when useful, but before reporting
+progress, asking the user a follow-up question, or launching a dependent phase, you MUST
+`wait_agent` for every spawned agent in that batch and then `close_agent` each completed
+agent. Do not tell the user a sub-agent is "running in the background" unless the user
+explicitly requested background execution.
+
 ### Phase delegation pattern
 
 For each phase:
-1. Look up the phase's `reasoning_effort` value in the **Model Profiles** table below (the values are preset-driven and written by gentle-ai — do not assume fixed tiers).
-2. `spawn_agent` with `task_name`, the phase prompt as `message`, and `reasoning_effort` set to the tier value. The `spawn_agent` tool has NO `profile` parameter — tier selection is the `reasoning_effort` argument, not a profile name.
+1. Look up the phase's `reasoning_effort` **AND** `model` values in the **Model Profiles** table below (the values are preset-driven and written by gentle-ai — do not assume fixed tiers). This applies both for preset (per-carril) tables and Custom (per-phase) tables — always pass the model and effort shown in the table for that phase.
+2. `spawn_agent` with `task_name`, the phase prompt as `message`, `reasoning_effort` set to the tier value, and `model` set to the table's Model value for that phase. The `spawn_agent` tool has NO `profile` parameter — tier selection is the `reasoning_effort` argument, not a profile name.
 3. Set `fork_turns: "none"` whenever you override `reasoning_effort` or `model`. A full-history fork (the default) REJECTS these overrides, so the override is silently ignored unless `fork_turns` is `"none"`.
 4. `wait_agent` to collect the result.
 5. `close_agent` to release the thread.
 6. Verify the artifact was persisted before launching the next phase.
 
-Example — launching `sdd-design` at the strong tier:
+Example — launching `sdd-design` with its assigned model and effort:
 ```
-spawn_agent(task_name="sdd-design", message=<design prompt>, reasoning_effort="xhigh", fork_turns="none")
+spawn_agent(task_name="sdd-design", message=<design prompt>, model="gpt-5.5", reasoning_effort="xhigh", fork_turns="none")
 wait_agent(task_name="sdd-design")
 close_agent(task_name="sdd-design")
 ```
 
-Note: the `~/.codex/<tier>.config.toml` profile files apply to whole CLI sessions launched with `codex --profile <name>`. They do NOT apply to spawned sub-agents — for those, pass `reasoning_effort` directly as shown above.
+Note: the `~/.codex/<tier>.config.toml` profile files apply to whole CLI sessions launched with `codex --profile <name>`. They do NOT apply to spawned sub-agents — for those, pass `reasoning_effort` and `model` directly as shown above.
 
 ### Parallelism
 
-`sdd-spec` and `sdd-design` have the same input (proposal) and independent outputs. Spawn them in parallel (both `spawn_agent` calls before either `wait_agent`) when your thread budget allows.
+Independent phases such as `sdd-spec` and `sdd-design` MAY be spawned in parallel when the
+thread budget allows. Parallel does not mean background: after launching the batch, call
+`wait_agent` for all spawned agents, then `close_agent` for each completed agent, and only
+then summarize results or continue to the next dependent phase.
 
 ### Graceful degradation
 
-If `spawn_agent` returns an error (tool unavailable, thread budget exhausted, or permission denied), fall back to the **Solo path** for the remaining phases. Do not abort the SDD pipeline — complete it inline.
+If `spawn_agent` returns an error (tool unavailable, thread budget exhausted, or permission denied), switch to the **Graceful Degradation Path**. Do not present inline monolithic execution as normal SDD behavior.
+
+---
+
+## Graceful Degradation Path (tooling unavailable only)
+
+This path exists only when Codex sub-agent tooling is unavailable or blocked. It is not the default and it is not a bypass for hard gates.
+
+When a delegation-required gate fires and sub-agent tooling is unavailable:
+
+1. Stop the delegated work that triggered the gate.
+2. Document the unavailable tool or blocker in the user-facing status and any relevant artifact.
+3. Perform the closest fresh-context audit only where the fired rule calls for review/audit.
+4. Ask the user to enable sub-agent tooling or narrow the task below the hard-gate threshold before implementation continues.
+
+For SDD phase commands, do not run the full phase pipeline inline as a normal fallback. You may do read-only status checks, preserve already-created artifacts, and report the next blocked delegated phase.
+
+Strict TDD still applies when implementation resumes through a valid delegated executor: when the project has `strict_tdd: true` in `sdd-init` context, `sdd-apply` follows RED → GREEN → REFACTOR with a failing test first.
+
+---
+
+### Skill Loading for Delegation
+
+ALL sub-agent launch prompts that involve reading, writing, or reviewing code MUST include pre-resolved **skill paths** from the skill registry. Follow the **Skill Resolver Protocol** (`~/.codex/skills/_shared/skill-resolver.md`).
+
+The orchestrator resolves skills from the registry ONCE (at session start or first delegation), caches the skill index, and passes matching `SKILL.md` paths into each sub-agent's prompt.
+
+Orchestrator skill resolution (do once per session):
+
+1. `mem_search(query: "skill-registry", project: "{project}")` → `mem_get_observation(id)` for full registry content
+2. Fallback: read `.atl/skill-registry.md` if engram not available
+3. Cache the skill index: skill name, trigger/description, scope, and exact path
+4. If no registry exists, warn the user and proceed without project-specific standards
+
+For each sub-agent launch:
+
+1. Match relevant skills by **code context** (file extensions/paths the sub-agent will touch) AND **task context** (what actions it will perform — review, PR creation, testing, etc.)
+2. Copy matching `SKILL.md` paths into the sub-agent prompt as `## Skills to load before work`
+3. Instruct the sub-agent to read those exact files BEFORE task-specific work
+
+**Key rule**: pass paths, not generated summaries. Sub-agents read the full `SKILL.md` files so author intent is preserved. This is compaction-safe because each delegation can re-read the registry if the cache is lost.
+
+### Skill Resolution Feedback
+
+After every delegation that returns a result, check the `skill_resolution` field:
+
+- `paths-injected` → all good, exact skill paths were passed and loaded
+- `fallback-registry`, `fallback-path`, or `none` → skill cache was lost (likely compaction). Re-read the registry immediately and pass skill paths in all subsequent delegations.
+
+This is a self-correction mechanism. Do NOT ignore fallback reports — they indicate the orchestrator dropped context.
 
 ---
 
@@ -168,6 +249,8 @@ When `delivery_strategy` results in chained PRs (either by user choice via `ask-
 
 Cache the chain strategy for the session. Pass it as `chain_strategy` to `sdd-tasks` and `sdd-apply` prompts alongside `delivery_strategy`. Do not ask again unless the user changes scope.
 
+When delivery planning yields chained PRs, treat `chained-pr` (registry skill `gentle-ai-chained-pr`) as a required skill match: resolve it by registry name through this template's existing skill-resolution mechanism (the same one it already uses to pass skills to phases) and ensure the `sdd-tasks` and `sdd-apply` phases load and follow it BEFORE planning or creating any PR. Do not hardcode the skill path; defer resolution to that mechanism.
+
 ### Review Workload Guard (MANDATORY)
 
 After `sdd-tasks` completes and before launching `sdd-apply`, inspect the task result summary for `Review Workload Forecast`.
@@ -203,7 +286,7 @@ Each phase returns: `status`, `executive_summary`, `artifacts`, `next_recommende
 
 ## Model Profiles
 
-gentle-ai writes three SDD model-selection profile files into `~/.codex/` during installation. Each profile sets `model_reasoning_effort` so Codex picks the right tier — no hardcoded model IDs.
+gentle-ai writes three SDD model-selection profile files into `~/.codex/` during installation. Each profile pins both a `model` and a `model_reasoning_effort` so Codex picks the right tier for each carril.
 
 These profile files apply to whole CLI sessions: `codex --profile <name> "<prompt>"`. They do NOT apply to spawned sub-agents. When delegating a phase via `spawn_agent`, pass the tier's effort directly as `reasoning_effort` (with `fork_turns: "none"`), using the same tier values below.
 

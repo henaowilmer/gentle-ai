@@ -6,12 +6,14 @@
 
 - Homebrew installed and available in PATH.
 - `git` available.
+- If Homebrew requires tap trust, run `brew trust --formula gentleman-programming/tap/gentle-ai` once.
 
 ### Ubuntu/Debian (and derivatives like Linux Mint, Pop!\_OS)
 
 - `apt-get` available (standard on these distros).
 - `sudo` access for package installs.
 - `git` available.
+- If using Homebrew on Linux, Bubblewrap may require unprivileged user namespaces; see `docs/usage.md#homebrew-upgrade-troubleshooting`.
 
 ### Arch Linux (and derivatives like Manjaro, EndeavourOS)
 
@@ -80,7 +82,7 @@ When checks pass, installer reports:
 
 If something looks wrong after install, run `gentle-ai doctor` for a read-only health check. It verifies tool binaries, `state.json` validity, Engram MCP reachability, and disk space — each check reports pass/warn/fail with a remedy hint.
 
-For a Pi-only install, the plan shows the Pi package stack instead of Gentle AI components. It installs `gentle-pi`, `gentle-engram`, and `pi-mcp-adapter`, runs `pi-engram init` through the pinned `gentle-engram` package, then installs `pi-subagents`, `pi-intercom`, `@juicesharp/rpiv-ask-user-question`, `pi-web-access`, `pi-lens`, `@juicesharp/rpiv-todo`, and `pi-btw`.
+For a Pi-only install, the plan shows the Pi package stack instead of Gentle AI components. It installs `gentle-pi`, `gentle-engram`, and `pi-mcp-adapter`, runs `pi-engram init` through the pinned `gentle-engram` package, then installs `pi-subagents`, `pi-intercom`, `@juicesharp/rpiv-ask-user-question`, `pi-web-access`, `@juicesharp/rpiv-todo`, and `pi-btw`.
 
 ## Hardening recommendations for users
 

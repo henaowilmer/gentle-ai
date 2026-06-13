@@ -3,16 +3,16 @@ package upgrade
 import (
 	"context"
 	"errors"
+	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/internal/update"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
-
-	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/update"
 )
 
 // --- TestRunStrategy_BrewUpgrade ---
@@ -38,7 +38,7 @@ func TestRunStrategy_BrewUpgrade(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "darwin", PackageManager: "brew"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err != nil {
 		t.Fatalf("runStrategy brew: unexpected error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestRunStrategy_GoInstallUpgrade(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err != nil {
 		t.Fatalf("runStrategy go-install: unexpected error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestRunStrategy_GoInstallMissingImportPath(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err == nil {
 		t.Errorf("expected error when GoImportPath is empty, got nil")
 	}
@@ -121,7 +121,7 @@ func TestRunStrategy_UnsupportedMethodManualFallback(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	// Unsupported method → manual fallback error.
 	if err == nil {
 		t.Errorf("expected error for unsupported install method, got nil")
@@ -147,7 +147,7 @@ func TestRunStrategy_BrewUpgradeFailure(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "darwin", PackageManager: "brew"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err == nil {
 		t.Errorf("expected error when brew upgrade fails, got nil")
 	}
@@ -173,45 +173,96 @@ func TestRunStrategy_GoInstallFailure(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err == nil {
 		t.Errorf("expected error when go install fails, got nil")
 	}
 }
 
-// --- TestRunStrategy_BinaryWindowsSelfUpdateSkipped ---
+// --- TestEffectiveMethod_GentleAIOnWindowsUsesInstaller ---
 
-// TestRunStrategy_BinaryWindowsSelfUpdateSkipped verifies that the Windows binary
-// self-replace for gentle-ai is NOT attempted in Phase 1 — it must return a
-// manual hint error, not execute.
-func TestRunStrategy_BinaryWindowsSelfUpdateSkipped(t *testing.T) {
-	origExecCommand := execCommand
-	t.Cleanup(func() { execCommand = origExecCommand })
-
-	execCalled := false
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		execCalled = true
-		return mockCmd("echo", "should not run")
-	}
-
-	r := update.UpdateResult{
-		Tool: update.ToolInfo{
-			Name:          "gentle-ai",
-			InstallMethod: update.InstallBinary,
+// TestEffectiveMethod_GentleAIOnWindowsUsesInstaller verifies that gentle-ai
+// on Windows uses InstallInstaller (auto-upgrade via PowerShell)
+func TestEffectiveMethod_GentleAIOnWindowsUsesInstaller(t *testing.T) {
+	tests := []struct {
+		name string
+		tool update.ToolInfo
+		want update.InstallMethod
+	}{
+		{
+			name: "binary becomes installer",
+			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallBinary},
+			want: update.InstallInstaller,
 		},
-		LatestVersion: "1.5.0",
-		ReleaseURL:    "https://github.com/Gentleman-Programming/gentle-ai/releases/tag/v1.5.0",
+		{
+			name: "script becomes installer",
+			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallScript},
+			want: update.InstallInstaller,
+		},
+		{
+			name: "go-install becomes installer",
+			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallGoInstall},
+			want: update.InstallInstaller,
+		},
+		{
+			name: "installer stays installer",
+			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallInstaller},
+			want: update.InstallInstaller,
+		},
+		{
+			name: "go available still uses installer",
+			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallBinary, GoImportPath: "github.com/Gentleman-Programming/gentle-ai/cmd/gentle-ai"},
+			want: update.InstallInstaller,
+		},
 	}
-	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget"}
 
-	err := runStrategy(context.Background(), r, profile)
-	// Windows binary self-replace must return an error (manual hint) in Phase 1.
-	if err == nil {
-		t.Errorf("expected manual fallback error for Windows binary self-replace, got nil")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", GoAvailable: true}
+			method := effectiveMethod(tc.tool, profile)
+			if method != tc.want {
+				t.Errorf("effectiveMethod(%q) = %q, want %q", tc.tool.Name, method, tc.want)
+			}
+		})
+	}
+}
+
+// --- TestEffectiveMethod_NonGentleAIToolsOnWindowsUseBinary ---
+
+// TestEffectiveMethod_NonGentleAIToolsOnWindowsUseBinary verifies that tools
+// OTHER than gentle-ai on Windows still use their declared install method
+// (binary, script, etc.) - they don't get InstallInstaller.
+func TestEffectiveMethod_NonGentleAIToolsOnWindowsUseBinary(t *testing.T) {
+	tests := []struct {
+		name string
+		tool update.ToolInfo
+		want update.InstallMethod
+	}{
+		{
+			name: "engram uses binary",
+			tool: update.ToolInfo{Name: "engram", InstallMethod: update.InstallBinary},
+			want: update.InstallBinary,
+		},
+		{
+			name: "gga uses script",
+			tool: update.ToolInfo{Name: "gga", InstallMethod: update.InstallScript},
+			want: update.InstallScript,
+		},
+		{
+			name: "unknown tool uses binary",
+			tool: update.ToolInfo{Name: "other", InstallMethod: update.InstallBinary},
+			want: update.InstallBinary,
+		},
 	}
 
-	if execCalled {
-		t.Errorf("exec should NOT be called for Windows binary self-replace in Phase 1")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", GoAvailable: true}
+			method := effectiveMethod(tc.tool, profile)
+			if method != tc.want {
+				t.Errorf("effectiveMethod(%q) = %q, want %q", tc.tool.Name, method, tc.want)
+			}
+		})
 	}
 }
 
@@ -321,7 +372,7 @@ func TestRunStrategyOpenCodePluginManualFallback(t *testing.T) {
 		return mockCmd("echo", "should not run")
 	}
 
-	err := runStrategy(context.Background(), update.UpdateResult{
+	_, err := runStrategy(context.Background(), update.UpdateResult{
 		Tool: update.ToolInfo{
 			Name:          "opencode-subagent-statusline",
 			InstallMethod: update.InstallOpenCodePlugin,
@@ -394,7 +445,7 @@ func TestRunStrategyOpenCodePluginUpgradesMaterializedPackage(t *testing.T) {
 		return cmd
 	}
 
-	err := runStrategy(context.Background(), update.UpdateResult{
+	_, err := runStrategy(context.Background(), update.UpdateResult{
 		Tool: update.ToolInfo{
 			Name:          pkg,
 			InstallMethod: update.InstallOpenCodePlugin,
@@ -474,7 +525,7 @@ func TestRunStrategyOpenCodePluginRegisteredPendingRunsPackageManager(t *testing
 		return mockCmd("true")
 	}
 
-	err := runStrategy(context.Background(), update.UpdateResult{
+	_, err := runStrategy(context.Background(), update.UpdateResult{
 		Tool: update.ToolInfo{
 			Name:          pkg,
 			InstallMethod: update.InstallOpenCodePlugin,
@@ -519,7 +570,7 @@ func TestRunStrategyOpenCodePluginFallsBackWithoutPackageManager(t *testing.T) {
 		return mockCmd("echo", "should not run")
 	}
 
-	err := runStrategy(context.Background(), update.UpdateResult{
+	_, err := runStrategy(context.Background(), update.UpdateResult{
 		Tool: update.ToolInfo{
 			Name:          pkg,
 			InstallMethod: update.InstallOpenCodePlugin,
@@ -580,35 +631,14 @@ func TestOpenCodePluginUpgradeHelperProcess(t *testing.T) {
 }
 
 // --- TestManualFallbackHint ---
-
-// TestManualFallbackHint verifies that Windows binary self-replace produces an
-// actionable hint string, not an empty error.
-func TestManualFallbackHint(t *testing.T) {
-	r := update.UpdateResult{
-		Tool: update.ToolInfo{
-			Name:          "gentle-ai",
-			InstallMethod: update.InstallBinary,
-		},
-		LatestVersion: "1.5.0",
-		UpdateHint:    "See https://github.com/Gentleman-Programming/gentle-ai/releases",
-	}
-	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget"}
-
-	err := runStrategy(context.Background(), r, profile)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	msg := err.Error()
-	if msg == "" {
-		t.Errorf("manual fallback error message should not be empty")
-	}
-
-	// Hint should mention manual action or Windows.
-	if !containsAny(msg, "manual", "Manual", "windows", "Windows", "winget", "hint") {
-		t.Errorf("manual hint message %q does not mention manual or windows", msg)
-	}
-}
+//
+// Removed: TestManualFallbackHint previously verified that Windows binary
+// self-replace for gentle-ai returns a manual fallback error. The Windows
+// installer method (PR #257) now routes gentle-ai to installerUpgrade, which
+// downloads and launches the PowerShell installer. The manual-fallback path
+// remains exercised by binaryUpgrade for non-gentle-ai tools on Windows
+// (see TestRunStrategy_UnsupportedMethodManualFallback and
+// TestRunStrategy_ScriptUpgradeWindowsManualFallback).
 
 func containsAny(s string, subs ...string) bool {
 	for _, sub := range subs {
@@ -644,15 +674,18 @@ func TestBrewUpgrade_RunsUpdateBeforeUpgrade(t *testing.T) {
 		t.Fatalf("brewUpgrade: unexpected error: %v", err)
 	}
 
-	// Must have called brew tap, brew update AND brew upgrade — in that order.
-	if len(callOrder) < 3 {
-		t.Fatalf("expected 3 brew calls (tap, update, upgrade), got %d: %v", len(callOrder), callOrder)
+	// Must have called brew tap, scoped trust, brew update AND brew upgrade — in that order.
+	if len(callOrder) < 4 {
+		t.Fatalf("expected 4 brew calls (tap, trust, update, upgrade), got %d: %v", len(callOrder), callOrder)
 	}
-	if callOrder[1] != "update" {
-		t.Errorf("second brew call = %q, want %q", callOrder[1], "update")
+	if callOrder[1] != "trust" {
+		t.Errorf("second brew call = %q, want %q", callOrder[1], "trust")
 	}
-	if callOrder[2] != "upgrade" {
-		t.Errorf("third brew call = %q, want %q", callOrder[2], "upgrade")
+	if callOrder[2] != "update" {
+		t.Errorf("third brew call = %q, want %q", callOrder[2], "update")
+	}
+	if callOrder[3] != "upgrade" {
+		t.Errorf("fourth brew call = %q, want %q", callOrder[3], "upgrade")
 	}
 }
 
@@ -683,39 +716,39 @@ func TestBrewUpgrade_UpdateFailureIsNonFatal(t *testing.T) {
 		t.Errorf("expected success when brew update fails but brew upgrade succeeds, got: %v", err)
 	}
 
-	// Both brew update and brew upgrade must have been called (after the tap).
-	if len(callArgs) < 3 {
-		t.Fatalf("expected 3 brew calls, got %d: %v", len(callArgs), callArgs)
+	// Brew trust, update, and upgrade must have been called (after the tap).
+	if len(callArgs) < 4 {
+		t.Fatalf("expected 4 brew calls, got %d: %v", len(callArgs), callArgs)
 	}
-	if callArgs[1] != "update" {
-		t.Errorf("second brew call = %q, want %q", callArgs[1], "update")
+	if callArgs[1] != "trust" {
+		t.Errorf("second brew call = %q, want %q", callArgs[1], "trust")
 	}
-	if callArgs[2] != "upgrade" {
-		t.Errorf("third brew call = %q, want %q", callArgs[2], "upgrade")
+	if callArgs[2] != "update" {
+		t.Errorf("third brew call = %q, want %q", callArgs[2], "update")
+	}
+	if callArgs[3] != "upgrade" {
+		t.Errorf("fourth brew call = %q, want %q", callArgs[3], "upgrade")
 	}
 }
 
 // --- TestBrewUpgrade_TapsBeforeUpdateAndUpgrade ---
 
-// TestBrewUpgrade_TapsBeforeUpdateAndUpgrade verifies that brewUpgrade calls
-// `brew tap Gentleman-Programming/homebrew-tap` BEFORE `brew update` and
-// `brew upgrade <toolName>`. This makes the upgrade idempotent when a user
-// has lost the tap (untap, machine swap, brew cleanup). See issue #455.
-func TestBrewUpgrade_TapsBeforeUpdateAndUpgrade(t *testing.T) {
+// TestBrewUpgrade_TapsAndTrustsBeforeUpdateAndUpgrade verifies that brewUpgrade calls
+// `brew tap Gentleman-Programming/homebrew-tap` and scoped artifact trust BEFORE
+// `brew update` and `brew upgrade <toolName>`. This makes the upgrade idempotent
+// when a user has lost the tap and works with Homebrew tap trust enforcement.
+func TestBrewUpgrade_TapsAndTrustsBeforeUpdateAndUpgrade(t *testing.T) {
 	origExecCommand := execCommand
 	t.Cleanup(func() { execCommand = origExecCommand })
 
 	type call struct {
 		subcommand string
-		arg        string
+		args       []string
 	}
 	var calls []call
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		if name == "brew" && len(args) > 0 {
-			c := call{subcommand: args[0]}
-			if len(args) > 1 {
-				c.arg = args[1]
-			}
+			c := call{subcommand: args[0], args: append([]string(nil), args[1:]...)}
 			calls = append(calls, c)
 		}
 		return mockCmd("echo", "ok")
@@ -725,20 +758,98 @@ func TestBrewUpgrade_TapsBeforeUpdateAndUpgrade(t *testing.T) {
 		t.Fatalf("brewUpgrade: unexpected error: %v", err)
 	}
 
-	if len(calls) < 3 {
-		t.Fatalf("expected 3 brew calls (tap, update, upgrade), got %d: %+v", len(calls), calls)
+	if len(calls) < 4 {
+		t.Fatalf("expected 4 brew calls (tap, trust, update, upgrade), got %d: %+v", len(calls), calls)
 	}
 	if calls[0].subcommand != "tap" {
 		t.Errorf("first brew call subcommand = %q, want %q", calls[0].subcommand, "tap")
 	}
-	if calls[0].arg != "Gentleman-Programming/homebrew-tap" {
-		t.Errorf("first brew call arg = %q, want %q", calls[0].arg, "Gentleman-Programming/homebrew-tap")
+	if len(calls[0].args) != 1 || calls[0].args[0] != "Gentleman-Programming/homebrew-tap" {
+		t.Errorf("first brew call args = %v, want [Gentleman-Programming/homebrew-tap]", calls[0].args)
 	}
-	if calls[1].subcommand != "update" {
-		t.Errorf("second brew call = %q, want %q", calls[1].subcommand, "update")
+	if calls[1].subcommand != "trust" {
+		t.Errorf("second brew call = %q, want %q", calls[1].subcommand, "trust")
 	}
-	if calls[2].subcommand != "upgrade" {
-		t.Errorf("third brew call = %q, want %q", calls[2].subcommand, "upgrade")
+	if len(calls[1].args) != 2 || calls[1].args[0] != "--cask" || calls[1].args[1] != "gentleman-programming/tap/engram" {
+		t.Errorf("second brew call args = %v, want [--cask gentleman-programming/tap/engram]", calls[1].args)
+	}
+	if calls[2].subcommand != "update" {
+		t.Errorf("third brew call = %q, want %q", calls[2].subcommand, "update")
+	}
+	if calls[3].subcommand != "upgrade" {
+		t.Errorf("fourth brew call = %q, want %q", calls[3].subcommand, "upgrade")
+	}
+}
+
+func TestBrewUpgrade_FormulaToolUsesFormulaTrust(t *testing.T) {
+	origExecCommand := execCommand
+	t.Cleanup(func() { execCommand = origExecCommand })
+
+	var trustArgs []string
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		if name == "brew" && len(args) > 0 && args[0] == "trust" {
+			trustArgs = append([]string(nil), args[1:]...)
+		}
+		return mockCmd("echo", "ok")
+	}
+
+	if err := brewUpgrade(context.Background(), "gentle-ai"); err != nil {
+		t.Fatalf("brewUpgrade: unexpected error: %v", err)
+	}
+
+	if len(trustArgs) != 2 || trustArgs[0] != "--formula" || trustArgs[1] != "gentleman-programming/tap/gentle-ai" {
+		t.Fatalf("brew trust args = %v, want [--formula gentleman-programming/tap/gentle-ai]", trustArgs)
+	}
+}
+
+func TestHomebrewFailureAdviceTapTrust(t *testing.T) {
+	output := `Error: Refusing to load formula gentleman-programming/tap/gentle-ai from untrusted tap.
+Run brew trust --formula gentleman-programming/tap/gentle-ai to trust it.`
+	advice := homebrewFailureAdvice("gentle-ai", output)
+	for _, want := range []string{
+		"brew trust --formula gentleman-programming/tap/gentle-ai",
+		"brew upgrade gentle-ai",
+	} {
+		if !strings.Contains(advice, want) {
+			t.Fatalf("tap trust advice missing %q:\n%s", want, advice)
+		}
+	}
+}
+
+func TestHomebrewFailureAdviceCaskTapTrust(t *testing.T) {
+	output := `Error: Refusing to load cask gentleman-programming/tap/engram from untrusted tap.
+Run brew trust --cask gentleman-programming/tap/engram to trust it.`
+	advice := homebrewFailureAdvice("engram", output)
+	for _, want := range []string{
+		"brew trust --cask gentleman-programming/tap/engram",
+		"brew upgrade engram",
+	} {
+		if !strings.Contains(advice, want) {
+			t.Fatalf("cask tap trust advice missing %q:\n%s", want, advice)
+		}
+	}
+	if strings.Contains(advice, "--formula") {
+		t.Fatalf("cask tap trust advice must not suggest --formula:\n%s", advice)
+	}
+}
+
+func TestHomebrewFailureAdviceBubblewrap(t *testing.T) {
+	output := `Error: Bubblewrap is installed but cannot create a rootless sandbox.
+Homebrew's Linux sandbox requires rootless Bubblewrap and unprivileged user namespaces.`
+	advice := homebrewFailureAdvice("gentle-ai", output)
+	if strings.Contains(strings.ToLower(advice), "preferred fix") {
+		t.Fatalf("bubblewrap advice must not frame host policy changes as preferred defaults:\n%s", advice)
+	}
+	for _, want := range []string{
+		"explicit admin/security decision",
+		"sudo sysctl -w kernel.unprivileged_userns_clone=1",
+		"sudo sysctl -w user.max_user_namespaces=28633",
+		"sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true",
+		"HOMEBREW_NO_SANDBOX_LINUX=1 brew upgrade gentle-ai",
+	} {
+		if !strings.Contains(advice, want) {
+			t.Fatalf("bubblewrap advice missing %q:\n%s", want, advice)
+		}
 	}
 }
 
@@ -760,7 +871,7 @@ func TestRunStrategy_ExecErrorWrapped(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "darwin", PackageManager: "brew"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1068,7 +1179,7 @@ func TestRunStrategy_GGAUsesGitClone(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err != nil {
 		t.Fatalf("runStrategy GGA: unexpected error: %v", err)
 	}
@@ -1185,7 +1296,7 @@ func TestEngramUpgradeUsesDownloadNotGoInstall(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err != nil {
 		t.Fatalf("runStrategy engram windows: unexpected error: %v", err)
 	}
@@ -1234,7 +1345,7 @@ func TestEngramUpgradeLinuxUsesDownload(t *testing.T) {
 	}
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
 
-	err := runStrategy(context.Background(), r, profile)
+	_, err := runStrategy(context.Background(), r, profile)
 	if err != nil {
 		t.Fatalf("runStrategy engram linux: unexpected error: %v", err)
 	}
@@ -1290,4 +1401,140 @@ func TestRunStrategy_ScriptUpgradeExecFailure(t *testing.T) {
 	}
 }
 
+// --- TestInstallerUpgrade_Success ---
 
+func TestInstallerUpgrade_Success(t *testing.T) {
+	origExecCommand := execCommand
+	origHTTPClient := scriptHTTPClient
+	origGoos := runtime.GOOS
+	t.Cleanup(func() {
+		execCommand = origExecCommand
+		scriptHTTPClient = origHTTPClient
+	})
+
+	if origGoos != "windows" {
+		t.Skip("skipping Windows-only installer test on non-windows platform")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Write-Output 'installer ok'\n"))
+	}))
+	defer server.Close()
+
+	scriptHTTPClient = server.Client()
+
+	execCalled := false
+	var gotArgs []string
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		execCalled = true
+		gotArgs = append(gotArgs, args...)
+		return mockCmd("echo", "ok")
+	}
+
+	tool := update.ToolInfo{
+		Name:          "gentle-ai",
+		Owner:         "Gentleman-Programming",
+		Repo:          "gentle-ai",
+		InstallMethod: update.InstallInstaller,
+	}
+
+	// Change URL to use the local test server for the test.
+	// Since installerUpgrade constructs the URL directly, we mock the HTTP client and use a round tripper
+	// or we just trust the mock HTTP client will handle the request.
+	// Wait, installerUpgrade builds scriptURL := "https://raw.githubusercontent.com/...".
+	// The HTTP client needs to redirect this or respond directly.
+	// We'll create a custom RoundTripper so any URL returns our mock response.
+	scriptHTTPClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		rec.Header().Set("Content-Type", "text/plain")
+		rec.WriteHeader(http.StatusOK)
+		rec.WriteString("Write-Output 'installer ok'\n")
+		return rec.Result(), nil
+	})
+
+	exitReq, err := installerUpgrade(context.Background(), tool, "")
+	if err != nil {
+		t.Fatalf("installerUpgrade: unexpected error: %v", err)
+	}
+
+	if !exitReq {
+		t.Errorf("expected exitReq to be true on success")
+	}
+	if !execCalled {
+		t.Errorf("expected execCommand to be called")
+	}
+
+	// Check if the temp file path is passed
+	filePassed := false
+	for i, arg := range gotArgs {
+		if arg == "-File" && i+1 < len(gotArgs) {
+			if strings.Contains(gotArgs[i+1], "gentle-ai-install") {
+				filePassed = true
+			}
+		}
+	}
+	if !filePassed {
+		t.Errorf("expected -File argument with temp file path, got args: %v", gotArgs)
+	}
+}
+
+// --- TestInstallerUpgrade_DownloadFailure ---
+
+func TestInstallerUpgrade_DownloadFailure(t *testing.T) {
+	origHTTPClient := scriptHTTPClient
+	origGoos := runtime.GOOS
+	t.Cleanup(func() {
+		scriptHTTPClient = origHTTPClient
+	})
+
+	if origGoos != "windows" {
+		t.Skip("skipping Windows-only installer test on non-windows platform")
+	}
+
+	scriptHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			rec.WriteHeader(http.StatusNotFound)
+			return rec.Result(), nil
+		}),
+	}
+
+	tool := update.ToolInfo{
+		Name:          "gentle-ai",
+		Owner:         "Gentleman-Programming",
+		Repo:          "gentle-ai",
+		InstallMethod: update.InstallInstaller,
+	}
+
+	exitReq, err := installerUpgrade(context.Background(), tool, "")
+	if err == nil {
+		t.Errorf("expected error when installer download fails, got nil")
+	}
+	if exitReq {
+		t.Errorf("expected exitReq to be false on error")
+	}
+}
+
+// --- TestInstallerUpgrade_NonWindows ---
+
+func TestInstallerUpgrade_NonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping non-Windows test on Windows platform")
+	}
+	tool := update.ToolInfo{Name: "gentle-ai"}
+	exitReq, err := installerUpgrade(context.Background(), tool, "")
+	if err == nil {
+		t.Errorf("expected error when calling installerUpgrade on non-windows, got nil")
+	}
+	if exitReq {
+		t.Errorf("expected exitReq to be false")
+	}
+}
+
+type roundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}

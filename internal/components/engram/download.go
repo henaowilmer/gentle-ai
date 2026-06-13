@@ -12,12 +12,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/internal/versions"
 )
 
 const (
@@ -28,13 +30,14 @@ const (
 
 // Package-level vars for testability.
 var (
-	engramHTTPClient       = &http.Client{Timeout: 5 * time.Minute}
-	engramGitHubBaseURL    = "https://github.com"
-	engramInstallDirFn     = engramInstallDir
-	engramChecksumURLFn    = engramChecksumURL
+	engramHTTPClient      = &http.Client{Timeout: 5 * time.Minute}
+	engramGitHubBaseURL   = "https://github.com"
+	engramInstallDirFn    = engramInstallDir
+	engramChecksumURLFn   = engramChecksumURL
+	engramStopProcessesFn = stopEngramProcesses
 )
 
-// DownloadLatestBinary fetches the latest engram release from GitHub and
+// DownloadLatestBinary fetches the pinned engram release from GitHub and
 // installs it to the appropriate directory for the given platform.
 // It returns the full path to the installed binary.
 //
@@ -46,11 +49,9 @@ var (
 func DownloadLatestBinary(profile system.PlatformProfile) (string, error) {
 	ctx := context.Background()
 
-	// 1. Fetch the latest version tag from GitHub API.
-	version, err := fetchLatestEngramVersion()
-	if err != nil {
-		return "", fmt.Errorf("fetch latest engram version: %w", err)
-	}
+	// 1. Use the pinned core Engram version. Beta/nightly installs are handled
+	// separately and still install Engram from @main.
+	version := versions.EngramCore
 
 	// 2. Determine binary name and archive URL.
 	goos := profile.OS
@@ -98,7 +99,16 @@ func DownloadLatestBinary(profile system.PlatformProfile) (string, error) {
 			archiveName, expectedDigest, actualDigest)
 	}
 
-	// 6. Extract the verified binary.
+	// 6. On Windows, stop running Engram processes before replacing engram.exe.
+	// Windows locks running executables, unlike POSIX where atomic rename can
+	// replace the directory entry while the old process keeps its inode.
+	if goos == "windows" {
+		if err := engramStopProcessesFn(); err != nil {
+			return "", fmt.Errorf("stop running engram processes before upgrade: %w", err)
+		}
+	}
+
+	// 7. Extract the verified binary.
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return "", fmt.Errorf("open archive: %w", err)
@@ -418,6 +428,23 @@ func extractZipBinary(data []byte, binaryName, outPath string) error {
 	}
 
 	return fmt.Errorf("binary %q not found in zip archive", binaryName)
+}
+
+// stopEngramProcesses stops any running Engram process so Windows can replace
+// engram.exe during upgrade. Missing processes are not an error because
+// Get-Process uses SilentlyContinue.
+func stopEngramProcesses() error {
+	cmd := exec.Command("powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		"Get-Process -Name engram -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop",
+	)
+	cmd.Stdin = nil
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("powershell Stop-Process engram: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // engramInstallDir returns the directory where the engram binary should be installed

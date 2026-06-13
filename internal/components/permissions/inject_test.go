@@ -13,6 +13,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agents/codex"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/cursor"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/gemini"
+	"github.com/gentleman-programming/gentle-ai/internal/agents/hermes"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/opencode"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/vscode"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
@@ -25,6 +26,30 @@ func cursorAdapter() agents.Adapter      { return cursor.NewAdapter() }
 func vscodeAdapter() agents.Adapter      { return vscode.NewAdapter() }
 func codexAdapter() agents.Adapter       { return codex.NewAdapter() }
 func antigravityAdapter() agents.Adapter { return antigravity.NewAdapter() }
+func hermesAdapter() agents.Adapter      { return hermes.NewAdapter() }
+
+// TestInjectHermesSkipsPermissions verifies that Hermes returns nil (no file written)
+// because Hermes permission format is undocumented — §14 of spec.
+func TestInjectHermesSkipsPermissions(t *testing.T) {
+	home := t.TempDir()
+
+	result, err := Inject(home, hermesAdapter())
+	if err != nil {
+		t.Fatalf("Inject(hermes) error = %v", err)
+	}
+	if result.Changed {
+		t.Fatal("Inject(hermes) changed = true, want false (no file should be written)")
+	}
+	if len(result.Files) != 0 {
+		t.Fatalf("Inject(hermes) files = %v, want [] (no file should be written)", result.Files)
+	}
+
+	// Confirm no config.yaml or settings file was created.
+	hermesDir := filepath.Join(home, ".hermes")
+	if _, err := os.Stat(hermesDir); err == nil {
+		t.Fatal("Inject(hermes) created ~/.hermes directory, want no files written")
+	}
+}
 
 func TestInjectOpenCodeIsIdempotent(t *testing.T) {
 	home := t.TempDir()
@@ -309,23 +334,50 @@ func TestInjectCodexWritesGentleDevPermissionsProfile(t *testing.T) {
 		`approval_policy = "on-request"`,
 		`default_permissions = "gentle-dev"`,
 		`[permissions.gentle-dev]`,
-		`extends = ":workspace"`,
 		`[permissions.gentle-dev.network]`,
 		`enabled = true`,
 		`[permissions.gentle-dev.network.domains]`,
 		`"*" = "allow"`,
+		`[permissions.gentle-dev.filesystem]`,
+		`":minimal" = "read"`,
+		`"~/.config/git" = "read"`,
+		`"~/.gitconfig" = "read"`,
+		`"~/.local/state/nix/profiles/home-manager/home-path" = "read"`,
+		`"~/.nix-profile" = "read"`,
+		`"/nix/store" = "read"`,
+		`":tmpdir" = "write"`,
+		`":slash_tmp" = "write"`,
+		`[permissions.gentle-dev.workspace_roots]`,
+		`"~" = true`,
 		`[permissions.gentle-dev.filesystem.":workspace_roots"]`,
+		`"." = "write"`,
+		`".git/**" = "write"`,
 		`"**/.env" = "deny"`,
 		`"**/.env.local" = "deny"`,
 		`"**/.env.*.local" = "deny"`,
+		`"**/.aws/credentials" = "deny"`,
+		`"**/.config/gh/hosts.yml" = "deny"`,
+		`"**/.credentials/**" = "deny"`,
+		`"**/.ssh/**" = "deny"`,
+		`"**/Library/Keychains/**" = "deny"`,
+		`"**/credentials.json" = "deny"`,
 		`"**/*.pem" = "deny"`,
 		`"**/*.key" = "deny"`,
-		`"**/secrets/*" = "deny"`,
+		`"**/secrets/**" = "deny"`,
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(text, want) {
 			t.Fatalf("config.toml missing %q; got:\n%s", want, text)
 		}
+	}
+
+	for _, invalidGitRule := range []string{`"**/.git" = "write"`, `"**/.git/**" = "write"`, `".git" = "write"`} {
+		if strings.Contains(text, invalidGitRule) {
+			t.Fatalf("config.toml contains invalid or redundant Codex permissions git rule %q; got:\n%s", invalidGitRule, text)
+		}
+	}
+	if strings.Contains(text, `extends = ":workspace"`) {
+		t.Fatalf("config.toml should not inherit :workspace because it keeps Codex .git protections; got:\n%s", text)
 	}
 }
 
@@ -410,12 +462,114 @@ args = ["mcp", "--tools=agent"]
 	}
 	for _, section := range []string{
 		"[permissions.gentle-dev]",
+		"[permissions.gentle-dev.filesystem]",
 		"[permissions.gentle-dev.network]",
 		"[permissions.gentle-dev.network.domains]",
+		"[permissions.gentle-dev.workspace_roots]",
 		`[permissions.gentle-dev.filesystem.":workspace_roots"]`,
 	} {
 		if count := strings.Count(text, section); count != 1 {
 			t.Fatalf("section %q count = %d, want 1; got:\n%s", section, count, text)
+		}
+	}
+}
+
+func TestInjectCodexPermissionsRemovesInvalidGitWriteRules(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	initial := `[permissions.gentle-dev.filesystem.":workspace_roots"]
+"**/.git" = "write"
+"**/.git/**" = "write"
+"**/.env" = "deny"
+"**/.env.local" = "deny"
+"**/.env.*.local" = "deny"
+"**/*.pem" = "deny"
+"**/*.key" = "deny"
+"**/secrets/*" = "deny"
+`
+	if err := os.WriteFile(configPath, []byte(initial), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Inject(home, codexAdapter()); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	text := string(content)
+
+	if !strings.Contains(text, `".git/**" = "write"`) {
+		t.Fatalf("config.toml missing valid git write rule; got:\n%s", text)
+	}
+	for _, invalidGitRule := range []string{`"**/.git" = "write"`, `"**/.git/**" = "write"`} {
+		if strings.Contains(text, invalidGitRule) {
+			t.Fatalf("config.toml still contains invalid git write rule %q; got:\n%s", invalidGitRule, text)
+		}
+	}
+
+	for _, denyRule := range []string{
+		`"**/.env" = "deny"`,
+		`"**/.env.local" = "deny"`,
+		`"**/.env.*.local" = "deny"`,
+		`"**/.aws/credentials" = "deny"`,
+		`"**/.config/gh/hosts.yml" = "deny"`,
+		`"**/.credentials/**" = "deny"`,
+		`"**/.ssh/**" = "deny"`,
+		`"**/Library/Keychains/**" = "deny"`,
+		`"**/credentials.json" = "deny"`,
+		`"**/*.pem" = "deny"`,
+		`"**/*.key" = "deny"`,
+		`"**/secrets/**" = "deny"`,
+	} {
+		if strings.Count(text, denyRule) != 1 {
+			t.Fatalf("config.toml should preserve deny rule %q exactly once; got:\n%s", denyRule, text)
+		}
+	}
+}
+
+func TestInjectCodexPermissionsRemovesObsoleteBroadEnvDenyRules(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	initial := `[permissions.gentle-dev.filesystem.":workspace_roots"]
+"**/.env.*" = "deny"
+"*.env.*" = "deny"
+"**/.env" = "deny"
+"**/.env.local" = "deny"
+"**/.env.*.local" = "deny"
+`
+	if err := os.WriteFile(configPath, []byte(initial), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Inject(home, codexAdapter()); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	text := string(content)
+
+	for _, obsolete := range []string{`"**/.env.*" = "deny"`, `"*.env.*" = "deny"`} {
+		if strings.Contains(text, obsolete) {
+			t.Fatalf("config.toml still contains obsolete broad env deny rule %q; got:\n%s", obsolete, text)
+		}
+	}
+	for _, current := range []string{`"**/.env" = "deny"`, `"**/.env.local" = "deny"`, `"**/.env.*.local" = "deny"`} {
+		if strings.Count(text, current) != 1 {
+			t.Fatalf("config.toml should preserve current env deny rule %q exactly once; got:\n%s", current, text)
 		}
 	}
 }

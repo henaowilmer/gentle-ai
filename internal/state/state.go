@@ -20,15 +20,26 @@ type ModelAssignmentState struct {
 	Effort     string `json:"effort,omitempty"`
 }
 
+// ClaudePhaseAssignmentState is the JSON-serialisable form of a Claude
+// subagent model+effort assignment. Empty Effort means Claude Code default.
+type ClaudePhaseAssignmentState struct {
+	Model  string `json:"model"`
+	Effort string `json:"effort,omitempty"`
+}
+
 // InstallState holds the persisted user selections from the last install run.
 type InstallState struct {
 	InstalledAgents []string `json:"installed_agents"`
 
 	// ClaudeModelAssignments maps SDD phase names (e.g. "sdd-explore") to a
-	// Claude model alias ("opus", "sonnet", "haiku"). Persisted so that
+	// Claude model alias ("fable", "opus", "sonnet", "haiku"). Persisted so that
 	// `gentle-ai sync` preserves the user's model choices instead of falling
 	// back to the "balanced" preset every time.
 	ClaudeModelAssignments map[string]string `json:"claude_model_assignments,omitempty"`
+
+	// ClaudePhaseAssignments maps SDD phase names to Claude model+effort assignments.
+	// It supersedes ClaudeModelAssignments while preserving backward compatibility.
+	ClaudePhaseAssignments map[string]ClaudePhaseAssignmentState `json:"claude_phase_assignments,omitempty"`
 
 	// KiroModelAssignments maps SDD phase names to a Kiro-native model alias.
 	// Values like "opus", "sonnet", and "haiku" remain valid for state files
@@ -39,6 +50,20 @@ type InstallState struct {
 	// (low|medium|high|xhigh). Persisted so that `gentle-ai sync` preserves the
 	// user's per-phase effort preset instead of falling back to Recommended.
 	CodexModelAssignments map[string]string `json:"codexModelAssignments,omitempty"`
+
+	// CodexCarrilModelAssignments maps the three carril profile names
+	// (sdd-strong|sdd-mid|sdd-cheap) to OpenAI subscription model IDs
+	// (e.g. "gpt-5.5", "gpt-5.4-mini"). Persisted so that `gentle-ai sync`
+	// regenerates profile files with the user's chosen model per tier.
+	// Absent/empty = resolve to DefaultCarrilModels at runtime (backward-compat).
+	CodexCarrilModelAssignments map[string]string `json:"codexCarrilModelAssignments,omitempty"`
+
+	// CodexPhaseModelAssignments maps each of the 13 SDD phase names to the
+	// model id the user assigned in the Custom per-phase picker (e.g. "gpt-5.5").
+	// When non-nil, overrides the carril-level model selection for that phase.
+	// Absent/nil = not using custom per-phase assignments (preset/carril behavior
+	// unchanged for backward-compatibility).
+	CodexPhaseModelAssignments map[string]string `json:"codexPhaseModelAssignments,omitempty"`
 
 	// ModelAssignments maps sub-agent names to provider/model pairs (OpenCode).
 	ModelAssignments map[string]ModelAssignmentState `json:"model_assignments,omitempty"`
@@ -98,12 +123,15 @@ func MergeAgents(existing InstallState, newAgents []string) InstallState {
 	}
 
 	return InstallState{
-		InstalledAgents:        merged,
-		ModelAssignments:       existing.ModelAssignments,
-		ClaudeModelAssignments: existing.ClaudeModelAssignments,
-		KiroModelAssignments:   existing.KiroModelAssignments,
-		CodexModelAssignments:  existing.CodexModelAssignments,
-		Persona:                existing.Persona,
+		InstalledAgents:             merged,
+		ModelAssignments:            existing.ModelAssignments,
+		ClaudeModelAssignments:      existing.ClaudeModelAssignments,
+		ClaudePhaseAssignments:      existing.ClaudePhaseAssignments,
+		KiroModelAssignments:        existing.KiroModelAssignments,
+		CodexModelAssignments:       existing.CodexModelAssignments,
+		CodexCarrilModelAssignments: existing.CodexCarrilModelAssignments,
+		CodexPhaseModelAssignments:  existing.CodexPhaseModelAssignments,
+		Persona:                     existing.Persona,
 	}
 }
 

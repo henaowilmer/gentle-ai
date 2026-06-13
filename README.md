@@ -44,6 +44,7 @@ Gentle-AI is NOT an AI agent installer. Most agents are easy to install. It is a
 | **OpenClaw**        |            Solo-agent            | Workspace-first `AGENTS.md` / `SOUL.md` with global MCP config  |
 | **Trae**            |            Solo-agent            | Desktop app by ByteDance; `~/.trae/skills/` + OS-specific rules |
 | **Pi**              | Full (package-managed subagents) | `gentle-pi` harness with persona/model commands + Engram memory |
+| **Hermes**          |         Detect-only              | YAML MCP config, SOUL.md persona; install manually first        |
 
 > **Note**: This project supersedes [Agent Teams Lite](https://github.com/Gentleman-Programming/agent-teams-lite) (now archived). Everything ATL provided is included here with better installation, automatic updates, and persistent memory.
 
@@ -88,7 +89,7 @@ Once your agents are configured, open your AI agent in a project and run these t
 | `/sdd-init`                        | Detects stack, testing capabilities, activates Strict TDD Mode if available | When your project adds/removes test frameworks, or first time in a new project |
 | `gentle-ai skill-registry refresh` | Scans installed skills and project conventions, builds the registry         | After installing/removing skills, or first time in a new project               |
 
-These are **not required** for basic usage. The SDD orchestrator runs `/sdd-init` automatically if it detects no context. Startup hooks normally keep the skill registry fresh for agents that support hooks, including Pi through `gentle-pi`. If you start Pi with `pi -ns`, startup skill loading/hooks are skipped, so run the registry refresh manually when you need updated project rules.
+These are **not required** for basic usage. The SDD orchestrator runs `/sdd-init` automatically if it detects no context. Startup hooks normally keep the skill registry fresh for agents that support hooks, including Codex, Claude Code, OpenCode, and Pi through `gentle-pi`. If you start Pi with `pi -ns`, startup skill loading/hooks are skipped, so run the registry refresh manually when you need updated project rules.
 
 Run `gentle-ai doctor` at any time for a read-only health check of your ecosystem (tool binaries, `state.json`, Engram reachability, disk space).
 
@@ -101,6 +102,7 @@ Run `gentle-ai doctor` at any time for a read-only health check of your ecosyste
 ```bash
 # macOS / Linux
 brew tap Gentleman-Programming/homebrew-tap
+brew trust --formula gentleman-programming/tap/gentle-ai  # one-time, for Homebrew tap trust
 brew install gentle-ai
 
 # Windows

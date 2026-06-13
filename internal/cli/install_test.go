@@ -2,6 +2,7 @@ package cli
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/model"
@@ -17,6 +18,7 @@ func TestParseInstallFlagsSupportsCSVAndRepeated(t *testing.T) {
 		"--skill", "sdd-apply",
 		"--persona", "neutral",
 		"--preset", "minimal",
+		"--channel", "beta",
 		"--dry-run",
 	})
 	if err != nil {
@@ -33,6 +35,15 @@ func TestParseInstallFlagsSupportsCSVAndRepeated(t *testing.T) {
 
 	if !flags.DryRun {
 		t.Fatalf("DryRun = false, want true")
+	}
+	if flags.Channel != "beta" {
+		t.Fatalf("Channel = %q, want beta", flags.Channel)
+	}
+}
+
+func TestInstallChannelHelpMentionsNightly(t *testing.T) {
+	if !strings.Contains(installChannelHelp, "nightly") {
+		t.Fatalf("installChannelHelp = %q, want nightly mentioned", installChannelHelp)
 	}
 }
 
@@ -58,7 +69,7 @@ func TestNormalizeInstallFlagsDefaults(t *testing.T) {
 	}
 
 	want := model.Selection{
-		Agents:  []model.AgentID{model.AgentClaudeCode, model.AgentOpenCode, model.AgentKilocode, model.AgentGeminiCLI, model.AgentCodex, model.AgentCursor, model.AgentVSCodeCopilot, model.AgentAntigravity, model.AgentWindsurf, model.AgentKimi, model.AgentQwenCode, model.AgentKiroIDE, model.AgentOpenClaw, model.AgentPi, model.AgentTrae},
+		Agents:  []model.AgentID{model.AgentClaudeCode, model.AgentOpenCode, model.AgentKilocode, model.AgentGeminiCLI, model.AgentCodex, model.AgentCursor, model.AgentVSCodeCopilot, model.AgentAntigravity, model.AgentWindsurf, model.AgentKimi, model.AgentQwenCode, model.AgentKiroIDE, model.AgentOpenClaw, model.AgentPi, model.AgentTrae, model.AgentHermes},
 		Persona: model.PersonaGentleman,
 		Preset:  model.PresetFullGentleman,
 		Components: []model.ComponentID{
@@ -76,6 +87,19 @@ func TestNormalizeInstallFlagsDefaults(t *testing.T) {
 
 	if !reflect.DeepEqual(input.Selection, want) {
 		t.Fatalf("selection = %#v, want %#v", input.Selection, want)
+	}
+	if input.Channel != ChannelStable {
+		t.Fatalf("Channel = %q, want %q", input.Channel, ChannelStable)
+	}
+}
+
+func TestNormalizeInstallFlagsChannelBeta(t *testing.T) {
+	input, err := NormalizeInstallFlags(InstallFlags{Channel: "beta"}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("NormalizeInstallFlags() error = %v", err)
+	}
+	if input.Channel != ChannelBeta {
+		t.Fatalf("Channel = %q, want %q", input.Channel, ChannelBeta)
 	}
 }
 
@@ -265,7 +289,7 @@ func TestRunInstallDryRunSkipsExecution(t *testing.T) {
 func makeDetectionWithAgents(present ...string) system.DetectionResult {
 	var configs []system.ConfigState
 	// Full canonical agent set — mirrors knownAgentConfigDirs in config_scan.go.
-	known := []string{"claude-code", "opencode", "kilocode", "gemini-cli", "cursor", "vscode-copilot", "codex", "antigravity", "windsurf", "kimi", "qwen-code", "kiro-ide", "openclaw", "pi", "trae-ide"}
+	known := []string{"claude-code", "opencode", "kilocode", "gemini-cli", "cursor", "vscode-copilot", "codex", "antigravity", "windsurf", "kimi", "qwen-code", "kiro-ide", "openclaw", "pi", "trae-ide", "hermes"}
 	presentSet := make(map[string]bool, len(present))
 	for _, p := range present {
 		presentSet[p] = true
@@ -325,6 +349,7 @@ func TestDefaultAgentsFromDetection_AllAgentsMappedCorrectly(t *testing.T) {
 		{"openclaw", model.AgentOpenClaw},
 		{"pi", model.AgentPi},
 		{"trae-ide", model.AgentTrae},
+		{"hermes", model.AgentHermes},
 	}
 
 	for _, tt := range tests {

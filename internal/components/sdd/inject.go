@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -24,9 +23,14 @@ type InjectionResult struct {
 
 type InjectOptions struct {
 	OpenCodeModelAssignments map[string]model.ModelAssignment
-	ClaudeModelAssignments   map[string]model.ClaudeModelAlias
-	KiroModelAssignments     map[string]model.KiroModelAlias
-	CodexModelAssignments    map[string]model.CodexEffort
+	// ClaudeModelAssignments is the legacy model-only Claude assignment map.
+	// Prefer ClaudePhaseAssignments for new callers that need per-phase effort.
+	ClaudeModelAssignments      map[string]model.ClaudeModelAlias
+	ClaudePhaseAssignments      map[string]model.ClaudePhaseAssignment
+	KiroModelAssignments        map[string]model.KiroModelAlias
+	CodexModelAssignments       map[string]model.CodexEffort
+	CodexCarrilModelAssignments map[string]string // carril→model-id; nil = use defaults
+	CodexPhaseModelAssignments  map[string]string // phase→model-id; non-empty = Custom per-phase mode; nil/empty = preset/carril mode
 
 	// WorkspaceDir is the root of the current workspace (e.g. os.Getwd()).
 	// When non-empty and the adapter implements workflowInjector, native
@@ -83,8 +87,8 @@ type kiroModelResolver interface {
 
 // claudeModelResolver is an optional adapter capability. When implemented,
 // the subagent copy loop stamps the resolved ClaudeModelAlias into the agent
-// frontmatter sentinel {{CLAUDE_MODEL}}. Claude Code accepts "opus", "sonnet",
-// and "haiku" directly as model values, so the resolver is effectively an
+// frontmatter sentinel {{CLAUDE_MODEL}}. Claude Code accepts "fable", "opus",
+// "sonnet", and "haiku" directly as model values, so the resolver is effectively an
 // identity function on the alias string — but the interface keeps the opt-in
 // shape consistent with kiroModelResolver.
 type claudeModelResolver interface {
@@ -93,13 +97,13 @@ type claudeModelResolver interface {
 
 // codexModelResolver is an optional adapter capability. When implemented,
 // injectFileAppend will replace the {{CODEX_PHASE_EFFORTS}} placeholder in the
-// Codex SDD orchestrator asset with a rendered per-phase effort table derived
-// from the CodexModelAssignments in InjectOptions.
+// Codex SDD orchestrator asset with a rendered per-phase effort+model table
+// derived from CodexModelAssignments and CodexCarrilModelAssignments in InjectOptions.
 //
 // Adapters that do NOT implement this interface are completely unaffected —
 // the substitution only fires when the adapter satisfies this interface.
 type codexModelResolver interface {
-	RenderCodexPhaseEfforts(assignments map[string]model.CodexEffort) string
+	RenderCodexPhaseEfforts(assignments map[string]model.CodexEffort, carrilModels map[string]string) string
 }
 
 // monorepoRootMarkers identify files/dirs that ONLY exist at the true root
@@ -192,17 +196,6 @@ func findProjectRoot(dir string) (string, bool) {
 	return "", false
 }
 
-var (
-	npmLookPath = exec.LookPath
-	npmRun      = func(dir string, args ...string) ([]byte, error) {
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Dir = dir
-		// CombinedOutput captures stdout+stderr so we can surface actionable
-		// error messages on failure. Do not set Stdout/Stderr separately.
-		return cmd.CombinedOutput()
-	}
-)
-
 // overlayAssetPath returns the embedded asset path for the SDD agent overlay
 // based on the selected SDD mode. Empty or SDDModeSingle uses the single
 // orchestrator overlay; SDDModeMulti uses the multi-agent overlay.
@@ -236,7 +229,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 	if adapter.Agent() != model.AgentOpenCode && adapter.Agent() != model.AgentKilocode {
 		switch adapter.SystemPromptStrategy() {
 		case model.StrategyMarkdownSections:
-			result, err := injectMarkdownSections(homeDir, adapter, opts.ClaudeModelAssignments)
+			result, err := injectMarkdownSections(homeDir, adapter, opts.ClaudeModelAssignments, opts.ClaudePhaseAssignments)
 			if err != nil {
 				return InjectionResult{}, err
 			}
@@ -608,8 +601,9 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 			// Non-Claude adapters don't implement claudeModelResolver and are unaffected.
 			if cmr, ok := adapter.(claudeModelResolver); ok {
 				phase := strings.TrimSuffix(entry.Name(), ".md")
-				alias := resolveClaudeModelAlias(opts.ClaudeModelAssignments, phase)
-				contentStr = strings.ReplaceAll(contentStr, "{{CLAUDE_MODEL}}", cmr.ClaudeModelID(alias))
+				assignment := resolveClaudePhaseAssignment(opts.ClaudeModelAssignments, opts.ClaudePhaseAssignments, phase)
+				contentStr = strings.ReplaceAll(contentStr, "{{CLAUDE_MODEL}}", cmr.ClaudeModelID(assignment.Model))
+				contentStr = injectClaudeEffortFrontmatter(contentStr, assignment)
 			}
 			outPath := filepath.Join(agentsDir, entry.Name())
 			writeResult, err := filemerge.WriteFileAtomic(outPath, []byte(contentStr), 0o644)
@@ -830,7 +824,55 @@ func migratePreservedOpenCodeOrchestratorPrompt(prompt string) string {
 		"agent.sdd-orchestrator.model",
 		"agent.gentle-orchestrator.model",
 	)
-	return ensurePreservedOpenCodeOrchestratorPreflight(replacer.Replace(prompt))
+	return ensurePreservedOpenCodeDelegationHardGates(ensurePreservedOpenCodeOrchestratorPreflight(replacer.Replace(prompt)))
+}
+
+func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
+	delegation := `
+
+<!-- gentle-ai:delegation-hard-gates-migration -->
+### Mandatory Delegation Triggers (Non-Skippable)
+
+These gates are non-skippable hard gates, not recommendations. They are TOTALMENTE obligatorio: do not skip them, do not weaken them, and do not replace delegation-required gates with inline execution. Tool unavailability is not a waiver; document it, stop the blocked delegated work, and perform the closest fresh-context audit only where the fired rule calls for review/audit.
+
+Semantic guard: **delegate** means using OpenCode's native Task tool to invoke a configured sub-agent. Running local scripts, Python, or Bash inline is execution, not delegation.
+
+Do not pass these rules to child agents as permission to spawn more agents; children receive concrete role work and must not orchestrate.
+
+1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task. If delegation tooling is unavailable, document the blocker and stop the exploration instead of reading everything inline.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer. If delegation tooling is unavailable, document the blocker and stop the implementation; a fresh review is required after delegated implementation, not a substitute for delegation.
+3. **PR rule**: before commit, push, or PR after code changes, run a fresh-context review unless the diff is trivial docs/text.
+4. **Incident rule**: after wrong ` + "`cwd`" + `, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run a fresh audit before continuing.
+5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate the remaining work instead of silently continuing monolithically. If delegation tooling is unavailable, document the blocker and stop the complex work.
+6. **Fresh review rule**: use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+<!-- /gentle-ai:delegation-hard-gates-migration -->
+`
+
+	if strings.Contains(prompt, "Mandatory Delegation Triggers") &&
+		strings.Contains(prompt, "non-skippable hard gates") &&
+		strings.Contains(prompt, "TOTALMENTE obligatorio") &&
+		strings.Contains(prompt, "4-file rule") &&
+		strings.Contains(prompt, "Multi-file write rule") &&
+		strings.Contains(prompt, "PR rule") &&
+		strings.Contains(prompt, "Incident rule") &&
+		strings.Contains(prompt, "Long-session rule") &&
+		strings.Contains(prompt, "Fresh review rule") &&
+		strings.Contains(prompt, "Semantic guard") &&
+		strings.Contains(prompt, "execution, not delegation") &&
+		strings.Contains(prompt, "fresh review is required after delegated implementation, not a substitute for delegation") {
+		return prompt
+	}
+
+	start := "<!-- gentle-ai:delegation-hard-gates-migration -->"
+	end := "<!-- /gentle-ai:delegation-hard-gates-migration -->"
+	if startIdx := strings.Index(prompt, start); startIdx >= 0 {
+		if relEndIdx := strings.Index(prompt[startIdx:], end); relEndIdx >= 0 {
+			endIdx := startIdx + relEndIdx + len(end)
+			return strings.TrimRight(prompt[:startIdx], "\n") + delegation + prompt[endIdx:]
+		}
+	}
+
+	return strings.TrimRight(prompt, "\n") + delegation
 }
 
 func ensurePreservedOpenCodeOrchestratorPreflight(prompt string) string {
@@ -1034,6 +1076,14 @@ func readMisnamedOpenCodeGentlemanSDDPrompt(settingsPath string) (string, error)
 }
 
 func installSkillRegistryAutomation(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
+	if adapter.Agent() == model.AgentCodex {
+		hooksPath := filepath.Join(adapter.GlobalConfigDir(homeDir), "hooks.json")
+		changed, err := ensureCodexSkillRegistryHook(hooksPath)
+		if err != nil {
+			return InjectionResult{}, fmt.Errorf("install Codex skill-registry hook: %w", err)
+		}
+		return InjectionResult{Changed: changed, Files: []string{hooksPath}}, nil
+	}
 	if adapter.Agent() != model.AgentClaudeCode {
 		return InjectionResult{}, nil
 	}
@@ -1046,6 +1096,64 @@ func installSkillRegistryAutomation(homeDir string, adapter agents.Adapter) (Inj
 		return InjectionResult{}, fmt.Errorf("install Claude skill-registry hook: %w", err)
 	}
 	return InjectionResult{Changed: changed, Files: []string{settingsPath}}, nil
+}
+
+func ensureCodexSkillRegistryHook(hooksPath string) (bool, error) {
+	root := map[string]any{}
+	if data, err := os.ReadFile(hooksPath); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+		if err := json.Unmarshal(data, &root); err != nil {
+			return false, fmt.Errorf("parse Codex hooks %q: %w", hooksPath, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+
+	const command = `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "$PWD" || true`
+	if claudeHookExists(root, command) {
+		return false, nil
+	}
+
+	hooksRaw, hasHooks := root["hooks"]
+	hooksMap, _ := hooksRaw.(map[string]any)
+	if hasHooks && hooksMap == nil {
+		return false, fmt.Errorf("Codex hooks %q has unsupported hooks shape: want object", hooksPath)
+	}
+	if hooksMap == nil {
+		hooksMap = map[string]any{}
+	}
+
+	sessionRaw, hasSessionStart := hooksMap["SessionStart"]
+	sessionStart, _ := sessionRaw.([]any)
+	if hasSessionStart && sessionStart == nil {
+		return false, fmt.Errorf("Codex hooks %q has unsupported hooks.SessionStart shape: want array", hooksPath)
+	}
+	sessionStart = append(sessionStart, map[string]any{
+		"matcher": "startup|resume|clear|compact",
+		"hooks": []any{
+			map[string]any{
+				"type":          "command",
+				"command":       command,
+				"timeout":       30,
+				"statusMessage": "Refreshing skill registry",
+			},
+		},
+	})
+	hooksMap["SessionStart"] = sessionStart
+	root["hooks"] = hooksMap
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	out = append(out, '\n')
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o755); err != nil {
+		return false, err
+	}
+	wr, err := filemerge.WriteFileAtomic(hooksPath, out, 0o644)
+	if err != nil {
+		return false, err
+	}
+	return wr.Changed, nil
 }
 
 func ensureClaudeSkillRegistryHook(settingsPath string) (bool, error) {
@@ -1137,10 +1245,9 @@ func claudeHookListContains(hookEntries []any, command string) bool {
 	return false
 }
 
-// installOpenCodePlugins copies the background-agents plugin and installs its
-// npm/bun dependency into the agent's global config directory. Returns an error
-// with an actionable message if the package manager is present but the install
-// fails. If no package manager is available, the install is skipped (soft failure).
+// installOpenCodePlugins copies the OpenCode-compatible plugins that gentle-ai
+// still manages by default. Native OpenCode subagents replace the legacy
+// background-agents plugin, so that legacy cleanup is scoped to OpenCode only.
 func installOpenCodePlugins(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
 	opencodeDir := adapter.GlobalConfigDir(homeDir)
 	pluginsDir := filepath.Join(opencodeDir, "plugins")
@@ -1152,7 +1259,19 @@ func installOpenCodePlugins(homeDir string, adapter agents.Adapter) (InjectionRe
 	var files []string
 	var changed bool
 
-	for _, name := range []string{"background-agents.ts", "model-variants.ts"} {
+	if adapter.Agent() == model.AgentOpenCode {
+		legacyPluginPath := filepath.Join(pluginsDir, "background-agents.ts")
+		if err := os.Remove(legacyPluginPath); err != nil {
+			if !os.IsNotExist(err) {
+				return InjectionResult{}, fmt.Errorf("remove legacy OpenCode plugin %s: %w", legacyPluginPath, err)
+			}
+		} else {
+			changed = true
+			files = append(files, legacyPluginPath)
+		}
+	}
+
+	for _, name := range []string{"model-variants.ts", "skill-registry.ts"} {
 		content := assets.MustRead("opencode/plugins/" + name)
 		pluginPath := filepath.Join(pluginsDir, name)
 
@@ -1167,73 +1286,7 @@ func installOpenCodePlugins(homeDir string, adapter agents.Adapter) (InjectionRe
 		}
 	}
 
-	// Install dependency — prefer bun (OpenCode uses it), fall back to npm.
-	// If neither is available, skip with a soft no-op (npm/bun not installed).
-	// If a package manager IS found and the install fails, surface the error.
-	depPkg := "unique-names-generator"
-	nmPath := filepath.Join(opencodeDir, "node_modules", depPkg)
-
-	// Only run the install if the package is not already present.
-	pkgMissing := false
-	pkgMgrRan := false
-	if _, statErr := os.Stat(nmPath); os.IsNotExist(statErr) {
-		pkgMissing = true
-		var installErr error
-		pkgMgrRan, installErr = runPkgInstall(opencodeDir, depPkg)
-		if installErr != nil {
-			return InjectionResult{}, installErr
-		}
-	}
-
-	// Post-install validation: if a package manager ran and claimed success,
-	// confirm the package actually landed on disk.
-	if pkgMissing && pkgMgrRan {
-		if _, statErr := os.Stat(nmPath); os.IsNotExist(statErr) {
-			// Package manager reported success but the package still isn't there.
-			// This is unusual (e.g. bun wrote to a different location). Surface it.
-			return InjectionResult{}, fmt.Errorf(
-				"post-install check: %q was not found after install in %q — "+
-					"the background-agents plugin will fail to load.\n"+
-					"Fix: run `cd %s && bun add %s` (or npm install %s) manually",
-				depPkg, nmPath, opencodeDir, depPkg, depPkg,
-			)
-		}
-	}
-
 	return InjectionResult{Changed: changed, Files: files}, nil
-}
-
-// runPkgInstall installs a node package in the given directory using bun (if
-// available) or npm. Returns (true, nil) on success, (false, nil) if no
-// package manager is found (soft skip), or (true, error) with a descriptive,
-// actionable message if a package manager was found but the install failed.
-func runPkgInstall(dir, pkg string) (ran bool, err error) {
-	// Prefer bun — OpenCode ships with bun.lock and recommends bun.
-	if bunPath, lookErr := npmLookPath("bun"); lookErr == nil {
-		out, runErr := npmRun(dir, bunPath, "add", pkg)
-		if runErr != nil {
-			return true, fmt.Errorf(
-				"bun add %s failed in %s: %w\nOutput: %s\nFix: run `cd %s && bun add %s` manually",
-				pkg, dir, runErr, strings.TrimSpace(string(out)), dir, pkg,
-			)
-		}
-		return true, nil
-	}
-
-	// Fall back to npm.
-	if npmPath, lookErr := npmLookPath("npm"); lookErr == nil {
-		out, runErr := npmRun(dir, npmPath, "install", "--save", pkg)
-		if runErr != nil {
-			return true, fmt.Errorf(
-				"npm install %s failed in %s: %w\nOutput: %s\nFix: run `cd %s && npm install %s` manually",
-				pkg, dir, runErr, strings.TrimSpace(string(out)), dir, pkg,
-			)
-		}
-		return true, nil
-	}
-
-	// No package manager available — soft skip.
-	return false, nil
 }
 
 type mergeJSONResult struct {
@@ -1512,6 +1565,8 @@ func sddOrchestratorAsset(agent model.AgentID) string {
 		return "qwen/sdd-orchestrator.md"
 	case model.AgentKiroIDE:
 		return "kiro/sdd-orchestrator.md"
+	case model.AgentHermes:
+		return "hermes/sdd-orchestrator.md"
 	case model.AgentOpenCode, model.AgentKilocode:
 		return "opencode/sdd-orchestrator.md"
 	default:
@@ -1542,7 +1597,14 @@ func injectFileAppend(homeDir string, adapter agents.Adapter, opts InjectOptions
 	// effort table. Only fires when the adapter implements codexModelResolver.
 	// All other FileReplace adapters (Gemini, Cursor, etc.) are unaffected.
 	if cmr, ok := adapter.(codexModelResolver); ok {
-		rendered := cmr.RenderCodexPhaseEfforts(opts.CodexModelAssignments)
+		var rendered string
+		if len(opts.CodexPhaseModelAssignments) > 0 {
+			// Custom per-phase mode: render a per-phase table (phase | model | effort).
+			rendered = model.RenderCodexPhaseEffortsByPhase(opts.CodexPhaseModelAssignments, opts.CodexModelAssignments)
+		} else {
+			// Preset / carril mode: render the standard per-carril table.
+			rendered = cmr.RenderCodexPhaseEfforts(opts.CodexModelAssignments, opts.CodexCarrilModelAssignments)
+		}
 		content = strings.ReplaceAll(content, "{{CODEX_PHASE_EFFORTS}}", rendered)
 		// Post-check: fail loudly if any placeholder token remains unresolved.
 		if strings.Contains(content, "{{") {
@@ -1741,12 +1803,12 @@ func stripBareOrchestratorSection(content string) string {
 	return result
 }
 
-func injectMarkdownSections(homeDir string, adapter agents.Adapter, assignments map[string]model.ClaudeModelAlias) (InjectionResult, error) {
+func injectMarkdownSections(homeDir string, adapter agents.Adapter, legacyAssignments map[string]model.ClaudeModelAlias, phaseAssignments map[string]model.ClaudePhaseAssignment) (InjectionResult, error) {
 	promptPath := adapter.SystemPromptFile(homeDir)
 	content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
-	if adapter.Agent() == model.AgentClaudeCode && len(assignments) > 0 {
+	if adapter.Agent() == model.AgentClaudeCode && (len(legacyAssignments) > 0 || len(phaseAssignments) > 0) {
 		var err error
-		content, err = injectClaudeModelAssignments(content, assignments)
+		content, err = injectClaudePhaseAssignments(content, legacyAssignments, phaseAssignments)
 		if err != nil {
 			return InjectionResult{}, err
 		}
@@ -1811,6 +1873,10 @@ var claudeModelAssignmentReasons = map[string]string{
 }
 
 func injectClaudeModelAssignments(content string, assignments map[string]model.ClaudeModelAlias) (string, error) {
+	return injectClaudePhaseAssignments(content, assignments, nil)
+}
+
+func injectClaudePhaseAssignments(content string, legacyAssignments map[string]model.ClaudeModelAlias, phaseAssignments map[string]model.ClaudePhaseAssignment) (string, error) {
 	const openMarker = "<!-- gentle-ai:sdd-model-assignments -->"
 	const closeMarker = "<!-- /gentle-ai:sdd-model-assignments -->"
 
@@ -1820,10 +1886,13 @@ func injectClaudeModelAssignments(content string, assignments map[string]model.C
 		return "", fmt.Errorf("sdd orchestrator asset missing model assignment markers")
 	}
 
-	merged := model.ClaudeModelPresetBalanced()
-	for key, alias := range assignments {
-		if alias.Valid() {
-			merged[key] = alias
+	merged := defaultClaudePhaseAssignments()
+	for key, assignment := range model.ClaudePhaseAssignmentsFromLegacy(legacyAssignments) {
+		merged[key] = assignment
+	}
+	for key, assignment := range phaseAssignments {
+		if assignment.Valid() {
+			merged[key] = assignment
 		}
 	}
 
@@ -1832,37 +1901,70 @@ func injectClaudeModelAssignments(content string, assignments map[string]model.C
 	return content[:start] + "\n" + replacement + content[end:], nil
 }
 
+func defaultClaudePhaseAssignments() map[string]model.ClaudePhaseAssignment {
+	return model.ClaudePhaseAssignmentsFromLegacy(model.ClaudeModelPresetBalanced())
+}
+
 func resolveClaudeModelAlias(assignments map[string]model.ClaudeModelAlias, phase string) model.ClaudeModelAlias {
-	merged := model.ClaudeModelPresetBalanced()
-	for key, alias := range assignments {
-		if alias.Valid() {
-			merged[key] = alias
+	return resolveClaudePhaseAssignment(assignments, nil, phase).Model
+}
+
+func resolveClaudePhaseAssignment(legacyAssignments map[string]model.ClaudeModelAlias, phaseAssignments map[string]model.ClaudePhaseAssignment, phase string) model.ClaudePhaseAssignment {
+	merged := defaultClaudePhaseAssignments()
+	for key, assignment := range model.ClaudePhaseAssignmentsFromLegacy(legacyAssignments) {
+		merged[key] = assignment
+	}
+	for key, assignment := range phaseAssignments {
+		if assignment.Valid() {
+			merged[key] = assignment
 		}
 	}
 
-	if alias, ok := merged[phase]; ok && alias.Valid() {
-		return alias
+	if assignment, ok := merged[phase]; ok && assignment.Valid() {
+		return assignment
 	}
-	if alias, ok := merged["default"]; ok && alias.Valid() {
-		return alias
+	if assignment, ok := merged["default"]; ok && assignment.Valid() {
+		return assignment
 	}
-	return model.ClaudeModelSonnet
+	return model.ClaudePhaseAssignment{Model: model.ClaudeModelSonnet}
 }
 
-func renderClaudeModelAssignmentsSection(assignments map[string]model.ClaudeModelAlias) string {
+func injectClaudeEffortFrontmatter(content string, assignment model.ClaudePhaseAssignment) string {
+	const placeholder = "{{CLAUDE_EFFORT_FRONTMATTER}}"
+	line := renderClaudeEffortFrontmatter(assignment)
+	if line == "" {
+		content = strings.ReplaceAll(content, placeholder+"\r\n", "")
+		content = strings.ReplaceAll(content, placeholder+"\n", "")
+		return strings.ReplaceAll(content, placeholder, "")
+	}
+	return strings.ReplaceAll(content, placeholder, line)
+}
+
+func renderClaudeEffortFrontmatter(assignment model.ClaudePhaseAssignment) string {
+	if assignment.Effort == model.ClaudeEffortDefault || !model.ClaudeEffortAllowedForModel(assignment.Model, assignment.Effort) {
+		return ""
+	}
+	return "effort: " + string(assignment.Effort)
+}
+
+func renderClaudeModelAssignmentsSection(assignments map[string]model.ClaudePhaseAssignment) string {
 	var b strings.Builder
 	b.WriteString("## Model Assignments\n\n")
 	b.WriteString("Read this table at session start (or before first delegation), cache it for the session, and pass the mapped alias in every Agent tool call via the `model` parameter. If a phase is missing, use the `default` row. If you do not have access to the assigned model (for example, no Opus access), substitute `sonnet` and continue.\n\n")
 	b.WriteString("The Claude Code session model is controlled by Claude Code itself; Gentle AI does not configure the main orchestrator model. This table applies only to Agent tool calls for SDD phase sub-agents and general delegation.\n\n")
 	b.WriteString("**Mandatory model gate:** Every Agent tool call MUST include `model`. Calling Agent without `model` is invalid. Before each Agent call, resolve the target phase to an alias from this table; for general/non-SDD delegation use `default`. If you are about to call Agent and have not chosen a `model`, STOP and choose the mapped alias first.\n\n")
-	b.WriteString("| Phase | Default Model | Reason |\n")
-	b.WriteString("|-------|---------------|--------|\n")
+	b.WriteString("| Phase | Default Model | Effort | Reason |\n")
+	b.WriteString("|-------|---------------|--------|--------|\n")
 	for _, key := range claudeModelAssignmentRowOrder {
-		alias := assignments[key]
-		if !alias.Valid() {
-			alias = model.ClaudeModelSonnet
+		assignment := assignments[key]
+		if !assignment.Valid() {
+			assignment = model.ClaudePhaseAssignment{Model: model.ClaudeModelSonnet}
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %s |\n", key, alias, claudeModelAssignmentReasons[key]))
+		effort := string(assignment.Effort)
+		if effort == "" {
+			effort = "default"
+		}
+		b.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", key, assignment.Model, effort, claudeModelAssignmentReasons[key]))
 	}
 	b.WriteString("\n")
 	return b.String()

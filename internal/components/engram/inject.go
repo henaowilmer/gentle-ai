@@ -174,6 +174,16 @@ type InjectOptions struct {
 	// is the safe no-op value for the experimental Codex multi-agent tool set.
 	// Set to true only when the user explicitly opts in via a CLI flag or TUI choice.
 	CodexMultiAgent bool
+
+	// CodexCarrilModelAssignments holds the resolved carril→model-id map used
+	// when writing SDD profile .config.toml files. nil/empty = use canonical
+	// defaults (sdd-strong/sdd-mid=gpt-5.5, sdd-cheap=gpt-5.4-mini).
+	CodexCarrilModelAssignments map[string]string
+
+	// CodexModelAssignments holds the resolved phase→effort map used to derive
+	// the per-carril reasoning_effort written to SDD profile files.
+	// nil/empty = use canonical defaults.
+	CodexModelAssignments map[string]model.CodexEffort
 }
 
 func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
@@ -202,7 +212,7 @@ const antigravityEngramPluginJSON = `{
 }
 `
 
-const antigravityEngramToolsMessage = "CRITICAL FIRST ACTION — Ensure these Engram MCP tools are available before responding: mem_save, mem_search, mem_context, mem_session_summary, mem_session_start, mem_session_end, mem_get_observation, mem_suggest_topic_key, mem_capture_passive, mem_save_prompt, mem_update, mem_current_project, mem_judge. If Antigravity defers MCP tools, load/select these tools from the engram MCP server first. Then call mem_context when the user asks about prior work or the session needs project memory."
+const antigravityEngramToolsMessage = "CRITICAL FIRST ACTION — Ensure these Engram MCP tools are available before responding: mem_save, mem_search, mem_context, mem_session_summary, mem_session_start, mem_session_end, mem_get_observation, mem_suggest_topic_key, mem_capture_passive, mem_save_prompt, mem_update, mem_current_project, mem_judge. When available, also load/select optional mem_review for memory lifecycle review; if mem_review is unavailable, continue with the required tools above. If Antigravity defers MCP tools, load/select these tools from the engram MCP server first. Then call mem_context when the user asks about prior work or the session needs project memory."
 
 func antigravityEngramHooksJSON() []byte {
 	cfg := map[string]any{
@@ -358,6 +368,23 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 			files = append(files, pluginFiles...)
 		}
 
+	case model.StrategyMergeIntoYAML:
+		// Hermes: upsert the engram MCP server block under mcp_servers: in
+		// ~/.hermes/config.yaml via the comment-preserving YAML string helpers.
+		configPath := adapter.MCPConfigPath(configHomeDir, "engram")
+		existing, readErr := readFileOrEmpty(configPath)
+		if readErr != nil {
+			return InjectionResult{}, readErr
+		}
+		engramCmd := stableEngramCommandForMergedConfig(configPath, adapter.Agent())
+		updated := filemerge.UpsertHermesEngramBlock(existing, engramCmd)
+		yamlWrite, writeErr := filemerge.WriteFileAtomic(configPath, []byte(updated), 0o644)
+		if writeErr != nil {
+			return InjectionResult{}, fmt.Errorf("write Hermes engram YAML %q: %w", configPath, writeErr)
+		}
+		changed = changed || yamlWrite.Changed
+		files = append(files, configPath)
+
 	case model.StrategyTOMLFile:
 		// Codex: upsert [mcp_servers.engram] block and instruction-file keys
 		// in ~/.codex/config.toml, then write instruction files.
@@ -430,7 +457,8 @@ func injectWithOptions(configHomeDir, promptDir string, adapter agents.Adapter, 
 		// selected at runtime via `codex --profile <name>`.
 		// codexHomeDir is the ~/.codex directory (the parent of config.toml).
 		codexHomeDir := filepath.Dir(configPath)
-		profilesChanged, profileFiles, profileErr := codex.WriteCodexProfiles(codexHomeDir)
+		profileAssignments := resolveProfileAssignments(opts.CodexCarrilModelAssignments, opts.CodexModelAssignments)
+		profilesChanged, profileFiles, profileErr := codex.WriteCodexProfiles(codexHomeDir, profileAssignments)
 		if profileErr != nil {
 			return InjectionResult{}, profileErr
 		}
@@ -644,6 +672,14 @@ func existingMergedEngramCommand(raw []byte, agentID model.AgentID) (string, boo
 		return "", false
 	}
 
+	// YAML recovery early branch for Hermes: placed before MergeJSONObjects
+	// (which would fail on YAML input). ReadYAMLMCPServerCommand scans the
+	// ~/.hermes/config.yaml content for the named server's command — no
+	// external YAML dependency, read-only. (Decision 9)
+	if agentID == model.AgentHermes {
+		return filemerge.ReadYAMLMCPServerCommand(string(raw), "engram")
+	}
+
 	normalized, err := filemerge.MergeJSONObjects(raw, []byte("{}"))
 	if err != nil {
 		return "", false
@@ -717,7 +753,7 @@ func executableFromCommandValue(command any) (string, bool) {
 
 func isStandardAgent(id model.AgentID) bool {
 	switch id {
-	case model.AgentOpenCode, model.AgentQwenCode, model.AgentCodex, model.AgentGeminiCLI, model.AgentAntigravity, model.AgentClaudeCode, model.AgentOpenClaw:
+	case model.AgentOpenCode, model.AgentQwenCode, model.AgentCodex, model.AgentGeminiCLI, model.AgentAntigravity, model.AgentClaudeCode, model.AgentOpenClaw, model.AgentHermes:
 		return true
 	default:
 		return false
@@ -800,4 +836,60 @@ func isVersionedHomebrewCellarPath(path string) bool {
 func isStableHomebrewEngramPath(path string) bool {
 	clean := filepath.ToSlash(filepath.Clean(path))
 	return (clean == "/opt/homebrew/bin/engram" || clean == "/usr/local/bin/engram") && isEngramCommand(clean)
+}
+
+// resolveProfileAssignments builds the []codex.ProfileAssignment slice used
+// to write the three SDD profile .config.toml files. The carril→model map and
+// the phase→effort map are resolved independently (they live on different axes)
+// so either can be nil and the other still takes effect.
+//
+//   - nil carrilModels → model for each carril falls back to model.DefaultCarrilModels.
+//   - nil phaseEfforts → effort for each carril falls back to the carril's canonical
+//     DefaultEffort from model.CodexTierGroups (Recommended preset values).
+//
+// Single source of truth: tier definitions (phases, default effort, default model)
+// are read from model.CodexTierGroups instead of a duplicate local table.
+func resolveProfileAssignments(carrilModels map[string]string, phaseEfforts map[string]model.CodexEffort) []codex.ProfileAssignment {
+	tiers := model.CodexTierGroups()
+
+	effortRank := map[model.CodexEffort]int{
+		model.CodexEffortLow:    0,
+		model.CodexEffortMedium: 1,
+		model.CodexEffortHigh:   2,
+		model.CodexEffortXHigh:  3,
+	}
+
+	out := make([]codex.ProfileAssignment, 0, len(tiers))
+	for _, t := range tiers {
+		// Resolve model: carrilModels override, fall back to canonical default.
+		mdl := t.Model
+		if v, ok := carrilModels[t.Profile]; ok && v != "" {
+			mdl = v
+		}
+
+		// Resolve effort: max over assigned phases, fall back to carril's DefaultEffort.
+		eff := t.DefaultEffort
+		if len(phaseEfforts) > 0 {
+			best := model.CodexEffort("")
+			bestRank := -1
+			for _, phase := range t.Phases {
+				if e, ok := phaseEfforts[phase]; ok {
+					if r, ok2 := effortRank[e]; ok2 && r > bestRank {
+						bestRank = r
+						best = e
+					}
+				}
+			}
+			if best != "" {
+				eff = best
+			}
+		}
+
+		out = append(out, codex.ProfileAssignment{
+			Profile:         t.Profile,
+			Model:           mdl,
+			ReasoningEffort: string(eff),
+		})
+	}
+	return out
 }

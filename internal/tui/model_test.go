@@ -2000,7 +2000,7 @@ func TestModelConfig_OpenCodePickerBackReturnsToModelConfig(t *testing.T) {
 // makeDetectionWithAgents builds a DetectionResult with the specified agents
 // marked as Exists=true. All other agents are absent.
 func makeDetectionWithAgents(present ...string) system.DetectionResult {
-	known := []string{"claude-code", "opencode", "gemini-cli", "cursor", "vscode-copilot", "codex", "antigravity", "windsurf", "qwen-code"}
+	known := []string{"claude-code", "opencode", "gemini-cli", "cursor", "vscode-copilot", "codex", "antigravity", "windsurf", "qwen-code", "hermes"}
 	presentSet := make(map[string]bool, len(present))
 	for _, p := range present {
 		presentSet[p] = true
@@ -2769,11 +2769,11 @@ func TestModelConfig_EscFromPickersReturnsToModelConfig(t *testing.T) {
 	}
 }
 
-// TestPreselectedAgents_AllSixAgentsMappedCorrectly verifies every canonical
+// TestPreselectedAgents_AllKnownAgentsMappedCorrectly verifies every canonical
 // agent string maps to its model.AgentID constant in preselectedAgents.
 // This prevents silent drops when new agents are added to ScanConfigs without
 // updating the TUI switch statement.
-func TestPreselectedAgents_AllSixAgentsMappedCorrectly(t *testing.T) {
+func TestPreselectedAgents_AllKnownAgentsMappedCorrectly(t *testing.T) {
 	tests := []struct {
 		configAgent string
 		wantID      model.AgentID
@@ -2784,6 +2784,7 @@ func TestPreselectedAgents_AllSixAgentsMappedCorrectly(t *testing.T) {
 		{"cursor", model.AgentCursor},
 		{"vscode-copilot", model.AgentVSCodeCopilot},
 		{"codex", model.AgentCodex},
+		{"hermes", model.AgentHermes},
 	}
 
 	for _, tt := range tests {
@@ -4363,5 +4364,155 @@ func TestCodexPicker_EscBackNavToPresetWhenNeitherClaudeNorKiro(t *testing.T) {
 
 	if state.Screen != ScreenPreset {
 		t.Fatalf("CodexPicker esc (no Claude, no Kiro): screen = %v, want ScreenPreset", state.Screen)
+	}
+}
+
+// TestCodexPresetSelection_PopulatesPendingSyncOverrides verifies that selecting a
+// Codex preset in ModelConfigMode populates PendingSyncOverrides with both
+// CodexModelAssignments and CodexCarrilModelAssignments (and the expected Selection fields).
+func TestCodexPresetSelection_PopulatesPendingSyncOverrides(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenCodexModelPicker
+	m.ModelConfigMode = true
+	m.Selection.Agents = []model.AgentID{model.AgentCodex}
+	m.Selection.Components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD}
+	m.CodexModelPicker = screens.NewCodexModelPickerState()
+	m.Cursor = 1 // Recommended preset (index 1: LowCost=0, Recommended=1, Powerful=2)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	// ModelConfigMode must be cleared after selection.
+	if state.ModelConfigMode {
+		t.Fatal("ModelConfigMode should be false after Codex preset selection")
+	}
+
+	// PendingSyncOverrides must be populated.
+	if state.PendingSyncOverrides == nil {
+		t.Fatal("PendingSyncOverrides = nil, want non-nil after Codex preset selection")
+	}
+
+	// CodexCarrilModelAssignments must contain all three carrils.
+	carrilMap := state.PendingSyncOverrides.CodexCarrilModelAssignments
+	if carrilMap == nil {
+		t.Fatal("PendingSyncOverrides.CodexCarrilModelAssignments = nil, want non-nil")
+	}
+	for _, carril := range []string{"sdd-strong", "sdd-mid", "sdd-cheap"} {
+		if _, ok := carrilMap[carril]; !ok {
+			t.Errorf("PendingSyncOverrides.CodexCarrilModelAssignments missing carril %q", carril)
+		}
+	}
+
+	// CodexModelAssignments must be non-nil (phase→effort map).
+	if state.PendingSyncOverrides.CodexModelAssignments == nil {
+		t.Fatal("PendingSyncOverrides.CodexModelAssignments = nil, want non-nil")
+	}
+
+	// Selection must also be updated.
+	if state.Selection.CodexCarrilModelAssignments == nil {
+		t.Fatal("Selection.CodexCarrilModelAssignments = nil, want non-nil after preset selection")
+	}
+}
+
+// ─── FIX W-1: Codex custom sub-mode cursor reset ─────────────────────────────
+
+// ─── FIX W-2: CustomConfirmed reset on preset selection ──────────────────────
+
+// TestCodexModelPickerPresetClearsCustomState verifies that selecting a preset
+// after a prior Custom confirm resets CustomConfirmed to false and clears
+// CodexPhaseModelAssignments so the inject layer uses the carril table.
+func TestCodexModelPickerPresetClearsCustomState(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenCodexModelPicker
+	m.CodexModelPicker = screens.NewCodexModelPickerState()
+
+	// Simulate a previously confirmed Custom flow.
+	m.CodexModelPicker.CustomConfirmed = true
+	m.Selection.CodexPhaseModelAssignments = map[string]string{
+		"sdd-propose": "gpt-5.4",
+	}
+
+	// Select the Recommended preset (cursor index 1).
+	m.Cursor = 1
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	// CustomConfirmed must be reset.
+	if state.CodexModelPicker.CustomConfirmed {
+		t.Error("CodexModelPicker.CustomConfirmed = true after preset selection, want false")
+	}
+	// CodexPhaseModelAssignments must be nil — inject layer should use carril table.
+	if state.Selection.CodexPhaseModelAssignments != nil {
+		t.Errorf("Selection.CodexPhaseModelAssignments = %v after preset selection, want nil",
+			state.Selection.CodexPhaseModelAssignments)
+	}
+}
+
+// ─── FIX W-1: Codex custom sub-mode cursor reset ─────────────────────────────
+
+// TestCodexModelPickerCustomModeEscResetsCursor verifies that after entering
+// the Codex custom sub-mode and pressing Esc, the outer cursor is reset to 0.
+func TestCodexModelPickerCustomModeEscResetsCursor(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenCodexModelPicker
+	m.CodexModelPicker = screens.NewCodexModelPickerState()
+	// Enter the Custom sub-mode (index 3).
+	m.CodexModelPicker.CustomMode = screens.CodexCustomModePhaseList
+	m.Cursor = 7 // simulate user navigated down in custom phase list
+
+	// Press Esc — should exit the Custom sub-mode and reset the outer cursor to 0.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	state := updated.(Model)
+
+	// Custom mode must be off.
+	if state.CodexModelPicker.CustomMode != screens.CodexCustomModeNone {
+		t.Fatalf("CodexModelPicker.CustomMode = %v, want CodexCustomModeNone after Esc", state.CodexModelPicker.CustomMode)
+	}
+	// Outer cursor must be reset to 0.
+	if state.Cursor != 0 {
+		t.Fatalf("Cursor = %d, want 0 after Esc from Codex custom sub-mode (cursor not reset)", state.Cursor)
+	}
+}
+
+func TestGentleAIUpgradeVersionDetectsSucceededGentleAI(t *testing.T) {
+	report := upgrade.UpgradeReport{Results: []upgrade.ToolUpgradeResult{
+		{ToolName: "engram", Status: upgrade.UpgradeSucceeded, NewVersion: "1.0.0"},
+		{ToolName: "gentle-ai", Status: upgrade.UpgradeSucceeded, NewVersion: "v1.40.0"},
+	}}
+	m := Model{UpgradeReport: &report}
+	got, ok := m.GentleAIUpgradeVersion()
+	if !ok {
+		t.Fatal("GentleAIUpgradeVersion() ok = false, want true")
+	}
+	if got != "1.40.0" {
+		t.Fatalf("GentleAIUpgradeVersion() = %q, want %q", got, "1.40.0")
+	}
+}
+
+func TestUpgradeResultEnterQuitsWhenGentleAIWasUpgraded(t *testing.T) {
+	report := upgrade.UpgradeReport{Results: []upgrade.ToolUpgradeResult{
+		{ToolName: "gentle-ai", Status: upgrade.UpgradeSucceeded, NewVersion: "v1.40.0"},
+	}}
+	m := Model{Screen: ScreenUpgrade, UpgradeReport: &report}
+	_, cmd := m.confirmSelection()
+	if cmd == nil {
+		t.Fatal("confirmSelection() cmd = nil, want tea.Quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("confirmSelection() command returned %T, want tea.QuitMsg", cmd())
+	}
+}
+
+func TestUpgradeSyncResultEscQuitsWhenGentleAIWasUpgraded(t *testing.T) {
+	report := upgrade.UpgradeReport{Results: []upgrade.ToolUpgradeResult{
+		{ToolName: "gentle-ai", Status: upgrade.UpgradeSucceeded, NewVersion: "v1.40.0"},
+	}}
+	m := Model{Screen: ScreenUpgradeSync, UpgradeReport: &report, HasSyncRun: true}
+	_, cmd := m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("handleKeyPress(esc) cmd = nil, want tea.Quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("handleKeyPress(esc) command returned %T, want tea.QuitMsg", cmd())
 	}
 }

@@ -191,7 +191,6 @@ func TestPiAgentInstallRunsPackageCommandsWhenPiAlreadyInstalled(t *testing.T) {
 		"pi install npm:pi-intercom",
 		"pi install npm:@juicesharp/rpiv-ask-user-question",
 		"pi install npm:pi-web-access",
-		"pi install npm:pi-lens",
 		"pi install npm:@juicesharp/rpiv-todo",
 		"pi install npm:pi-btw",
 	} {
@@ -1525,6 +1524,7 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 	pluginPaths := []string{
 		filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts"),
 		filepath.Join(home, ".config", "opencode", "plugins", "model-variants.ts"),
+		filepath.Join(home, ".config", "opencode", "plugins", "skill-registry.ts"),
 	}
 	for _, pluginPath := range pluginPaths {
 		if !containsPath(expectedPaths, pluginPath) {
@@ -1554,11 +1554,23 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 	}
 
 	for _, path := range expectedPaths {
+		if isLegacyOpenCodeBackgroundAgentsPlugin(path) {
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("expected legacy OpenCode SDD plugin %q to be removed after install; stat err = %v", path, statErr)
+			}
+			continue
+		}
 		if _, statErr := os.Stat(path); statErr != nil {
 			t.Fatalf("expected dry-run path %q to exist after install: %v", path, statErr)
 		}
 	}
 	for _, pluginPath := range pluginPaths {
+		if isLegacyOpenCodeBackgroundAgentsPlugin(pluginPath) {
+			if _, statErr := os.Stat(pluginPath); !os.IsNotExist(statErr) {
+				t.Fatalf("expected legacy OpenCode SDD plugin %q to be removed after install; stat err = %v", pluginPath, statErr)
+			}
+			continue
+		}
 		if _, statErr := os.Stat(pluginPath); statErr != nil {
 			t.Fatalf("expected OpenCode SDD plugin %q to exist after install: %v", pluginPath, statErr)
 		}

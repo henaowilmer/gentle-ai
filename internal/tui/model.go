@@ -95,6 +95,25 @@ func sanitizeKnownModelEffort(assignment model.ModelAssignment, sddModels map[st
 	return assignment
 }
 
+// codexPhaseModelsFromCustomAssignments converts the TUI's CustomAssignments map
+// (phase → CodexCustomAssignment) to the state-layer map (phase → model id string)
+// used by Selection.CodexPhaseModelAssignments and state.InstallState.
+func codexPhaseModelsFromCustomAssignments(assignments map[string]screens.CodexCustomAssignment) map[string]string {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(assignments))
+	for phase, a := range assignments {
+		if a.ModelID != "" {
+			out[phase] = a.ModelID
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -488,6 +507,7 @@ func NewModel(detection system.DetectionResult, version string, installState ...
 		Preset:                 model.PresetFullGentleman,
 		Components:             components,
 		ClaudeModelAssignments: installStateClaudeAssignments(s.ClaudeModelAssignments),
+		ClaudePhaseAssignments: installStateClaudePhaseAssignments(s.ClaudePhaseAssignments),
 		KiroModelAssignments:   installStateKiroAssignments(s.KiroModelAssignments),
 		ModelAssignments:       installStateModelAssignments(s.ModelAssignments),
 	}
@@ -515,6 +535,40 @@ func installStateClaudeAssignments(assignments map[string]string) map[string]mod
 	out := make(map[string]model.ClaudeModelAlias, len(assignments))
 	for phase, alias := range assignments {
 		out[phase] = model.ClaudeModelAlias(alias)
+	}
+	return out
+}
+
+func installStateClaudePhaseAssignments(assignments map[string]state.ClaudePhaseAssignmentState) map[string]model.ClaudePhaseAssignment {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ClaudePhaseAssignment, len(assignments))
+	for phase, assignment := range assignments {
+		a := model.ClaudePhaseAssignment{Model: model.ClaudeModelAlias(assignment.Model), Effort: model.ClaudeEffort(assignment.Effort)}
+		if a.Valid() {
+			out[phase] = a
+		}
+	}
+	return out
+}
+
+func claudePickerAssignments(legacy map[string]model.ClaudeModelAlias, phase map[string]model.ClaudePhaseAssignment) map[string]model.ClaudePhaseAssignment {
+	if len(phase) > 0 {
+		return phase
+	}
+	return model.ClaudePhaseAssignmentsFromLegacy(legacy)
+}
+
+func claudePhaseAssignmentsToLegacy(assignments map[string]model.ClaudePhaseAssignment) map[string]model.ClaudeModelAlias {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ClaudeModelAlias, len(assignments))
+	for phase, assignment := range assignments {
+		if assignment.Model.Valid() {
+			out[phase] = assignment.Model
+		}
 	}
 	return out
 }
@@ -637,6 +691,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err == nil {
 			report := msg.Report
 			m.UpgradeReport = &report
+			if report.ExitRequested {
+				return m, tea.Quit
+			}
 		}
 		m.UpdateResults = nil
 		m.UpdateCheckDone = false
@@ -676,6 +733,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err == nil {
 			report := msg.Report
 			m.UpgradeReport = &report
+			if report.ExitRequested {
+				return m, tea.Quit
+			}
 		}
 		m.UpdateResults = nil
 		m.UpdateCheckDone = false
@@ -931,20 +991,24 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if m.Screen == ScreenClaudeModelPicker {
 		wasInCustomMode := m.ClaudeModelPicker.InCustomMode
+		previousMode := m.ClaudeModelPicker.Mode
 		handled, updated := screens.HandleClaudeModelPickerNav(keyStr, &m.ClaudeModelPicker, m.Cursor)
 		if handled {
-			// Issue #147: reset cursor when exiting custom mode (Esc or Back row).
-			if wasInCustomMode && !m.ClaudeModelPicker.InCustomMode {
+			// Issue #147: reset cursor when exiting custom mode (Esc or Back row),
+			// and when entering/leaving nested model/effort selection screens.
+			if (wasInCustomMode && !m.ClaudeModelPicker.InCustomMode) || previousMode != m.ClaudeModelPicker.Mode {
 				m.Cursor = 0
 			}
 			if updated != nil {
-				m.Selection.ClaudeModelAssignments = updated
+				m.Selection.ClaudePhaseAssignments = updated
+				m.Selection.ClaudeModelAssignments = claudePhaseAssignmentsToLegacy(updated)
 				// In ModelConfigMode, persist model assignments via sync.
 				if m.ModelConfigMode {
 					m.ModelConfigMode = false
 					m.PendingSyncOverrides = &model.SyncOverrides{
 						TargetAgents:           []model.AgentID{model.AgentClaudeCode},
-						ClaudeModelAssignments: updated,
+						ClaudeModelAssignments: claudePhaseAssignmentsToLegacy(updated),
+						ClaudePhaseAssignments: updated,
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
@@ -1027,15 +1091,51 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.Screen == ScreenCodexModelPicker {
+		wasInCustomSubMode := m.CodexModelPicker.CustomMode != screens.CodexCustomModeNone
 		handled, assignments := screens.HandleCodexModelPickerNav(keyStr, &m.CodexModelPicker, m.Cursor)
 		if handled {
+			// Reset cursor when exiting the Custom sub-mode back to the main picker.
+			if wasInCustomSubMode && m.CodexModelPicker.CustomMode == screens.CodexCustomModeNone {
+				m.Cursor = 0
+			}
 			if assignments != nil {
 				m.Selection.CodexModelAssignments = assignments
+				// Derive carril model assignments from the selected preset (all
+				// current presets use canonical subscription models).
+				presetCarrilModels := model.DefaultCarrilModels()
+				m.Selection.CodexCarrilModelAssignments = presetCarrilModels
+
+				// When the user confirmed Custom per-phase assignments, also
+				// persist the per-phase model map so the inject layer can render
+				// a per-phase table instead of the carril table.
+				if m.CodexModelPicker.CustomConfirmed {
+					phaseModels := codexPhaseModelsFromCustomAssignments(m.CodexModelPicker.CustomAssignments)
+					m.Selection.CodexPhaseModelAssignments = phaseModels
+				} else {
+					// Preset selected — clear any stale custom per-phase state so a
+					// subsequent Custom flow starts clean and the inject layer uses
+					// the carril table, not leftover per-phase assignments.
+					m.Selection.CodexPhaseModelAssignments = nil
+					m.CodexModelPicker.CustomConfirmed = false
+				}
+
 				if m.ModelConfigMode {
 					m.ModelConfigMode = false
+					// When a preset is selected, m.Selection.CodexPhaseModelAssignments is nil
+					// (cleared above). The sync override must carry a non-nil empty map instead
+					// so that applyOverrides clears any stale per-phase map loaded from state,
+					// and persistAssignments deletes the key from state.json.
+					// When Custom is confirmed, m.Selection.CodexPhaseModelAssignments is a
+					// non-empty map and is forwarded directly.
+					phaseOverride := m.Selection.CodexPhaseModelAssignments
+					if phaseOverride == nil {
+						phaseOverride = map[string]string{} // explicit clear signal for the preset path
+					}
 					m.PendingSyncOverrides = &model.SyncOverrides{
-						TargetAgents:          []model.AgentID{model.AgentCodex},
-						CodexModelAssignments: assignments,
+						TargetAgents:                []model.AgentID{model.AgentCodex},
+						CodexModelAssignments:       assignments,
+						CodexCarrilModelAssignments: presetCarrilModels,
+						CodexPhaseModelAssignments:  phaseOverride,
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
@@ -1167,6 +1267,9 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Don't allow going back while pipeline is running.
 		if m.Screen == ScreenInstalling && m.pipelineRunning {
 			return m, nil
+		}
+		if _, ok := m.GentleAIUpgradeVersion(); ok {
+			return m, tea.Quit
 		}
 		return m.goBack(), nil
 	case " ":
@@ -1446,6 +1549,11 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		if m.OperationRunning {
 			return m, nil
 		}
+		// If gentle-ai itself was upgraded, leave the TUI so the app layer can restart
+		// or ask for restart using the platform-specific restart helper.
+		if _, ok := m.GentleAIUpgradeVersion(); ok {
+			return m, tea.Quit
+		}
 		// If showing results (UpgradeReport != nil or UpgradeErr != nil), return to welcome.
 		if m.UpgradeReport != nil || m.UpgradeErr != nil {
 			m = m.withResetOperationState()
@@ -1484,6 +1592,11 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		// Guard: don't re-launch while running.
 		if m.OperationRunning {
 			return m, nil
+		}
+		// If gentle-ai itself was upgraded, leave the TUI so the app layer can restart
+		// or ask for restart using the platform-specific restart helper.
+		if _, ok := m.GentleAIUpgradeVersion(); ok {
+			return m, tea.Quit
 		}
 		// If operations are done, return to welcome.
 		if m.HasSyncRun || m.UpgradeReport != nil || m.UpgradeErr != nil {
@@ -1559,7 +1672,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		switch m.Cursor {
 		case 0: // Configure Claude models
 			m.ModelConfigMode = true
-			m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromAssignments(m.Selection.ClaudeModelAssignments)
+			m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments))
 			m.setScreen(ScreenClaudeModelPicker)
 		case 1: // Configure OpenCode models
 			m.ModelConfigMode = true
@@ -1636,7 +1749,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			m.Selection.Preset = options[m.Cursor]
 			m.Selection.Components = componentsForPreset(options[m.Cursor], m.Selection.Persona)
 			if m.shouldShowClaudeModelPickerScreen() {
-				m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromAssignments(m.Selection.ClaudeModelAssignments)
+				m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments))
 				m.setScreen(ScreenClaudeModelPicker)
 				return m, nil
 			}
@@ -1700,7 +1813,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case ScreenCodexModelPicker:
-		if m.Cursor == screens.CodexModelPickerOptionCount()-1 {
+		if m.CodexModelPicker.CustomMode == screens.CodexCustomModeNone && m.Cursor == screens.CodexModelPickerOptionCount(m.CodexModelPicker)-1 {
 			if m.ModelConfigMode {
 				m.ModelConfigMode = false
 				m.setScreen(ScreenModelConfig)
@@ -1925,7 +2038,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.buildDependencyPlan()
 				// Show model picker screens if needed (components are now set).
 				if m.shouldShowClaudeModelPickerScreen() {
-					m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromAssignments(m.Selection.ClaudeModelAssignments)
+					m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments))
 					m.setScreen(ScreenClaudeModelPicker)
 					return m, nil
 				}
@@ -2461,6 +2574,20 @@ func reportUpgradedGentleAI(report upgrade.UpgradeReport) bool {
 	return false
 }
 
+// GentleAIUpgradeVersion returns the upgraded gentle-ai version when the current
+// TUI result requires restarting the app before continuing with config sync.
+func (m Model) GentleAIUpgradeVersion() (string, bool) {
+	if m.UpgradeReport == nil {
+		return "", false
+	}
+	for _, result := range m.UpgradeReport.Results {
+		if result.ToolName == "gentle-ai" && result.Status == upgrade.UpgradeSucceeded {
+			return strings.TrimPrefix(result.NewVersion, "v"), true
+		}
+	}
+	return "", false
+}
+
 // restoreBackup triggers a backup restore in a goroutine.
 func (m Model) restoreBackup(manifest backup.Manifest) (tea.Model, tea.Cmd) {
 	if m.RestoreFn == nil {
@@ -2914,7 +3041,7 @@ func (m Model) optionCount() int {
 	case ScreenKiroModelPicker:
 		return screens.KiroModelPickerOptionCount(m.KiroModelPicker)
 	case ScreenCodexModelPicker:
-		return screens.CodexModelPickerOptionCount()
+		return screens.CodexModelPickerOptionCount(m.CodexModelPicker)
 	case ScreenSDDMode:
 		return len(screens.SDDModeOptions()) + 1
 	case ScreenStrictTDD:
@@ -3343,6 +3470,8 @@ func detectedAgentIDs(detection system.DetectionResult) []model.AgentID {
 			selected = append(selected, model.AgentQwenCode)
 		case string(model.AgentPi):
 			selected = append(selected, model.AgentPi)
+		case string(model.AgentHermes):
+			selected = append(selected, model.AgentHermes)
 		}
 	}
 	return selected

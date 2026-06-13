@@ -168,7 +168,7 @@ func TestGoldenSDD_OpenCode_Multi(t *testing.T) {
 
 	// Golden-check the settings file with multi overlay merged.
 	settingsJSON := readTestFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"))
-	for _, toolName := range []string{"\"delegate\"", "\"delegation_read\"", "\"delegation_list\""} {
+	for _, toolName := range []string{"\"task\""} {
 		if !strings.Contains(string(settingsJSON), toolName) {
 			t.Fatalf("multi-mode settings missing orchestrator tool %s", toolName)
 		}
@@ -182,10 +182,14 @@ func TestGoldenSDD_OpenCode_Multi(t *testing.T) {
 	normalizedSettings := []byte(jsonStr)
 	assertGolden(t, "sdd-opencode-multi-settings.golden", normalizedSettings)
 
-	pluginPath := filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts")
-	pluginContent := readTestFile(t, pluginPath)
-	if string(pluginContent) != assets.MustRead("opencode/plugins/background-agents.ts") {
-		t.Fatalf("plugin content mismatch for %q", pluginPath)
+	legacyPluginPath := filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts")
+	if _, err := os.Stat(legacyPluginPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy background-agents plugin should not be installed by default; stat err = %v", err)
+	}
+	modelVariantsPath := filepath.Join(home, ".config", "opencode", "plugins", "model-variants.ts")
+	pluginContent := readTestFile(t, modelVariantsPath)
+	if string(pluginContent) != assets.MustRead("opencode/plugins/model-variants.ts") {
+		t.Fatalf("plugin content mismatch for %q", modelVariantsPath)
 	}
 }
 
