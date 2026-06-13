@@ -15,6 +15,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agents/kimi"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/opencode"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/components/theme"
 	"github.com/gentleman-programming/gentle-ai/internal/installcmd"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
@@ -1620,9 +1621,9 @@ func TestRunInstallFullGentlemanClaudeAndOpenCodeSkipsClaudeLegacyTheme(t *testi
 	}
 
 	openCodeTUIPath := filepath.Join(home, ".config", "opencode", "tui.json")
-	assertFileContains(t, openCodeTUIPath, `"theme": "gentleman-kanagawa"`)
+	assertFileContains(t, openCodeTUIPath, `"theme": "gentleman-midnight"`)
 
-	openCodeThemePath := filepath.Join(home, ".config", "opencode", "themes", "gentleman-kanagawa.json")
+	openCodeThemePath := filepath.Join(home, ".config", "opencode", "themes", theme.DefaultOpenCodeThemeFileName())
 	if _, err := os.Stat(openCodeThemePath); err != nil {
 		t.Fatalf("expected OpenCode theme file %q: %v", openCodeThemePath, err)
 	}

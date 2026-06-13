@@ -106,7 +106,7 @@ func TestRemoveManagedPersonaPreamble_WithoutMarkerDoesNotDeleteContent(t *testi
 
 func TestRemoveJSONPaths_RemovesOnlyManagedKeys(t *testing.T) {
 	input := []byte(`{
-  "theme": "gentleman-kanagawa",
+  "theme": "gentleman-midnight",
   "permission": {
     "bash": {
       "*": "allow"

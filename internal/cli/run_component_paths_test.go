@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gentleman-programming/gentle-ai/internal/components/theme"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 )
 
@@ -74,7 +75,7 @@ func TestComponentPathsThemeSkipsClaudeSettingsWhenClaudeThemeSelected(t *testin
 
 	for _, want := range []string{
 		filepath.Join(home, ".config", "opencode", "tui.json"),
-		filepath.Join(home, ".config", "opencode", "themes", "gentleman-kanagawa.json"),
+		filepath.Join(home, ".config", "opencode", "themes", theme.DefaultOpenCodeThemeFileName()),
 	} {
 		if !containsPath(paths, want) {
 			t.Fatalf("componentPaths(theme) missing OpenCode theme path %q\npaths=%v", want, paths)

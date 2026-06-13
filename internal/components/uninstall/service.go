@@ -16,6 +16,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/sdd"
+	"github.com/gentleman-programming/gentle-ai/internal/components/theme"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/state"
 )
@@ -503,13 +504,18 @@ func (s *Service) componentOperations(adapter agents.Adapter, componentID model.
 	case model.ComponentTheme:
 		if adapter.Agent() == model.AgentOpenCode {
 			tuiPath := filepath.Join(homeDir, ".config", "opencode", "tui.json")
-			themePath := filepath.Join(homeDir, ".config", "opencode", "themes", "gentleman-kanagawa.json")
-			targets = append(targets, tuiPath, themePath)
-			ops = append(ops,
-				rewriteJSONFile(tuiPath, jsonPath{"theme"}),
-				removeFile(themePath),
-				removeDirIfEmpty(filepath.Dir(themePath)),
-			)
+			themeDir := filepath.Join(homeDir, ".config", "opencode", "themes")
+			managedThemePaths := []string{
+				filepath.Join(themeDir, theme.DefaultOpenCodeThemeFileName()),
+				filepath.Join(themeDir, theme.LegacyOpenCodeThemeFileName()),
+			}
+			targets = append(targets, tuiPath)
+			ops = append(ops, rewriteJSONFile(tuiPath, jsonPath{"theme"}))
+			for _, themePath := range managedThemePaths {
+				targets = append(targets, themePath)
+				ops = append(ops, removeFile(themePath))
+			}
+			ops = append(ops, removeDirIfEmpty(themeDir))
 			break
 		}
 		if path := adapter.SettingsPath(homeDir); path != "" {
