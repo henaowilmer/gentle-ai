@@ -382,6 +382,7 @@ type Model struct {
 
 	// pipelineRunning tracks whether the pipeline goroutine is active.
 	pipelineRunning bool
+	pipelineEvents  <-chan tea.Msg
 
 	// TUI operations — set by startUpgrade / startSync / startUpgradeSync goroutines.
 
@@ -676,7 +677,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setScreen(ScreenOpenCodePluginResult)
 		return m, nil
 	case StepProgressMsg:
-		return m.handleStepProgress(msg)
+		updated, cmd := m.handleStepProgress(msg)
+		state := updated.(Model)
+		if cmd == nil && state.pipelineRunning && state.pipelineEvents != nil {
+			cmd = waitPipelineEvent(state.pipelineEvents)
+		}
+		return state, cmd
 	case PipelineDoneMsg:
 		return m.handlePipelineDone(msg)
 	case BackupRestoreMsg:
@@ -803,6 +809,7 @@ func (m Model) handleStepProgress(msg StepProgressMsg) (tea.Model, tea.Cmd) {
 func (m Model) handlePipelineDone(msg PipelineDoneMsg) (tea.Model, tea.Cmd) {
 	m.Execution = msg.Result
 	m.pipelineRunning = false
+	m.pipelineEvents = nil
 
 	// Rebuild progress from real step results so failed steps show ✗ instead
 	// of being blindly marked as succeeded.
@@ -2318,6 +2325,8 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 	}
 
 	m.pipelineRunning = true
+	events := make(chan tea.Msg, len(labels)*2+1)
+	m.pipelineEvents = events
 
 	// Capture values for the goroutine closure.
 	executeFn := m.ExecuteFn
@@ -2325,18 +2334,27 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 	resolved := m.DependencyPlan
 	detection := m.Detection
 
-	return m, tea.Batch(tickCmd(), func() tea.Msg {
+	go func() {
+		defer close(events)
 		onProgress := func(event pipeline.ProgressEvent) {
-			// NOTE: ProgressFunc is called synchronously from the pipeline goroutine.
-			// We cannot use p.Send() here because we don't have a reference to the
-			// tea.Program. Instead, these events are collected in the ExecutionResult
-			// and the PipelineDoneMsg handles the final state. For real-time updates,
-			// we rely on the pipeline calling this synchronously from each step.
+			events <- StepProgressMsg{StepID: event.StepID, Status: event.Status, Err: event.Err}
 		}
 
 		result := executeFn(selection, resolved, detection, onProgress)
-		return PipelineDoneMsg{Result: result}
-	})
+		events <- PipelineDoneMsg{Result: result}
+	}()
+
+	return m, tea.Batch(tickCmd(), waitPipelineEvent(events))
+}
+
+func waitPipelineEvent(events <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-events
+		if !ok {
+			return nil
+		}
+		return msg
+	}
 }
 
 // withResetSyncState clears sync-result state so ScreenSync shows the confirmation
