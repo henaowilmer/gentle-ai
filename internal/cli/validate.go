@@ -44,6 +44,9 @@ func NormalizeInstallFlags(flags InstallFlags, detection system.DetectionResult)
 	if len(flags.Components) == 0 && strings.TrimSpace(flags.Preset) == "" && isPiOnlyAgents(selection.Agents) {
 		components = piOnlyComponents()
 	}
+	if len(flags.Components) == 0 {
+		components = model.ScopePresetComponentsToAgents(components, selection.Agents)
+	}
 
 	selection.Components = components
 
@@ -172,6 +175,7 @@ func componentsForPreset(preset model.PresetID, persona model.PersonaID) []model
 			model.ComponentContext7,
 			model.ComponentPermission,
 			model.ComponentGGA,
+			model.ComponentTheme,
 			model.ComponentClaudeTheme,
 			model.ComponentOpenCodeGentleLogo,
 		}

@@ -4222,6 +4222,44 @@ func TestPersonaScreenRecomputesComponentsWhenPresetAlreadySet(t *testing.T) {
 	}
 }
 
+func TestPresetScreenScopesThemeComponentsToSelectedAgents(t *testing.T) {
+	t.Run("claude only excludes legacy theme", func(t *testing.T) {
+		m := NewModel(system.DetectionResult{}, "dev")
+		m.Screen = ScreenPreset
+		m.Selection.Agents = []model.AgentID{model.AgentClaudeCode}
+		m.Selection.Persona = model.PersonaGentleman
+		m.Cursor = presetCursor(t, model.PresetFullGentleman)
+
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		state := updated.(Model)
+
+		if hasSelectedComponent(state.Selection.Components, model.ComponentTheme) {
+			t.Fatalf("components = %v, should not include legacy theme for Claude-only preset", state.Selection.Components)
+		}
+		if !hasSelectedComponent(state.Selection.Components, model.ComponentClaudeTheme) {
+			t.Fatalf("components = %v, want claude-theme for Claude-only preset", state.Selection.Components)
+		}
+	})
+
+	t.Run("opencode only includes legacy theme", func(t *testing.T) {
+		m := NewModel(system.DetectionResult{}, "dev")
+		m.Screen = ScreenPreset
+		m.Selection.Agents = []model.AgentID{model.AgentOpenCode}
+		m.Selection.Persona = model.PersonaGentleman
+		m.Cursor = presetCursor(t, model.PresetFullGentleman)
+
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		state := updated.(Model)
+
+		if !hasSelectedComponent(state.Selection.Components, model.ComponentTheme) {
+			t.Fatalf("components = %v, want legacy theme for OpenCode preset", state.Selection.Components)
+		}
+		if hasSelectedComponent(state.Selection.Components, model.ComponentClaudeTheme) {
+			t.Fatalf("components = %v, should not include claude-theme for OpenCode-only preset", state.Selection.Components)
+		}
+	})
+}
+
 // TestPersonaScreenDoesNotRecomputeForCustomPreset verifies that changing persona
 // does NOT recompute (and wipe) the nil component list when preset is custom.
 func TestPersonaScreenDoesNotRecomputeForCustomPreset(t *testing.T) {

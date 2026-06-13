@@ -501,6 +501,17 @@ func (s *Service) componentOperations(adapter agents.Adapter, componentID model.
 			}
 		}
 	case model.ComponentTheme:
+		if adapter.Agent() == model.AgentOpenCode {
+			tuiPath := filepath.Join(homeDir, ".config", "opencode", "tui.json")
+			themePath := filepath.Join(homeDir, ".config", "opencode", "themes", "gentleman-kanagawa.json")
+			targets = append(targets, tuiPath, themePath)
+			ops = append(ops,
+				rewriteJSONFile(tuiPath, jsonPath{"theme"}),
+				removeFile(themePath),
+				removeDirIfEmpty(filepath.Dir(themePath)),
+			)
+			break
+		}
 		if path := adapter.SettingsPath(homeDir); path != "" {
 			targets = append(targets, path)
 			ops = append(ops, rewriteJSONFile(path, jsonPath{"theme"}))

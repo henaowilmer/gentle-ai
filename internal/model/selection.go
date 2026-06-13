@@ -41,6 +41,40 @@ func (s Selection) HasComponent(component ComponentID) bool {
 	return false
 }
 
+func ScopePresetComponentsToAgents(components []ComponentID, agents []AgentID) []ComponentID {
+	if len(components) == 0 || len(agents) == 0 {
+		return components
+	}
+
+	hasOpenCode := false
+	hasClaudeCode := false
+	for _, agent := range agents {
+		switch agent {
+		case AgentOpenCode:
+			hasOpenCode = true
+		case AgentClaudeCode:
+			hasClaudeCode = true
+		}
+	}
+
+	scoped := make([]ComponentID, 0, len(components))
+	for _, component := range components {
+		switch component {
+		case ComponentTheme, ComponentOpenCodeGentleLogo:
+			if !hasOpenCode {
+				continue
+			}
+		case ComponentClaudeTheme:
+			if !hasClaudeCode {
+				continue
+			}
+		}
+		scoped = append(scoped, component)
+	}
+
+	return scoped
+}
+
 // SyncOverrides holds optional overrides applied to the sync selection.
 // Used when the TUI "Configure Models" flow needs to persist model assignments
 // without re-running the full install pipeline.

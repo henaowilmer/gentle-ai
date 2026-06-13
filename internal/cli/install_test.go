@@ -79,6 +79,7 @@ func TestNormalizeInstallFlagsDefaults(t *testing.T) {
 			model.ComponentContext7,
 			model.ComponentPermission,
 			model.ComponentGGA,
+			model.ComponentTheme,
 			model.ComponentClaudeTheme,
 			model.ComponentOpenCodeGentleLogo,
 			model.ComponentPersona,
@@ -118,6 +119,38 @@ func TestNormalizeInstallFlagsCustomAcceptsOptionalGentlemanInstallables(t *test
 	}
 }
 
+func TestNormalizeInstallFlagsScopesFullPresetThemeToClaudeCode(t *testing.T) {
+	input, err := NormalizeInstallFlags(InstallFlags{
+		Agents: []string{string(model.AgentClaudeCode)},
+	}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("NormalizeInstallFlags() error = %v", err)
+	}
+
+	if containsComponent(input.Selection.Components, model.ComponentTheme) {
+		t.Fatalf("components = %#v, should not include legacy theme for Claude-only preset", input.Selection.Components)
+	}
+	if !containsComponent(input.Selection.Components, model.ComponentClaudeTheme) {
+		t.Fatalf("components = %#v, want claude-theme for Claude-only preset", input.Selection.Components)
+	}
+}
+
+func TestNormalizeInstallFlagsScopesFullPresetThemeToOpenCode(t *testing.T) {
+	input, err := NormalizeInstallFlags(InstallFlags{
+		Agents: []string{string(model.AgentOpenCode)},
+	}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("NormalizeInstallFlags() error = %v", err)
+	}
+
+	if !containsComponent(input.Selection.Components, model.ComponentTheme) {
+		t.Fatalf("components = %#v, want legacy theme for OpenCode preset", input.Selection.Components)
+	}
+	if containsComponent(input.Selection.Components, model.ComponentClaudeTheme) {
+		t.Fatalf("components = %#v, should not include claude-theme for OpenCode-only preset", input.Selection.Components)
+	}
+}
+
 func TestNormalizeInstallFlagsPiOnlyDefaultsToEngramOnly(t *testing.T) {
 	input, err := NormalizeInstallFlags(InstallFlags{
 		Agents: []string{string(model.AgentPi)},
@@ -134,6 +167,16 @@ func TestNormalizeInstallFlagsPiOnlyDefaultsToEngramOnly(t *testing.T) {
 	if !reflect.DeepEqual(input.Selection.Components, wantComponents) {
 		t.Fatalf("components = %#v, want %#v", input.Selection.Components, wantComponents)
 	}
+}
+
+func containsComponent(components []model.ComponentID, target model.ComponentID) bool {
+	for _, component := range components {
+		if component == target {
+			return true
+		}
+	}
+
+	return false
 }
 
 func TestNormalizeInstallFlagsPiOnlyRespectsExplicitComponents(t *testing.T) {

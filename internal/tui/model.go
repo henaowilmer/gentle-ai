@@ -496,7 +496,10 @@ func NewModel(detection system.DetectionResult, version string, installState ...
 		s = installState[0]
 	}
 	agents := preselectedAgents(detection, s)
-	components := componentsForPreset(model.PresetFullGentleman, model.PersonaGentleman)
+	components := model.ScopePresetComponentsToAgents(
+		componentsForPreset(model.PresetFullGentleman, model.PersonaGentleman),
+		agents,
+	)
 	if isPiOnlyAgents(agents) {
 		components = piOnlyComponents()
 	}
@@ -1738,7 +1741,10 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			m.Selection.Persona = options[m.Cursor]
 			// Recompute components if a non-custom preset was already chosen
 			if m.Selection.Preset != "" && m.Selection.Preset != model.PresetCustom {
-				m.Selection.Components = componentsForPreset(m.Selection.Preset, m.Selection.Persona)
+				m.Selection.Components = model.ScopePresetComponentsToAgents(
+					componentsForPreset(m.Selection.Preset, m.Selection.Persona),
+					m.Selection.Agents,
+				)
 			}
 			m.setScreen(ScreenPreset)
 			return m, nil
@@ -1748,7 +1754,10 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		options := screens.PresetOptions()
 		if m.Cursor < len(options) {
 			m.Selection.Preset = options[m.Cursor]
-			m.Selection.Components = componentsForPreset(options[m.Cursor], m.Selection.Persona)
+			m.Selection.Components = model.ScopePresetComponentsToAgents(
+				componentsForPreset(options[m.Cursor], m.Selection.Persona),
+				m.Selection.Agents,
+			)
 			if m.shouldShowClaudeModelPickerScreen() {
 				m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments))
 				m.setScreen(ScreenClaudeModelPicker)
@@ -3622,6 +3631,7 @@ func componentsForPreset(preset model.PresetID, persona model.PersonaID) []model
 			model.ComponentContext7,
 			model.ComponentPermission,
 			model.ComponentGGA,
+			model.ComponentTheme,
 			model.ComponentClaudeTheme,
 			model.ComponentOpenCodeGentleLogo,
 		}
