@@ -835,6 +835,9 @@ func (s componentApplyStep) Run() error {
 		return nil
 	case model.ComponentTheme:
 		for _, adapter := range adapters {
+			if !legacyThemeAppliesToAdapter(s.selection, adapter) {
+				continue
+			}
 			if _, err := theme.Inject(s.homeDir, adapter); err != nil {
 				return fmt.Errorf("inject theme for %q: %w", adapter.Agent(), err)
 			}
@@ -1197,8 +1200,19 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 			paths = append(paths, gga.ConfigPath(homeDir))
 			paths = append(paths, gga.AgentsTemplatePath(homeDir))
 		case model.ComponentTheme:
-			if p := adapter.SettingsPath(homeDir); p != "" {
-				paths = append(paths, p)
+			if !legacyThemeAppliesToAdapter(selection, adapter) {
+				break
+			}
+			switch adapter.Agent() {
+			case model.AgentOpenCode:
+				paths = append(paths,
+					filepath.Join(homeDir, ".config", "opencode", "tui.json"),
+					filepath.Join(homeDir, ".config", "opencode", "themes", "gentleman-kanagawa.json"),
+				)
+			default:
+				if p := adapter.SettingsPath(homeDir); p != "" {
+					paths = append(paths, p)
+				}
 			}
 		case model.ComponentClaudeTheme:
 			if adapter.Agent() == model.AgentClaudeCode {
@@ -1223,6 +1237,14 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 	}
 
 	return paths
+}
+
+func legacyThemeAppliesToAdapter(selection model.Selection, adapter agents.Adapter) bool {
+	if adapter.Agent() != model.AgentClaudeCode {
+		return true
+	}
+
+	return !selection.HasComponent(model.ComponentClaudeTheme)
 }
 
 func componentInjectionDir(homeDir, workspaceDir string, adapter agents.Adapter) string {

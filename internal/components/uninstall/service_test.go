@@ -423,9 +423,136 @@ func TestComponentOperationsSDD_OpenCodeMissingManagedModelVariantFilesAreNonFat
 	applySDDOpenCodeOperations(t, svc, adapter)
 }
 
+func TestComponentOperationsTheme_OpenCodeRemovesManagedThemeAndPreservesUnrelatedTUIConfig(t *testing.T) {
+	homeDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	svc, err := NewService(homeDir, workspaceDir, "dev")
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	adapter, ok := svc.registry.Get(model.AgentOpenCode)
+	if !ok {
+		t.Fatal("openCode adapter not found in registry")
+	}
+
+	tuiPath := filepath.Join(homeDir, ".config", "opencode", "tui.json")
+	themeDir := filepath.Join(homeDir, ".config", "opencode", "themes")
+	themePath := filepath.Join(themeDir, "gentleman-kanagawa.json")
+	if err := os.MkdirAll(themeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(theme dir) error = %v", err)
+	}
+	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","theme":"gentleman-kanagawa","plugin":["existing-plugin"],"layout":"compact"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tui) error = %v", err)
+	}
+	if err := os.WriteFile(themePath, []byte(`{"$schema":"https://opencode.ai/theme.json","theme":{"primary":"#fff"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(theme) error = %v", err)
+	}
+
+	applyOpenCodeThemeOperations(t, svc, adapter)
+
+	data, err := os.ReadFile(tuiPath)
+	if err != nil {
+		t.Fatalf("ReadFile(tui) error = %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("json.Unmarshal(tui) error = %v", err)
+	}
+	if _, exists := root["theme"]; exists {
+		t.Fatalf("theme key should be removed from tui.json: %#v", root)
+	}
+	if got := root["layout"]; got != "compact" {
+		t.Fatalf("layout = %#v, want compact", got)
+	}
+	plugins, ok := root["plugin"].([]any)
+	if !ok || len(plugins) != 1 || plugins[0] != "existing-plugin" {
+		t.Fatalf("plugin = %#v, want preserved existing plugin", root["plugin"])
+	}
+	if _, err := os.Stat(themePath); !os.IsNotExist(err) {
+		t.Fatalf("managed theme file should be removed; stat err = %v", err)
+	}
+	if _, err := os.Stat(themeDir); !os.IsNotExist(err) {
+		t.Fatalf("empty themes directory should be removed; stat err = %v", err)
+	}
+}
+
+func TestComponentOperationsTheme_OpenCodePreservesNonEmptyThemesDirectory(t *testing.T) {
+	homeDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	svc, err := NewService(homeDir, workspaceDir, "dev")
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	adapter, ok := svc.registry.Get(model.AgentOpenCode)
+	if !ok {
+		t.Fatal("openCode adapter not found in registry")
+	}
+
+	tuiPath := filepath.Join(homeDir, ".config", "opencode", "tui.json")
+	themeDir := filepath.Join(homeDir, ".config", "opencode", "themes")
+	themePath := filepath.Join(themeDir, "gentleman-kanagawa.json")
+	customThemePath := filepath.Join(themeDir, "custom.json")
+	if err := os.MkdirAll(themeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(theme dir) error = %v", err)
+	}
+	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","theme":"gentleman-kanagawa","sidebar":"visible"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tui) error = %v", err)
+	}
+	if err := os.WriteFile(themePath, []byte(`{"managed":true}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(managed theme) error = %v", err)
+	}
+	if err := os.WriteFile(customThemePath, []byte(`{"custom":true}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(custom theme) error = %v", err)
+	}
+
+	applyOpenCodeThemeOperations(t, svc, adapter)
+
+	if _, err := os.Stat(themePath); !os.IsNotExist(err) {
+		t.Fatalf("managed theme file should be removed; stat err = %v", err)
+	}
+	if _, err := os.Stat(customThemePath); err != nil {
+		t.Fatalf("custom theme file should be preserved; stat err = %v", err)
+	}
+	if _, err := os.Stat(themeDir); err != nil {
+		t.Fatalf("non-empty themes directory should be preserved; stat err = %v", err)
+	}
+
+	data, err := os.ReadFile(tuiPath)
+	if err != nil {
+		t.Fatalf("ReadFile(tui) error = %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("json.Unmarshal(tui) error = %v", err)
+	}
+	if _, exists := root["theme"]; exists {
+		t.Fatalf("tui.json theme key should be removed, got: %#v", root)
+	}
+	if got := root["sidebar"]; got != "visible" {
+		t.Fatalf("sidebar = %#v, want visible", got)
+	}
+}
+
 func applySDDOpenCodeOperations(t *testing.T, svc *Service, adapter agents.Adapter) {
 	t.Helper()
 	ops, _, err := svc.componentOperations(adapter, model.ComponentSDD)
+	if err != nil {
+		t.Fatalf("componentOperations() error = %v", err)
+	}
+	for _, op := range ops {
+		if _, _, err := op.apply(op.path); err != nil {
+			t.Fatalf("op.apply(%q) error = %v", op.path, err)
+		}
+	}
+}
+
+func applyOpenCodeThemeOperations(t *testing.T, svc *Service, adapter agents.Adapter) {
+	t.Helper()
+	ops, _, err := svc.componentOperations(adapter, model.ComponentTheme)
 	if err != nil {
 		t.Fatalf("componentOperations() error = %v", err)
 	}

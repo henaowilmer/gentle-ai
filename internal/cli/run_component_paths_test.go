@@ -58,6 +58,30 @@ func TestComponentPathsSDDMultiIncludesOpenCodePlugins(t *testing.T) {
 	}
 }
 
+func TestComponentPathsThemeSkipsClaudeSettingsWhenClaudeThemeSelected(t *testing.T) {
+	home := t.TempDir()
+	selection := model.Selection{
+		Components: []model.ComponentID{model.ComponentTheme, model.ComponentClaudeTheme},
+	}
+	adapters := resolveAdapters([]model.AgentID{model.AgentClaudeCode, model.AgentOpenCode})
+
+	paths := componentPaths(home, selection, adapters, model.ComponentTheme)
+
+	claudeSettingsPath := filepath.Join(home, ".claude", "settings.json")
+	if containsPath(paths, claudeSettingsPath) {
+		t.Fatalf("componentPaths(theme) should skip Claude legacy theme path when claude-theme is selected\npaths=%v", paths)
+	}
+
+	for _, want := range []string{
+		filepath.Join(home, ".config", "opencode", "tui.json"),
+		filepath.Join(home, ".config", "opencode", "themes", "gentleman-kanagawa.json"),
+	} {
+		if !containsPath(paths, want) {
+			t.Fatalf("componentPaths(theme) missing OpenCode theme path %q\npaths=%v", want, paths)
+		}
+	}
+}
+
 func TestComponentPathsSDDSingleIncludesOpenCodePlugins(t *testing.T) {
 	home := t.TempDir()
 	adapters := resolveAdapters([]model.AgentID{model.AgentOpenCode})

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1574,6 +1575,56 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 		if _, statErr := os.Stat(pluginPath); statErr != nil {
 			t.Fatalf("expected OpenCode SDD plugin %q to exist after install: %v", pluginPath, statErr)
 		}
+	}
+}
+
+func TestRunInstallFullGentlemanClaudeAndOpenCodeSkipsClaudeLegacyTheme(t *testing.T) {
+	home := t.TempDir()
+	restoreHome := osUserHomeDir
+	restoreCommand := runCommand
+	restoreLookPath := cmdLookPath
+	t.Cleanup(func() {
+		osUserHomeDir = restoreHome
+		runCommand = restoreCommand
+		cmdLookPath = restoreLookPath
+	})
+
+	osUserHomeDir = func() (string, error) { return home, nil }
+	runCommand = func(string, ...string) error { return nil }
+	cmdLookPath = missingBinaryLookPath
+
+	result, err := RunInstall([]string{"--agent", "claude-code", "--agent", "opencode"}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("RunInstall() error = %v", err)
+	}
+	if !result.Verify.Ready {
+		t.Fatalf("post-apply verification not ready: %#v", result.Verify)
+	}
+
+	claudeSettingsPath := filepath.Join(home, ".claude", "settings.json")
+	if data, err := os.ReadFile(claudeSettingsPath); err == nil {
+		var root map[string]any
+		if err := json.Unmarshal(data, &root); err != nil {
+			t.Fatalf("json.Unmarshal(%q) error = %v", claudeSettingsPath, err)
+		}
+		if _, exists := root["theme"]; exists {
+			t.Fatalf("Claude settings should not contain legacy theme in multi-agent full-gentleman install, got: %#v", root)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(%q) error = %v", claudeSettingsPath, err)
+	}
+
+	claudeThemePath := filepath.Join(home, ".claude", "themes", "gentleman.json")
+	if _, err := os.Stat(claudeThemePath); err != nil {
+		t.Fatalf("expected Claude custom theme file %q: %v", claudeThemePath, err)
+	}
+
+	openCodeTUIPath := filepath.Join(home, ".config", "opencode", "tui.json")
+	assertFileContains(t, openCodeTUIPath, `"theme": "gentleman-kanagawa"`)
+
+	openCodeThemePath := filepath.Join(home, ".config", "opencode", "themes", "gentleman-kanagawa.json")
+	if _, err := os.Stat(openCodeThemePath); err != nil {
+		t.Fatalf("expected OpenCode theme file %q: %v", openCodeThemePath, err)
 	}
 }
 

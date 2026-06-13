@@ -66,34 +66,100 @@ func TestInjectMergesThemeOverlayIntoAdapterSettings(t *testing.T) {
 	}
 }
 
-func TestInjectCreatesAdapterSettingsWhenMissing(t *testing.T) {
+func TestInjectOpenCodeCreatesTUIThemeAndThemeFile(t *testing.T) {
 	home := t.TempDir()
 
-	result, err := Inject(home, opencodeAdapter())
+	first, err := Inject(home, opencodeAdapter())
 	if err != nil {
 		t.Fatalf("Inject() error = %v", err)
 	}
+	second, err := Inject(home, opencodeAdapter())
+	if err != nil {
+		t.Fatalf("Inject() second error = %v", err)
+	}
 
-	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
-	if !result.Changed {
+	tuiPath := filepath.Join(home, ".config", "opencode", "tui.json")
+	themePath := filepath.Join(home, ".config", "opencode", "themes", "gentleman-kanagawa.json")
+	if !first.Changed {
 		t.Fatalf("Inject() changed = false")
 	}
-	if len(result.Files) != 1 || result.Files[0] != settingsPath {
-		t.Fatalf("files = %#v, want only %q", result.Files, settingsPath)
+	if second.Changed {
+		t.Fatalf("Inject() second changed = true")
+	}
+	if len(first.Files) != 2 || first.Files[0] != tuiPath || first.Files[1] != themePath {
+		t.Fatalf("files = %#v, want [%q %q]", first.Files, tuiPath, themePath)
 	}
 
-	data, err := os.ReadFile(settingsPath)
+	data, err := os.ReadFile(tuiPath)
 	if err != nil {
-		t.Fatalf("ReadFile(settings) error = %v", err)
+		t.Fatalf("ReadFile(tui) error = %v", err)
 	}
 	var root struct {
-		Theme string `json:"theme"`
+		Schema string `json:"$schema"`
+		Theme  string `json:"theme"`
 	}
 	if err := json.Unmarshal(data, &root); err != nil {
-		t.Fatalf("Unmarshal(settings) error = %v", err)
+		t.Fatalf("Unmarshal(tui) error = %v", err)
 	}
 	if root.Theme != "gentleman-kanagawa" {
 		t.Fatalf("theme = %q, want gentleman-kanagawa", root.Theme)
+	}
+	if root.Schema != "https://opencode.ai/tui.json" {
+		t.Fatalf("schema = %q, want https://opencode.ai/tui.json", root.Schema)
+	}
+
+	themeData, err := os.ReadFile(themePath)
+	if err != nil {
+		t.Fatalf("ReadFile(theme) error = %v", err)
+	}
+	var themeRoot struct {
+		Schema string         `json:"$schema"`
+		Theme  map[string]any `json:"theme"`
+	}
+	if err := json.Unmarshal(themeData, &themeRoot); err != nil {
+		t.Fatalf("Unmarshal(theme) error = %v", err)
+	}
+	if themeRoot.Schema != "https://opencode.ai/theme.json" {
+		t.Fatalf("theme schema = %q, want https://opencode.ai/theme.json", themeRoot.Schema)
+	}
+	for _, key := range []string{"primary", "secondary", "accent", "text", "textMuted", "background"} {
+		if _, ok := themeRoot.Theme[key]; !ok {
+			t.Fatalf("theme missing required key %q", key)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "opencode", "opencode.json")); !os.IsNotExist(err) {
+		t.Fatalf("Inject() should not write opencode.json for OpenCode theme; stat error = %v", err)
+	}
+}
+
+func TestInjectOpenCodePreservesExistingTUIConfig(t *testing.T) {
+	home := t.TempDir()
+	tuiPath := filepath.Join(home, ".config", "opencode", "tui.json")
+	if err := os.MkdirAll(filepath.Dir(tuiPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(tui dir) error = %v", err)
+	}
+	if err := os.WriteFile(tuiPath, []byte(`{"$schema":"https://opencode.ai/tui.json","plugin":["existing-plugin"]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(tui) error = %v", err)
+	}
+
+	if _, err := Inject(home, opencodeAdapter()); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	data, err := os.ReadFile(tuiPath)
+	if err != nil {
+		t.Fatalf("ReadFile(tui) error = %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("Unmarshal(tui) error = %v", err)
+	}
+	if got := root["theme"]; got != "gentleman-kanagawa" {
+		t.Fatalf("theme = %#v, want gentleman-kanagawa", got)
+	}
+	plugins, ok := root["plugin"].([]any)
+	if !ok || len(plugins) != 1 || plugins[0] != "existing-plugin" {
+		t.Fatalf("plugin = %#v, want preserved existing plugin", root["plugin"])
 	}
 }
 

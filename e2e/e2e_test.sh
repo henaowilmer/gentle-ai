@@ -265,7 +265,8 @@ test_preset_full_components() {
     assert_output_contains "$components_line" "permissions" "Full includes permissions"
     assert_output_contains "$components_line" "gga" "Full includes gga"
     assert_output_contains "$components_line" "claude-theme" "Full includes Claude Gentleman theme"
-    assert_output_contains "$components_line" "opencode-gentle-logo" "Full includes OpenCode Gentle logo"
+    assert_output_not_contains "$components_line" "\(^\|,\)theme\(,\|$\)" "Full excludes legacy OpenCode theme"
+    assert_output_not_contains "$components_line" "opencode-gentle-logo" "Full excludes OpenCode Gentle logo"
 }
 
 test_dry_run_full_preset_persona_before_sdd() {
@@ -1003,11 +1004,14 @@ test_oc_theme_injection() {
     cleanup_test_env
 
     if $BINARY install --agent opencode --component theme --persona neutral 2>&1; then
-        local settings="$HOME/.config/opencode/opencode.json"
-        assert_file_exists "$settings" "OpenCode opencode.json"
-        assert_file_contains "$settings" '"theme"' "Has theme key"
-        assert_file_contains "$settings" 'gentleman-kanagawa' "Has gentleman-kanagawa theme"
-        assert_valid_json "$settings" "opencode.json is valid JSON"
+        local tui="$HOME/.config/opencode/tui.json"
+        local theme_file="$HOME/.config/opencode/themes/gentleman-kanagawa.json"
+        assert_file_exists "$tui" "OpenCode tui.json"
+        assert_file_contains "$tui" '"theme"' "Has theme key"
+        assert_file_contains "$tui" 'gentleman-kanagawa' "Has gentleman-kanagawa theme"
+        assert_valid_json "$tui" "tui.json is valid JSON"
+        assert_file_exists "$theme_file" "OpenCode Gentleman theme file"
+        assert_valid_json "$theme_file" "theme file is valid JSON"
     else
         log_fail "OpenCode theme install command failed"
     fi
@@ -1062,15 +1066,23 @@ test_full_preset_opencode() {
 
     if $BINARY install --agent opencode --component engram --component sdd --component persona --component skills --component context7 --component permissions --component theme --preset full-gentleman --persona gentleman 2>&1; then
         local settings="$HOME/.config/opencode/opencode.json"
+        local tui="$HOME/.config/opencode/tui.json"
+        local theme_file="$HOME/.config/opencode/themes/gentleman-kanagawa.json"
         local agents_md="$HOME/.config/opencode/AGENTS.md"
 
-        # opencode.json should have all overlays merged
+        # opencode.json should have JSON overlays; theme lives in tui.json + themes/
         assert_file_exists "$settings" "OpenCode opencode.json"
         assert_file_contains "$settings" '"permission"' "Has permission config"
-        assert_file_contains "$settings" '"theme"' "Has theme"
         assert_file_contains "$settings" '"mcp"' "Has MCP servers"
         assert_file_contains "$settings" '"context7"' "Has context7 MCP"
         assert_valid_json "$settings" "opencode.json is valid JSON"
+
+        assert_file_exists "$tui" "OpenCode tui.json exists"
+        assert_file_contains "$tui" '"theme"' "tui.json has theme"
+        assert_file_contains "$tui" 'gentleman-kanagawa' "tui.json has gentleman-kanagawa"
+        assert_valid_json "$tui" "tui.json is valid JSON"
+        assert_file_exists "$theme_file" "OpenCode Gentleman theme file exists"
+        assert_valid_json "$theme_file" "OpenCode theme file is valid JSON"
 
         # AGENTS.md for persona + engram (SDD orchestrator is in opencode.json for OpenCode, NOT AGENTS.md)
         assert_file_exists "$agents_md" "AGENTS.md exists"
@@ -1449,17 +1461,21 @@ test_idempotent_theme_opencode() {
     cleanup_test_env
 
     $BINARY install --agent opencode --component theme --persona neutral 2>&1 || true
-    local first_hash
-    first_hash=$(md5sum "$HOME/.config/opencode/opencode.json" 2>/dev/null | cut -d' ' -f1)
+    local first_tui_hash
+    local first_theme_hash
+    first_tui_hash=$(md5sum "$HOME/.config/opencode/tui.json" 2>/dev/null | cut -d' ' -f1)
+    first_theme_hash=$(md5sum "$HOME/.config/opencode/themes/gentleman-kanagawa.json" 2>/dev/null | cut -d' ' -f1)
 
     $BINARY install --agent opencode --component theme --persona neutral 2>&1 || true
-    local second_hash
-    second_hash=$(md5sum "$HOME/.config/opencode/opencode.json" 2>/dev/null | cut -d' ' -f1)
+    local second_tui_hash
+    local second_theme_hash
+    second_tui_hash=$(md5sum "$HOME/.config/opencode/tui.json" 2>/dev/null | cut -d' ' -f1)
+    second_theme_hash=$(md5sum "$HOME/.config/opencode/themes/gentleman-kanagawa.json" 2>/dev/null | cut -d' ' -f1)
 
-    if [ "$first_hash" = "$second_hash" ] && [ -n "$first_hash" ]; then
+    if [ "$first_tui_hash" = "$second_tui_hash" ] && [ -n "$first_tui_hash" ] && [ "$first_theme_hash" = "$second_theme_hash" ] && [ -n "$first_theme_hash" ]; then
         log_pass "Idempotent: same theme config after two runs"
     else
-        log_fail "Theme config changed between runs ($first_hash vs $second_hash)"
+        log_fail "Theme config changed between runs"
     fi
 }
 
@@ -1589,17 +1605,23 @@ test_edge_multiple_json_overlays() {
     log_test "Edge case: multiple JSON overlays merge correctly"
     cleanup_test_env
 
-    # Install permissions, then theme, then context7 — all into OpenCode opencode.json
+    # Install permissions + context7 into opencode.json, theme into tui.json + themes/
     $BINARY install --agent opencode --component permissions --persona neutral 2>&1 || true
     $BINARY install --agent opencode --component theme --persona neutral 2>&1 || true
     $BINARY install --agent opencode --component context7 --persona neutral 2>&1 || true
 
     local settings="$HOME/.config/opencode/opencode.json"
+    local tui="$HOME/.config/opencode/tui.json"
+    local theme_file="$HOME/.config/opencode/themes/gentleman-kanagawa.json"
     assert_file_contains "$settings" '"permission"' "Permission config present after 3 merges"
-    assert_file_contains "$settings" '"theme"' "Theme present after 3 merges"
     assert_file_contains "$settings" '"mcp"' "MCP servers present after 3 merges"
     assert_file_contains "$settings" '"context7"' "Context7 present after 3 merges"
     assert_valid_json "$settings" "Final merged JSON is valid"
+    assert_file_contains "$tui" '"theme"' "Theme present in tui.json after 3 installs"
+    assert_file_contains "$tui" 'gentleman-kanagawa' "Gentleman theme selected in tui.json"
+    assert_valid_json "$tui" "tui.json is valid after 3 installs"
+    assert_file_exists "$theme_file" "Theme file exists after 3 installs"
+    assert_valid_json "$theme_file" "Theme file is valid after 3 installs"
 }
 
 # --- Category: GGA tests ---
