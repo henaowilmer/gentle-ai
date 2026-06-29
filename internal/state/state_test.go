@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // TestMergeAgents verifies that MergeAgents appends new agents to existing
@@ -658,6 +659,185 @@ func TestMergeAgents_PreservesCodexPhaseModelAssignments(t *testing.T) {
 	if !reflect.DeepEqual(merged.CodexPhaseModelAssignments, existing.CodexPhaseModelAssignments) {
 		t.Errorf("MergeAgents did not preserve CodexPhaseModelAssignments: got %v, want %v",
 			merged.CodexPhaseModelAssignments, existing.CodexPhaseModelAssignments)
+	}
+}
+
+// ─── Slice 2 RED: LastUpdateCheck round-trip and backward-compat ─────────────
+
+// TestLastUpdateCheck_RoundTrip verifies that LastUpdateCheck survives a
+// Write/Read cycle with the expected JSON key "last_update_check".
+func TestLastUpdateCheck_RoundTrip(t *testing.T) {
+	home := t.TempDir()
+
+	ts := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	s := InstallState{
+		InstalledAgents: []string{"claude-code"},
+		LastUpdateCheck: &ts,
+	}
+
+	if err := Write(home, s); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	got, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if got.LastUpdateCheck == nil || !got.LastUpdateCheck.Equal(ts) {
+		t.Errorf("LastUpdateCheck = %v, want %v", got.LastUpdateCheck, ts)
+	}
+
+	// JSON must contain the expected key.
+	data, err := os.ReadFile(Path(home))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !contains(string(data), "last_update_check") {
+		t.Errorf("JSON must contain key last_update_check; got:\n%s", data)
+	}
+}
+
+// TestLastUpdateCheck_OmitWhenZero verifies that a zero-value LastUpdateCheck
+// is omitted from JSON (omitempty), so old binaries that wrote state without
+// the field still produce clean JSON.
+func TestLastUpdateCheck_OmitWhenZero(t *testing.T) {
+	home := t.TempDir()
+	s := InstallState{InstalledAgents: []string{"claude-code"}}
+	if err := Write(home, s); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	data, err := os.ReadFile(Path(home))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if contains(string(data), "last_update_check") {
+		t.Error("JSON must not contain last_update_check when zero")
+	}
+}
+
+// TestLastUpdateCheck_BackwardCompat verifies that state.json files written
+// before the LastUpdateCheck field was added still read without error, with a
+// nil LastUpdateCheck (never checked = always-check behavior).
+func TestLastUpdateCheck_BackwardCompat(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, stateDir), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	legacy := `{"installed_agents":["claude-code"]}` + "\n"
+	if err := os.WriteFile(Path(home), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	s, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if s.LastUpdateCheck != nil {
+		t.Errorf("LastUpdateCheck = %v, want nil for legacy state", s.LastUpdateCheck)
+	}
+}
+
+// TestMergeAgents_PreservesLastUpdateCheck verifies MergeAgents carries
+// LastUpdateCheck from the existing state into the merged result.
+func TestMergeAgents_PreservesLastUpdateCheck(t *testing.T) {
+	ts := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	existing := InstallState{
+		InstalledAgents: []string{"claude-code"},
+		LastUpdateCheck: &ts,
+	}
+	merged := MergeAgents(existing, []string{"opencode"})
+	if merged.LastUpdateCheck == nil || !merged.LastUpdateCheck.Equal(ts) {
+		t.Errorf("MergeAgents did not preserve LastUpdateCheck: got %v, want %v",
+			merged.LastUpdateCheck, ts)
+	}
+}
+
+// ─── Slice 4 RED: PendingSync round-trip and backward-compat ────────────────
+
+// TestPendingSync_RoundTrip verifies that PendingSync bool survives a
+// Write/Read cycle with the expected JSON key "pending_sync".
+func TestPendingSync_RoundTrip(t *testing.T) {
+	home := t.TempDir()
+
+	s := InstallState{
+		InstalledAgents: []string{"claude-code"},
+		PendingSync:     true,
+	}
+
+	if err := Write(home, s); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	got, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if !got.PendingSync {
+		t.Errorf("PendingSync = false after round-trip, want true")
+	}
+
+	// JSON must contain the expected key.
+	data, err := os.ReadFile(Path(home))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !contains(string(data), "pending_sync") {
+		t.Errorf("JSON must contain key pending_sync; got:\n%s", data)
+	}
+}
+
+// TestPendingSync_OmitWhenFalse verifies that PendingSync=false (zero value)
+// is omitted from JSON (omitempty), preserving backward-compatibility with
+// existing state files that lack the field.
+func TestPendingSync_OmitWhenFalse(t *testing.T) {
+	home := t.TempDir()
+	s := InstallState{InstalledAgents: []string{"claude-code"}}
+	if err := Write(home, s); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	data, err := os.ReadFile(Path(home))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if contains(string(data), "pending_sync") {
+		t.Error("JSON must not contain pending_sync when false")
+	}
+}
+
+// TestPendingSync_BackwardCompat verifies that state.json files written before
+// PendingSync was added still read cleanly with PendingSync=false (safe default:
+// no deferred sync pending).
+func TestPendingSync_BackwardCompat(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, stateDir), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	legacy := `{"installed_agents":["claude-code"]}` + "\n"
+	if err := os.WriteFile(Path(home), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	s, err := Read(home)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if s.PendingSync {
+		t.Errorf("PendingSync = true for legacy state, want false (no deferred sync)")
+	}
+}
+
+// TestMergeAgents_PreservesPendingSync verifies MergeAgents carries
+// PendingSync from the existing state into the merged result.
+func TestMergeAgents_PreservesPendingSync(t *testing.T) {
+	existing := InstallState{
+		InstalledAgents: []string{"claude-code"},
+		PendingSync:     true,
+	}
+	merged := MergeAgents(existing, []string{"opencode"})
+	if !merged.PendingSync {
+		t.Errorf("MergeAgents did not preserve PendingSync: got false, want true")
 	}
 }
 

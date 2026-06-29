@@ -11,6 +11,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/internal/pipeline"
 	"github.com/gentleman-programming/gentle-ai/internal/state"
 	"github.com/gentleman-programming/gentle-ai/internal/verify"
 )
@@ -582,6 +583,145 @@ func TestComponentSyncStepRunsGGAInjectWithoutBinaryInstall(t *testing.T) {
 	prModePath := filepath.Join(home, ".local", "share", "gga", "lib", "pr_mode.sh")
 	if _, err := os.Stat(prModePath); err != nil {
 		t.Errorf("expected GGA runtime asset at %q: %v", prModePath, err)
+	}
+}
+
+func TestCodeGraphGuidanceSyncStepRefreshesOldMarkerWhenConfigured(t *testing.T) {
+	home := t.TempDir()
+	agentsPath := filepath.Join(home, ".config", "opencode", "AGENTS.md")
+	mustWriteFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), []byte(`{}`))
+	mustWriteFile(t, agentsPath, []byte(strings.Join([]string{
+		"custom notes",
+		"<!-- gentle-ai:codegraph-guidance -->",
+		"stale CodeGraph lifecycle guidance",
+		"<!-- /gentle-ai:codegraph-guidance -->",
+	}, "\n")))
+
+	restoreLookPath := cmdLookPath
+	t.Cleanup(func() { cmdLookPath = restoreLookPath })
+	cmdLookPath = func(name string) (string, error) {
+		if name != "codegraph" {
+			return "", os.ErrNotExist
+		}
+		return "/bin/codegraph", nil
+	}
+
+	var changed []string
+	step := codeGraphGuidanceSyncStep{
+		id:           "sync:community-tool:codegraph-guidance",
+		homeDir:      home,
+		changedFiles: &changed,
+	}
+	if err := step.Run(); err != nil {
+		t.Fatalf("codeGraphGuidanceSyncStep.Run() error = %v", err)
+	}
+
+	body, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", agentsPath, err)
+	}
+	text := string(body)
+	if strings.Contains(text, "stale CodeGraph lifecycle guidance") {
+		t.Fatalf("stale guidance was not refreshed:\n%s", text)
+	}
+	if !strings.Contains(text, "immediately run `codegraph init <project-root>`") || !strings.Contains(text, "custom notes") {
+		t.Fatalf("latest guidance/user content missing after sync refresh:\n%s", text)
+	}
+	if !reflect.DeepEqual(changed, []string{agentsPath}) {
+		t.Fatalf("changed files = %#v, want %#v", changed, []string{agentsPath})
+	}
+}
+
+func TestCodeGraphGuidanceSyncStepDoesNotInjectWhenNotConfigured(t *testing.T) {
+	home := t.TempDir()
+	agentsPath := filepath.Join(home, ".config", "opencode", "AGENTS.md")
+	mustWriteFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), []byte(`{}`))
+
+	restoreLookPath := cmdLookPath
+	t.Cleanup(func() { cmdLookPath = restoreLookPath })
+	cmdLookPath = func(string) (string, error) { return "", os.ErrNotExist }
+
+	var changed []string
+	step := codeGraphGuidanceSyncStep{
+		id:           "sync:community-tool:codegraph-guidance",
+		homeDir:      home,
+		changedFiles: &changed,
+	}
+	if err := step.Run(); err != nil {
+		t.Fatalf("codeGraphGuidanceSyncStep.Run() error = %v", err)
+	}
+	if _, err := os.Stat(agentsPath); !os.IsNotExist(err) {
+		t.Fatalf("AGENTS.md should not be created when CodeGraph is not configured; stat err = %v", err)
+	}
+	if len(changed) != 0 {
+		t.Fatalf("changed files = %#v, want none", changed)
+	}
+}
+
+func TestSyncRuntimeAddsCodeGraphRefreshStepOnlyWhenConfigured(t *testing.T) {
+	home := t.TempDir()
+	mustWriteFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), []byte(`{}`))
+	mustWriteFile(t, filepath.Join(home, ".config", "opencode", "AGENTS.md"), []byte("<!-- gentle-ai:codegraph-guidance -->\nold\n<!-- /gentle-ai:codegraph-guidance -->\n"))
+
+	restoreLookPath := cmdLookPath
+	t.Cleanup(func() { cmdLookPath = restoreLookPath })
+	cmdLookPath = func(name string) (string, error) {
+		if name == "codegraph" {
+			return "/bin/codegraph", nil
+		}
+		return "", os.ErrNotExist
+	}
+
+	rt, err := newSyncRuntime(home, model.Selection{Agents: []model.AgentID{model.AgentOpenCode}})
+	if err != nil {
+		t.Fatalf("newSyncRuntime() error = %v", err)
+	}
+	plan := rt.stagePlan()
+	if !hasStepID(plan.Apply, "sync:community-tool:codegraph-guidance") {
+		t.Fatalf("sync plan missing CodeGraph guidance refresh step")
+	}
+
+	cmdLookPath = func(string) (string, error) { return "", os.ErrNotExist }
+	rt, err = newSyncRuntime(home, model.Selection{Agents: []model.AgentID{model.AgentOpenCode}})
+	if err != nil {
+		t.Fatalf("newSyncRuntime() error = %v", err)
+	}
+	plan = rt.stagePlan()
+	if hasStepID(plan.Apply, "sync:community-tool:codegraph-guidance") {
+		t.Fatalf("sync plan should not include CodeGraph guidance refresh when CodeGraph is not configured")
+	}
+
+	cmdLookPath = func(name string) (string, error) {
+		if name == "codegraph" {
+			return "/bin/codegraph", nil
+		}
+		return "", os.ErrNotExist
+	}
+	paths := syncBackupTargets(home, "", model.Selection{Agents: []model.AgentID{model.AgentOpenCode}}, resolveAdapters([]model.AgentID{model.AgentOpenCode}))
+	for _, path := range paths {
+		if path == filepath.Join(home, ".config", "opencode", "AGENTS.md") {
+			return
+		}
+	}
+	t.Fatalf("sync backup targets should include CodeGraph guidance path when refresh step is planned; got %#v", paths)
+}
+
+func hasStepID(steps []pipeline.Step, id string) bool {
+	for _, step := range steps {
+		if step.ID() == id {
+			return true
+		}
+	}
+	return false
+}
+
+func mustWriteFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
 }
 
@@ -1287,6 +1427,17 @@ func TestRunSyncDetectsExistingProfilesOnRegularSync(t *testing.T) {
 					ProviderID: "anthropic",
 					ModelID:    "claude-haiku-3-5-20241022",
 				},
+				PhaseAssignments: map[string]model.ModelAssignment{
+					"jd-judge-a": {
+						ProviderID: "anthropic",
+						ModelID:    "claude-opus-4-5",
+						Effort:     "high",
+					},
+					"jd-fix-agent": {
+						ProviderID: "anthropic",
+						ModelID:    "claude-sonnet-4-20250514",
+					},
+				},
 			},
 		},
 	}
@@ -1304,6 +1455,9 @@ func TestRunSyncDetectsExistingProfilesOnRegularSync(t *testing.T) {
 	}
 	if !strings.Contains(string(settingsData), `"sdd-orchestrator-test-profile"`) {
 		t.Fatalf("run1 did not create sdd-orchestrator-test-profile in opencode.json")
+	}
+	if !strings.Contains(string(settingsData), `"jd-judge-a-test-profile"`) || !strings.Contains(string(settingsData), `"jd-fix-agent-test-profile"`) {
+		t.Fatalf("run1 did not create profile-scoped JD agents in opencode.json")
 	}
 
 	// Run 2: normal sync (no explicit profiles) → DetectProfiles should find the
@@ -1335,6 +1489,12 @@ func TestRunSyncDetectsExistingProfilesOnRegularSync(t *testing.T) {
 	}
 	if !strings.Contains(string(settingsData2), `"sdd-orchestrator-test-profile"`) {
 		t.Errorf("run2 (regular sync): sdd-orchestrator-test-profile key should still be present after DetectProfiles re-sync")
+	}
+	if !strings.Contains(string(settingsData2), `"jd-judge-a-test-profile"`) || !strings.Contains(string(settingsData2), `"jd-fix-agent-test-profile"`) {
+		t.Errorf("run2 (regular sync): profile-scoped JD agents should still be present after DetectProfiles re-sync")
+	}
+	if !strings.Contains(string(settingsData2), `"jd-judge-a"`) || !strings.Contains(string(settingsData2), `"jd-judge-a-test-profile"`) {
+		t.Errorf("run2 (regular sync): profile orchestrator prompt should preserve JD delegation mapping after DetectProfiles re-sync")
 	}
 	_ = result2 // result2 may or may not be no-op depending on whether profile overlay is idempotent
 }
@@ -1935,6 +2095,38 @@ func TestParseSyncFlagsProfilePhaseAssignment(t *testing.T) {
 	}
 	if assign.ModelID != "claude-sonnet-4-20250514" {
 		t.Errorf("sdd-apply ModelID = %q, want %q", assign.ModelID, "claude-sonnet-4-20250514")
+	}
+}
+
+func TestParseSyncFlagsProfilePhaseJDAssignments(t *testing.T) {
+	flags, err := ParseSyncFlags([]string{
+		"--profile", "review:anthropic/claude-sonnet-4-20250514",
+		"--profile-phase", "review:jd-judge-a:anthropic/claude-opus-4-5",
+		"--profile-phase", "review:jd-judge-b:openai/gpt-5.1",
+		"--profile-phase", "review:jd-fix-agent:anthropic/claude-sonnet-4-20250514",
+	})
+	if err != nil {
+		t.Fatalf("ParseSyncFlags() error = %v", err)
+	}
+
+	if len(flags.Profiles) != 1 {
+		t.Fatalf("expected 1 profile, got %d", len(flags.Profiles))
+	}
+
+	assignments := flags.Profiles[0].PhaseAssignments
+	for _, phase := range []string{"jd-judge-a", "jd-judge-b", "jd-fix-agent"} {
+		if _, ok := assignments[phase]; !ok {
+			t.Fatalf("PhaseAssignments missing %q key; got %v", phase, assignments)
+		}
+	}
+	if got := assignments["jd-judge-a"].FullID(); got != "anthropic/claude-opus-4-5" {
+		t.Errorf("jd-judge-a model = %q, want %q", got, "anthropic/claude-opus-4-5")
+	}
+	if got := assignments["jd-judge-b"].FullID(); got != "openai/gpt-5.1" {
+		t.Errorf("jd-judge-b model = %q, want %q", got, "openai/gpt-5.1")
+	}
+	if got := assignments["jd-fix-agent"].FullID(); got != "anthropic/claude-sonnet-4-20250514" {
+		t.Errorf("jd-fix-agent model = %q, want %q", got, "anthropic/claude-sonnet-4-20250514")
 	}
 }
 

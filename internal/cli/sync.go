@@ -12,6 +12,7 @@ import (
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/components/communitytool"
 	"github.com/gentleman-programming/gentle-ai/internal/components/engram"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/mcp"
@@ -225,8 +226,9 @@ func parseProfilePhaseFlag(raw string) (name, phase string, assignment model.Mod
 	if phase == "" {
 		return "", "", model.ModelAssignment{}, fmt.Errorf("--profile-phase %q: phase must not be empty", raw)
 	}
-	// Validate that the phase is a known SDD phase name.
-	knownPhases := sdd.ProfilePhaseOrder()
+	// Validate that the phase is a known profile-configurable agent name.
+	// SDD profiles can configure both SDD phase agents and Judgment Day agents.
+	knownPhases := sdd.ProfileAssignmentPhaseOrder()
 	validPhase := false
 	for _, p := range knownPhases {
 		if p == phase {
@@ -436,7 +438,19 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 		})
 	}
 
+	if shouldRefreshCodeGraphGuidance(r.homeDir) {
+		apply = append(apply, codeGraphGuidanceSyncStep{
+			id:           "sync:community-tool:codegraph-guidance",
+			homeDir:      r.homeDir,
+			changedFiles: &r.changedFiles,
+		})
+	}
+
 	return pipeline.StagePlan{Prepare: prepare, Apply: apply}
+}
+
+func shouldRefreshCodeGraphGuidance(homeDir string) bool {
+	return communitytool.HasConfiguredCodeGraph(homeDir, communitytool.DetectorFunc(cmdLookPath))
 }
 
 // syncBackupTargets returns the file paths that need to be backed up
@@ -447,6 +461,11 @@ func syncBackupTargets(homeDir, workspaceDir string, selection model.Selection, 
 	paths := map[string]struct{}{}
 	for _, component := range selection.Components {
 		for _, path := range syncComponentPathsWithWorkspace(homeDir, workspaceDir, selection, adapters, component) {
+			paths[path] = struct{}{}
+		}
+	}
+	if shouldRefreshCodeGraphGuidance(homeDir) {
+		for _, path := range communitytool.CodeGraphGuidancePaths(homeDir) {
 			paths[path] = struct{}{}
 		}
 	}
@@ -554,6 +573,27 @@ type componentSyncStep struct {
 	agents       []model.AgentID
 	selection    model.Selection
 	changedFiles *[]string // accumulates absolute paths of files that actually changed
+}
+
+type codeGraphGuidanceSyncStep struct {
+	id           string
+	homeDir      string
+	changedFiles *[]string
+}
+
+func (s codeGraphGuidanceSyncStep) ID() string {
+	return s.id
+}
+
+func (s codeGraphGuidanceSyncStep) Run() error {
+	res, _, err := communitytool.RefreshCodeGraphGuidanceIfConfigured(s.homeDir, communitytool.DetectorFunc(cmdLookPath))
+	if err != nil {
+		return fmt.Errorf("sync CodeGraph guidance: %w", err)
+	}
+	if s.changedFiles != nil && res.Changed {
+		*s.changedFiles = append(*s.changedFiles, res.Files...)
+	}
+	return nil
 }
 
 func (s componentSyncStep) ID() string {

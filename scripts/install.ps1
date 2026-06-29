@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Gentle-AI — Install Script for Windows
+    Gentle-AI - Install Script for Windows
     Ecosystem, Frameworks, Workflows for AI coding agents.
 
 .DESCRIPTION
@@ -70,7 +70,7 @@ function Show-Banner {
     Write-Host " | |_| |  __/ | | | |_| |  __/_____/ ___ \ | | " -ForegroundColor Cyan
     Write-Host "  \____|\___|_| |_|\__|_|\___|    /_/   \_\___|" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Gentle-AI — Ecosystem, Frameworks, Workflows" -ForegroundColor DarkGray
+    Write-Host "  Gentle-AI - Ecosystem, Frameworks, Workflows" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -120,7 +120,7 @@ function Get-InstallMethod {
         if ($Forced -ne "auto" -and $Forced -ne "go") {
             Stop-WithError "-Channel beta installs Gentle AI from main and only supports -Method go"
         }
-        Write-Info "Using beta channel — will install $BINARY_NAME from main via go install"
+        Write-Info "Using beta channel - will install $BINARY_NAME from main via go install"
         return "go"
     }
 
@@ -151,6 +151,12 @@ function Install-ViaGo {
     $goPackage = "github.com/$($GITHUB_OWNER.ToLower())/$GITHUB_REPO/cmd/$BINARY_NAME@$version"
     Write-Info "Running: go install $goPackage"
 
+    if ($Channel -eq "beta") {
+        Add-GoEnvPattern -Name "GONOSUMDB" -Pattern "github.com/gentleman-programming/gentle-ai"
+        Add-GoEnvPattern -Name "GOPRIVATE" -Pattern "github.com/gentleman-programming/gentle-ai"
+        Add-GoEnvPattern -Name "GONOPROXY" -Pattern "github.com/gentleman-programming/gentle-ai"
+    }
+
     & go install $goPackage
     if ($LASTEXITCODE -ne 0) {
         Stop-WithError "Failed to install via go install. Make sure Go is properly configured."
@@ -168,6 +174,24 @@ function Install-ViaGo {
     }
 
     Write-Success "Installed $BINARY_NAME via go install"
+}
+
+function Add-GoEnvPattern {
+    param(
+        [string]$Name,
+        [string]$Pattern
+    )
+
+    $current = [Environment]::GetEnvironmentVariable($Name, "Process")
+    if (-not $current) {
+        Set-Item -Path "Env:$Name" -Value $Pattern
+        return
+    }
+
+    $patterns = $current.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries).Trim()
+    if ($patterns -contains $Pattern) { return }
+
+    Set-Item -Path "Env:$Name" -Value ("{0},{1}" -f $Pattern, $current)
 }
 
 # ============================================================================
@@ -217,9 +241,9 @@ function Install-ViaBinary {
 
         $fileSize = (Get-Item $archivePath).Length
         if ($fileSize -lt 1000) {
-            Stop-WithError "Downloaded file is suspiciously small ($fileSize bytes). Archive may not exist for this platform."
+            Stop-WithError ("Downloaded file is suspiciously small ({0} bytes). Archive may not exist for this platform." -f $fileSize)
         }
-        Write-Success "Downloaded $archiveName ($fileSize bytes)"
+        Write-Success ("Downloaded {0} ({1} bytes)" -f $archiveName, $fileSize)
 
         # Verify checksum
         Write-Info "Verifying checksum..."
@@ -230,8 +254,25 @@ function Install-ViaBinary {
             $checksums = Get-Content $checksumsPath
             $expectedLine = $checksums | Where-Object { $_ -match $archiveName }
             if ($expectedLine) {
-                $expectedChecksum = ($expectedLine -split "\s+")[0]
-                $actualChecksum = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+                $expectedChecksum = (($expectedLine -split "\s+")[0]).ToLowerInvariant()
+
+                # Compute SHA256 hash - use Get-FileHash if available (PS 4.0+),
+                # otherwise fall back to .NET cryptography for edge cases where
+                # the cmdlet is unavailable (corrupted install, restricted context, etc.)
+                if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+                    $actualChecksum = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                } else {
+                    # Fallback using .NET for environments where Get-FileHash is unavailable
+                    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+                    $fileStream = [System.IO.File]::OpenRead($archivePath)
+                    try {
+                        $hashBytes = $sha256.ComputeHash($fileStream)
+                        $actualChecksum = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLowerInvariant()
+                    } finally {
+                        $fileStream.Close()
+                        $sha256.Dispose()
+                    }
+                }
 
                 if ($actualChecksum -ne $expectedChecksum) {
                     Stop-WithError "Checksum mismatch!`n  Expected: $expectedChecksum`n  Got:      $actualChecksum"
@@ -245,10 +286,11 @@ function Install-ViaBinary {
                 }
             }
         } catch {
+            $reason = $_.Exception.Message
             if ($Insecure) {
-                Write-Warn "Could not download checksums.txt - checksum verification skipped (-Insecure)"
+                Write-Warn ("Could not download checksums.txt from: {0} - {1} - checksum verification skipped (-Insecure)" -f $checksumsUrl, $reason)
             } else {
-                Stop-WithError "Could not download checksums.txt from: $checksumsUrl`nRefusing to install without integrity verification.`nUse -Insecure to skip (not recommended)."
+                Stop-WithError ("Could not download checksums.txt from: {0}`nError: {1}`nRefusing to install without integrity verification.`nUse -Insecure to skip (not recommended)." -f $checksumsUrl, $reason)
             }
         }
 
@@ -286,7 +328,7 @@ function Install-ViaBinary {
         # a fully lossless round-trip would require the Win32 Registry class with
         # GetValue(..., DoNotExpandEnvironmentNames). We accept the trade-off here
         # because user PATH entries that rely on unexpanded refs are uncommon and
-        # we only ever append — we never rewrite the whole value.
+        # we only ever append - we never rewrite the whole value.
         $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 
         # Split on ';' and compare entries case-insensitively so wildcard chars

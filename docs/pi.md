@@ -29,8 +29,8 @@ Gentle AI runs exactly these Pi setup steps:
 pi install npm:gentle-pi
 pi install npm:gentle-engram
 pi install npm:pi-mcp-adapter
-npm exec --yes --package gentle-engram@0.1.4 -- pi-engram init
-pi install npm:pi-subagents
+npm exec --yes --package gentle-engram@latest -- pi-engram init
+pi install npm:pi-subagents-j0k3r
 pi install npm:pi-intercom
 pi install npm:@juicesharp/rpiv-ask-user-question
 pi install npm:pi-web-access
@@ -44,7 +44,7 @@ pi install npm:pi-btw
 | [`gentle-engram`](https://pi.dev/packages/gentle-engram) | Pi integration for Engram session memory and MCP tools. It is not the Engram binary itself.                               |
 | `pi-mcp-adapter`                                         | Lets Pi expose MCP servers, including Engram, through Pi's MCP runtime.                                                   |
 | `pi-engram init`                                         | Initializes the Pi Engram MCP config shape owned by `gentle-engram`.                                                      |
-| `pi-subagents`                                           | Runs SDD agents discovered from `.pi/agents/`.                                                                            |
+| `pi-subagents-j0k3r`                                      | Runs SDD agents discovered from `.pi/agents/`; installed from the published Pi package `npm:pi-subagents-j0k3r`.                 |
 | `pi-intercom`                                            | Lets child agents ask the parent Pi session for decisions while chains run.                                               |
 | `@juicesharp/rpiv-ask-user-question`                     | Lets Pi child agents ask the active user session for clarification when they need human input.                            |
 | `pi-web-access`                                          | Adds web access tools for Pi.                                                                                             |

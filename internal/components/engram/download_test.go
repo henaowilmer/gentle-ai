@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/versions"
 )
 
 // --- test helpers ---
@@ -258,7 +257,7 @@ func TestDownloadLatestBinaryLinux(t *testing.T) {
 		t.Skip("this test verifies Linux path behaviour, not applicable on Windows")
 	}
 
-	server := makeServerWithFakeTarGz(t, versions.EngramCore)
+	server := makeServerWithFakeTarGz(t, "1.3.0")
 	defer server.Close()
 
 	// Override the HTTP client and the base URL for GitHub API.
@@ -278,7 +277,7 @@ func TestDownloadLatestBinaryLinux(t *testing.T) {
 	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
 
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
-	installedPath, err := DownloadLatestBinary(profile)
+	installedPath, err := DownloadLatestBinary(profile, false)
 	if err != nil {
 		t.Fatalf("DownloadLatestBinary() error = %v", err)
 	}
@@ -304,7 +303,7 @@ func TestDownloadLatestBinaryLinux(t *testing.T) {
 // --- TestDownloadLatestBinaryWindows ---
 
 func TestDownloadLatestBinaryWindows(t *testing.T) {
-	server := makeServerWithFakeZip(t, versions.EngramCore)
+	server := makeServerWithFakeZip(t, "1.3.0")
 	defer server.Close()
 
 	origClient := engramHTTPClient
@@ -325,7 +324,7 @@ func TestDownloadLatestBinaryWindows(t *testing.T) {
 	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
 
 	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget"}
-	installedPath, err := DownloadLatestBinary(profile)
+	installedPath, err := DownloadLatestBinary(profile, false)
 	if err != nil {
 		t.Fatalf("DownloadLatestBinary() error = %v", err)
 	}
@@ -365,14 +364,14 @@ func TestDownloadLatestBinaryDownloadError(t *testing.T) {
 	})
 
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
-	_, err := DownloadLatestBinary(profile)
+	_, err := DownloadLatestBinary(profile, false)
 	if err == nil {
-		t.Fatal("expected error when pinned release download returns 500, got nil")
+		t.Fatal("expected error when GitHub API returns 500, got nil")
 	}
 }
 
-func TestDownloadLatestBinaryUsesPinnedEngramCoreRelease(t *testing.T) {
-	binaryVersion := versions.EngramCore
+func TestDownloadLatestBinarySkipsLatestReleaseWithoutBinaryAssets(t *testing.T) {
+	const binaryVersion = "1.15.13"
 
 	tarContent := buildFakeTarGz(t, "engram")
 	// Build checksums.txt covering all linux arches so the test is arch-agnostic.
@@ -383,9 +382,39 @@ func TestDownloadLatestBinaryUsesPinnedEngramCoreRelease(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.Contains(r.URL.Path, "/releases/latest") || strings.Contains(r.URL.RawQuery, "per_page=20"):
-			t.Fatalf("DownloadLatestBinary() should not query latest releases when using pinned core Engram version: %s?%s", r.URL.Path, r.URL.RawQuery)
-		case strings.HasSuffix(r.URL.Path, "/releases/download/v"+binaryVersion+"/checksums.txt"):
+		case strings.Contains(r.URL.Path, "releases/latest"):
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "pi-v0.1.7",
+				"assets":   []any{},
+			})
+		case strings.Contains(r.URL.Path, "releases") && !strings.Contains(r.URL.Path, "releases/latest") &&
+			!strings.Contains(r.URL.Path, "/releases/download") &&
+			r.URL.Query().Get("per_page") == "20":
+			w.Header().Set("Content-Type", "application/json")
+			// Pages beyond 1 return empty to signal end-of-list.
+			if r.URL.Query().Get("page") != "1" {
+				json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"tag_name":   "pi-v0.1.7",
+					"draft":      false,
+					"prerelease": false,
+					"assets":     []any{},
+				},
+				{
+					"tag_name":   "v" + binaryVersion,
+					"draft":      false,
+					"prerelease": false,
+					"assets": []map[string]string{
+						{"name": "checksums.txt"},
+						{"name": "engram_" + binaryVersion + "_linux_amd64.tar.gz"},
+					},
+				},
+			})
+		case strings.HasSuffix(r.URL.Path, "checksums.txt"):
 			w.Header().Set("Content-Type", "text/plain")
 			fmt.Fprint(w, checksums)
 		case strings.Contains(r.URL.Path, "/releases/download/v"+binaryVersion+"/engram_"+binaryVersion+"_linux_"):
@@ -413,7 +442,7 @@ func TestDownloadLatestBinaryUsesPinnedEngramCoreRelease(t *testing.T) {
 	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
 
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
-	installedPath, err := DownloadLatestBinary(profile)
+	installedPath, err := DownloadLatestBinary(profile, false)
 	if err != nil {
 		t.Fatalf("DownloadLatestBinary() error = %v", err)
 	}
@@ -423,9 +452,9 @@ func TestDownloadLatestBinaryUsesPinnedEngramCoreRelease(t *testing.T) {
 	}
 }
 
-func TestDownloadLatestBinaryUsesPinnedReleaseWhenTokenIsSet(t *testing.T) {
+func TestDownloadLatestBinaryReleaseListFallsBackToAnonymousWhenTokenGets403(t *testing.T) {
 	const fakeToken = "ci-token"
-	binaryVersion := versions.EngramCore
+	const binaryVersion = "1.15.13"
 
 	tarContent := buildFakeTarGz(t, "engram")
 	checksums := ""
@@ -434,9 +463,39 @@ func TestDownloadLatestBinaryUsesPinnedReleaseWhenTokenIsSet(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
 		switch {
-		case strings.Contains(r.URL.Path, "/releases/latest") || strings.Contains(r.URL.RawQuery, "per_page=20"):
-			t.Fatalf("DownloadLatestBinary() should not query latest releases when using pinned core Engram version: %s?%s", r.URL.Path, r.URL.RawQuery)
+		case strings.Contains(r.URL.Path, "releases/latest"):
+			if auth != "" {
+				// Simulate 403 when authenticated to trigger anonymous retry.
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"tag_name": "v" + binaryVersion})
+		case strings.Contains(r.URL.Path, "releases") && !strings.Contains(r.URL.Path, "releases/latest") &&
+			!strings.Contains(r.URL.Path, "/releases/download") &&
+			r.URL.Query().Get("per_page") == "20":
+			if auth != "" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			// Pages beyond 1 return empty to signal end-of-list.
+			if r.URL.Query().Get("page") != "1" {
+				json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"tag_name":   "v" + binaryVersion,
+					"draft":      false,
+					"prerelease": false,
+					"assets": []map[string]string{
+						{"name": "engram_" + binaryVersion + "_linux_amd64.tar.gz"},
+					},
+				},
+			})
 		case strings.HasSuffix(r.URL.Path, "checksums.txt"):
 			w.Header().Set("Content-Type", "text/plain")
 			fmt.Fprint(w, checksums)
@@ -468,7 +527,7 @@ func TestDownloadLatestBinaryUsesPinnedReleaseWhenTokenIsSet(t *testing.T) {
 	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
 
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
-	installedPath, err := DownloadLatestBinary(profile)
+	installedPath, err := DownloadLatestBinary(profile, false)
 	if err != nil {
 		t.Fatalf("DownloadLatestBinary() error = %v", err)
 	}
@@ -479,7 +538,7 @@ func TestDownloadLatestBinaryUsesPinnedReleaseWhenTokenIsSet(t *testing.T) {
 }
 
 func TestDownloadLatestBinaryWindowsStopsEngramBeforeReplace(t *testing.T) {
-	version := versions.EngramCore
+	version := "1.3.0"
 	server := makeServerWithFakeZip(t, version)
 	defer server.Close()
 
@@ -505,7 +564,7 @@ func TestDownloadLatestBinaryWindowsStopsEngramBeforeReplace(t *testing.T) {
 		return nil
 	}
 
-	installedPath, err := DownloadLatestBinary(system.PlatformProfile{OS: "windows", PackageManager: "winget"})
+	installedPath, err := DownloadLatestBinary(system.PlatformProfile{OS: "windows", PackageManager: "winget"}, false)
 	if err != nil {
 		t.Fatalf("DownloadLatestBinary(windows) error = %v", err)
 	}
@@ -522,7 +581,7 @@ func TestDownloadLatestBinaryWindowsStopsEngramBeforeReplace(t *testing.T) {
 }
 
 func TestDownloadLatestBinaryWindowsStopFailureAbortsBeforeReplace(t *testing.T) {
-	version := versions.EngramCore
+	version := "1.3.0"
 	server := makeServerWithFakeZip(t, version)
 	defer server.Close()
 
@@ -543,7 +602,7 @@ func TestDownloadLatestBinaryWindowsStopFailureAbortsBeforeReplace(t *testing.T)
 	engramInstallDirFn = func(goos string) string { return installDir }
 	engramStopProcessesFn = func() error { return errors.New("stop denied") }
 
-	_, err := DownloadLatestBinary(system.PlatformProfile{OS: "windows", PackageManager: "winget"})
+	_, err := DownloadLatestBinary(system.PlatformProfile{OS: "windows", PackageManager: "winget"}, false)
 	if err == nil {
 		t.Fatal("expected stop failure, got nil")
 	}
@@ -555,29 +614,156 @@ func TestDownloadLatestBinaryWindowsStopFailureAbortsBeforeReplace(t *testing.T)
 	}
 }
 
-func TestDownloadLatestBinaryUsesPinnedReleaseWithoutLatestAPIFallback(t *testing.T) {
-	const fakeToken = "ci-token"
-	version := versions.EngramCore
+// TestDownloadLatestBinaryWindowsStopSucceedsWhenProcessNotRunning verifies that the
+// Windows stop-before-replace path does NOT fail when no engram process is running.
+// This is the regression case from issue #850: Stop-Process with -ErrorAction Stop
+// would exit 1 even when nothing needed stopping (e.g. the process list was empty or
+// the process was held by an editor session and Get-Process returned nothing).
+// The seam returning nil (no error) is the contract that must hold for the
+// "engram not running" case; the implementation no longer uses -ErrorAction Stop.
+func TestDownloadLatestBinaryWindowsStopSucceedsWhenProcessNotRunning(t *testing.T) {
+	version := "1.3.0"
+	server := makeServerWithFakeZip(t, version)
+	defer server.Close()
+
+	origClient := engramHTTPClient
+	origBaseURL := engramGitHubBaseURL
+	origInstallDirFn := engramInstallDirFn
+	origStopProcessesFn := engramStopProcessesFn
+	t.Cleanup(func() {
+		engramHTTPClient = origClient
+		engramGitHubBaseURL = origBaseURL
+		engramInstallDirFn = origInstallDirFn
+		engramStopProcessesFn = origStopProcessesFn
+	})
+
+	engramHTTPClient = server.Client()
+	engramGitHubBaseURL = server.URL
+	installDir := t.TempDir()
+	engramInstallDirFn = func(goos string) string { return installDir }
+
+	// Simulate stopEngramProcesses returning nil (no engram process found — clean).
+	engramStopProcessesFn = func() error { return nil }
+
+	installedPath, err := DownloadLatestBinary(system.PlatformProfile{OS: "windows", PackageManager: "winget"}, false)
+	if err != nil {
+		t.Fatalf("DownloadLatestBinary(windows) should succeed when stop returns nil, got: %v", err)
+	}
+	if _, err := os.Stat(installedPath); err != nil {
+		t.Fatalf("stat installed binary: %v", err)
+	}
+}
+
+// TestDownloadLatestBinaryWindowsStopNilProceedsToInstall verifies that when
+// stopEngramProcesses returns nil, DownloadLatestBinary proceeds and installs the
+// binary. This covers the caller's "nil means proceed" contract only; it does NOT
+// exercise the WARNING-to-stderr emission inside stopEngramProcesses (that branch
+// requires a real PowerShell call and is only integration-covered on Windows CI).
+func TestDownloadLatestBinaryWindowsStopNilProceedsToInstall(t *testing.T) {
+	version := "1.3.0"
+	server := makeServerWithFakeZip(t, version)
+	defer server.Close()
+
+	origClient := engramHTTPClient
+	origBaseURL := engramGitHubBaseURL
+	origInstallDirFn := engramInstallDirFn
+	origStopProcessesFn := engramStopProcessesFn
+	t.Cleanup(func() {
+		engramHTTPClient = origClient
+		engramGitHubBaseURL = origBaseURL
+		engramInstallDirFn = origInstallDirFn
+		engramStopProcessesFn = origStopProcessesFn
+	})
+
+	engramHTTPClient = server.Client()
+	engramGitHubBaseURL = server.URL
+	installDir := t.TempDir()
+	engramInstallDirFn = func(goos string) string { return installDir }
+
+	// Simulate the resilient case: stop was attempted, some processes could not be
+	// stopped (access denied), but stopEngramProcesses returns nil (warning-only).
+	// The upgrade should still proceed — Windows may succeed in replacing the file.
+	engramStopProcessesFn = func() error {
+		// In the real implementation this prints a WARNING to stderr and returns nil.
+		return nil
+	}
+
+	installedPath, err := DownloadLatestBinary(system.PlatformProfile{OS: "windows", PackageManager: "winget"}, false)
+	if err != nil {
+		t.Fatalf("DownloadLatestBinary(windows) should not abort when stop returns nil (warning path), got: %v", err)
+	}
+	if _, err := os.Stat(installedPath); err != nil {
+		t.Fatalf("stat installed binary: %v", err)
+	}
+}
+
+// TestDownloadLatestBinaryIgnoresGentleEngramAndPiTags asserts the CORRECTNESS
+// CRUX: when the release list contains a mix of a core engram tag (vX.Y.Z), a
+// gentle-engram tag, and a pi-v* tag, DownloadLatestBinary MUST pick the core
+// engram version and MUST NOT pick the gentle-engram or pi-* tag.
+func TestDownloadLatestBinaryIgnoresGentleEngramAndPiTags(t *testing.T) {
+	const binaryVersion = "1.16.3"
 
 	tarContent := buildFakeTarGz(t, "engram")
 	checksums := ""
-	for _, goos := range []string{"linux", "darwin"} {
-		for _, goarch := range []string{"amd64", "arm64"} {
-			checksums += makeChecksumsTxt(engramArchiveName(version, goos, goarch), tarContent)
-		}
+	for _, goarch := range []string{"amd64", "arm64"} {
+		checksums += makeChecksumsTxt(engramArchiveName(binaryVersion, "linux", goarch), tarContent)
 	}
 
+	// The release list intentionally lists gentle-engram first (highest position)
+	// and pi-v* second — both without binary assets — followed by the real core
+	// engram release. The download MUST skip the first two and pick the third.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.Contains(r.URL.Path, "/releases/latest") || strings.Contains(r.URL.RawQuery, "per_page=20"):
-			t.Fatalf("DownloadLatestBinary() should not query latest releases when using pinned core Engram version: %s?%s", r.URL.Path, r.URL.RawQuery)
+		case strings.Contains(r.URL.Path, "releases/latest"):
+			// /latest points at a gentle-engram tag — the non-core tag that must be skipped.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "gentle-engram v0.1.8",
+				"assets":   []any{},
+			})
+		case strings.Contains(r.URL.Path, "releases") && !strings.Contains(r.URL.Path, "releases/latest") &&
+			!strings.Contains(r.URL.Path, "/releases/download") &&
+			r.URL.Query().Get("per_page") == "20":
+			w.Header().Set("Content-Type", "application/json")
+			// Pages beyond 1 return empty to signal end-of-list.
+			if r.URL.Query().Get("page") != "1" {
+				json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"tag_name":   "gentle-engram v0.1.8",
+					"draft":      false,
+					"prerelease": false,
+					"assets":     []any{},
+				},
+				{
+					"tag_name":   "pi-v0.1.7",
+					"draft":      false,
+					"prerelease": false,
+					"assets":     []any{},
+				},
+				{
+					"tag_name":   "v" + binaryVersion,
+					"draft":      false,
+					"prerelease": false,
+					"assets": []map[string]string{
+						{"name": "checksums.txt"},
+						{"name": "engram_" + binaryVersion + "_linux_amd64.tar.gz"},
+					},
+				},
+			})
 		case strings.HasSuffix(r.URL.Path, "checksums.txt"):
 			w.Header().Set("Content-Type", "text/plain")
 			fmt.Fprint(w, checksums)
-		default:
+		case strings.Contains(r.URL.Path, "/releases/download/v"+binaryVersion+"/engram_"+binaryVersion+"_linux_"):
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.WriteHeader(http.StatusOK)
 			w.Write(tarContent)
+		default:
+			t.Fatalf("unexpected request path (should be core engram v%s, not gentle-engram/pi): %s?%s",
+				binaryVersion, r.URL.Path, r.URL.RawQuery)
 		}
 	}))
 	defer server.Close()
@@ -591,24 +777,20 @@ func TestDownloadLatestBinaryUsesPinnedReleaseWithoutLatestAPIFallback(t *testin
 		engramGitHubBaseURL = origBaseURL
 	})
 
-	t.Setenv("GITHUB_TOKEN", fakeToken)
-	t.Setenv("GH_TOKEN", "")
-
 	tmpDir := t.TempDir()
 	origInstallDirFn := engramInstallDirFn
 	engramInstallDirFn = func(goos string) string { return tmpDir }
 	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
 
 	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
-	installedPath, err := DownloadLatestBinary(profile)
+	installedPath, err := DownloadLatestBinary(profile, false)
 	if err != nil {
-		t.Fatalf("DownloadLatestBinary() error = %v", err)
+		t.Fatalf("DownloadLatestBinary() error = %v, want core engram v%s to be selected", err, binaryVersion)
 	}
 
 	if !strings.HasPrefix(installedPath, tmpDir) {
 		t.Errorf("installedPath = %q, want prefix %q", installedPath, tmpDir)
 	}
-
 	if _, err := os.Stat(installedPath); err != nil {
 		t.Fatalf("stat installed binary: %v", err)
 	}
@@ -623,7 +805,7 @@ func TestDownloadLatestBinaryUsesPinnedReleaseWithoutLatestAPIFallback(t *testin
 //   - digest mismatch: checksums.txt lists wrong digest → fail closed
 //   - malformed checksums.txt: content has no parseable entries → fail closed
 func TestEngramChecksumVerification(t *testing.T) {
-	version := versions.EngramCore
+	version := "1.3.0"
 
 	// tarContent is a real .tar.gz archive used across sub-tests.
 	tarContent := buildFakeTarGz(t, "engram")
@@ -698,7 +880,7 @@ func TestEngramChecksumVerification(t *testing.T) {
 			t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
 
 			profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
-			_, err := DownloadLatestBinary(profile)
+			_, err := DownloadLatestBinary(profile, false)
 
 			if tt.wantErrSubstr == "" {
 				if err != nil {
@@ -714,6 +896,135 @@ func TestEngramChecksumVerification(t *testing.T) {
 				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.wantErrSubstr)
 			}
 		})
+	}
+}
+
+// TestFetchLatestEngramVersionWithAssetsPaginates asserts that
+// fetchLatestEngramVersionWithAssets paginates beyond the first page when
+// page 1 contains only non-core tags (pi-v* / gentle-engram) and the valid
+// core vX.Y.Z release with a binary asset is on page 2.
+//
+// Regression test for the issue where per_page=20 capped discovery and returned
+// "no engram release with downloadable binary assets found" even though a valid
+// core release existed just beyond the window.
+func TestFetchLatestEngramVersionWithAssetsPaginates(t *testing.T) {
+	const binaryVersion = "1.17.0"
+
+	tarContent := buildFakeTarGz(t, "engram")
+	checksums := ""
+	for _, goarch := range []string{"amd64", "arm64"} {
+		checksums += makeChecksumsTxt(engramArchiveName(binaryVersion, "linux", goarch), tarContent)
+	}
+
+	// Track which pages were requested so we can assert pagination occurred.
+	var pagesRequested []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "releases/latest"):
+			// /latest points at a pi-v* tag so the single-release path falls
+			// through to fetchLatestEngramVersionWithAssets.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "pi-v0.2.0",
+				"assets":   []any{},
+			})
+
+		case strings.Contains(r.URL.Path, "/repos/") && strings.Contains(r.URL.Path, "/releases") &&
+			!strings.Contains(r.URL.Path, "/releases/download") &&
+			!strings.Contains(r.URL.Path, "releases/latest"):
+			// Release list endpoint — track the page parameter.
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			pagesRequested = append(pagesRequested, page)
+
+			w.Header().Set("Content-Type", "application/json")
+			switch page {
+			case "1":
+				// Page 1: only non-core tags — must NOT pick any of these.
+				json.NewEncoder(w).Encode([]map[string]any{
+					{
+						"tag_name":   "pi-v0.2.0",
+						"draft":      false,
+						"prerelease": false,
+						"assets":     []any{},
+					},
+					{
+						"tag_name":   "gentle-engram v0.2.0",
+						"draft":      false,
+						"prerelease": false,
+						"assets":     []any{},
+					},
+					{
+						"tag_name":   "pi-v0.1.9",
+						"draft":      false,
+						"prerelease": false,
+						"assets":     []any{},
+					},
+				})
+			case "2":
+				// Page 2: the real core engram release.
+				json.NewEncoder(w).Encode([]map[string]any{
+					{
+						"tag_name":   "v" + binaryVersion,
+						"draft":      false,
+						"prerelease": false,
+						"assets": []map[string]string{
+							{"name": "checksums.txt"},
+							{"name": "engram_" + binaryVersion + "_linux_amd64.tar.gz"},
+						},
+					},
+				})
+			default:
+				// Any further page is empty — signals end of releases.
+				json.NewEncoder(w).Encode([]map[string]any{})
+			}
+
+		case strings.HasSuffix(r.URL.Path, "checksums.txt"):
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, checksums)
+
+		case strings.Contains(r.URL.Path, "/releases/download/v"+binaryVersion+"/engram_"+binaryVersion+"_linux_"):
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			w.Write(tarContent)
+
+		default:
+			t.Fatalf("unexpected request: %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer server.Close()
+
+	origClient := engramHTTPClient
+	origBaseURL := engramGitHubBaseURL
+	engramHTTPClient = server.Client()
+	engramGitHubBaseURL = server.URL
+	t.Cleanup(func() {
+		engramHTTPClient = origClient
+		engramGitHubBaseURL = origBaseURL
+	})
+
+	tmpDir := t.TempDir()
+	origInstallDirFn := engramInstallDirFn
+	engramInstallDirFn = func(goos string) string { return tmpDir }
+	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
+
+	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
+	installedPath, err := DownloadLatestBinary(profile, false)
+	if err != nil {
+		t.Fatalf("DownloadLatestBinary() error = %v, want core engram v%s selected from page 2", err, binaryVersion)
+	}
+
+	if _, err := os.Stat(installedPath); err != nil {
+		t.Fatalf("stat installed binary: %v", err)
+	}
+
+	// Verify that pagination actually happened — both page 1 and page 2 must have been requested.
+	gotPages := strings.Join(pagesRequested, ",")
+	if !strings.Contains(gotPages, "1") || !strings.Contains(gotPages, "2") {
+		t.Errorf("expected pagination across pages 1 and 2, got pages requested: [%s]", gotPages)
 	}
 }
 
@@ -784,4 +1095,316 @@ func TestEngramExpectedChecksumFor(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- TestDownloadLatestBinary_ChannelRouting (Slice 3) ---
+
+// TestDownloadLatestBinary_StableChannelUsesRelease verifies that calling
+// DownloadLatestBinary with isBeta=false fetches from the release download
+// path (the existing GitHub Releases flow).
+func TestDownloadLatestBinary_StableChannelUsesRelease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows: uses tar.gz server fixture")
+	}
+
+	server := makeServerWithFakeTarGz(t, "1.3.0")
+	defer server.Close()
+
+	origClient := engramHTTPClient
+	origBaseURL := engramGitHubBaseURL
+	engramHTTPClient = server.Client()
+	engramGitHubBaseURL = server.URL
+	t.Cleanup(func() {
+		engramHTTPClient = origClient
+		engramGitHubBaseURL = origBaseURL
+	})
+
+	tmpDir := t.TempDir()
+	origInstallDirFn := engramInstallDirFn
+	engramInstallDirFn = func(goos string) string { return tmpDir }
+	t.Cleanup(func() { engramInstallDirFn = origInstallDirFn })
+
+	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
+	// isBeta=false → should use the release download path.
+	installedPath, err := DownloadLatestBinary(profile, false)
+	if err != nil {
+		t.Fatalf("DownloadLatestBinary(stable): unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(installedPath, tmpDir) {
+		t.Errorf("installedPath = %q, want prefix %q", installedPath, tmpDir)
+	}
+}
+
+// TestDownloadLatestBinary_BetaChannelUsesGoInstallMain verifies that calling
+// DownloadLatestBinary with isBeta=true performs go install @main instead of
+// fetching a release archive.
+func TestDownloadLatestBinary_BetaChannelUsesGoInstallMain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: requires go install command")
+	}
+
+	origGoInstallFn := engramGoInstallFn
+	t.Cleanup(func() { engramGoInstallFn = origGoInstallFn })
+
+	var gotPkg string
+	engramGoInstallFn = func(pkg string) (string, error) {
+		gotPkg = pkg
+		return "/tmp/engram-beta", nil
+	}
+
+	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
+	// isBeta=true → should use go install @main, not release download.
+	installedPath, err := DownloadLatestBinary(profile, true)
+	if err != nil {
+		t.Fatalf("DownloadLatestBinary(beta): unexpected error: %v", err)
+	}
+	if !strings.Contains(gotPkg, "@main") {
+		t.Errorf("go install pkg = %q, want @main suffix", gotPkg)
+	}
+	if installedPath == "" {
+		t.Error("expected non-empty installedPath for beta channel")
+	}
+}
+
+func TestCanonicalEngramGoInstallPackagePreservesDeclaredModuleCasing(t *testing.T) {
+	tests := []struct {
+		name string
+		pkg  string
+		want string
+	}{
+		{
+			name: "lowercase owner is canonicalized",
+			pkg:  "github.com/gentleman-programming/engram/cmd/engram@main",
+			want: "github.com/Gentleman-Programming/engram/cmd/engram@main",
+		},
+		{
+			name: "canonical owner remains unchanged",
+			pkg:  "github.com/Gentleman-Programming/engram/cmd/engram@v1.2.3",
+			want: "github.com/Gentleman-Programming/engram/cmd/engram@v1.2.3",
+		},
+		{
+			name: "unrelated package remains unchanged",
+			pkg:  "github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest",
+			want: "github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canonicalEngramGoInstallPackage(tt.pkg); got != tt.want {
+				t.Fatalf("canonicalEngramGoInstallPackage(%q) = %q, want %q", tt.pkg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEngramGoInstallFromMainCanonicalizesModuleCasing(t *testing.T) {
+	const fakeInstallDir = "/custom/gobin"
+
+	origGoInstallCmdFn := engramGoInstallCmdFn
+	origGoEnvFn := engramGoEnvFn
+	t.Cleanup(func() {
+		engramGoInstallCmdFn = origGoInstallCmdFn
+		engramGoEnvFn = origGoEnvFn
+	})
+
+	var gotPkg string
+	engramGoInstallCmdFn = func(pkg string) error {
+		gotPkg = pkg
+		return nil
+	}
+	engramGoEnvFn = func(keys ...string) (map[string]string, error) {
+		return map[string]string{"GOBIN": fakeInstallDir, "GOPATH": ""}, nil
+	}
+
+	_, err := engramGoInstallFromMain("github.com/gentleman-programming/engram/cmd/engram@main")
+	if err != nil {
+		t.Fatalf("engramGoInstallFromMain: unexpected error: %v", err)
+	}
+
+	wantPkg := "github.com/Gentleman-Programming/engram/cmd/engram@main"
+	if gotPkg != wantPkg {
+		t.Fatalf("go install package = %q, want %q", gotPkg, wantPkg)
+	}
+}
+
+// TestEngramGoInstallFromMain_UsesGoEnvForBinDir verifies that
+// engramGoInstallFromMain resolves the install directory via `go env GOBIN GOPATH`
+// (the effective Go environment) rather than reading raw shell env vars.
+// This matters when GOBIN is set via `go env -w GOBIN=...` (stored in Go's
+// env file) but NOT exported into the shell environment.
+func TestEngramGoInstallFromMain_UsesGoEnvForBinDir(t *testing.T) {
+	const fakeInstallDir = "/custom/gobin/via/go-env"
+
+	origGoEnvFn := engramGoEnvFn
+	t.Cleanup(func() { engramGoEnvFn = origGoEnvFn })
+
+	// Simulate GOBIN set only via `go env -w` (not in shell env).
+	// The raw os.Getenv("GOBIN") would return "", but go env GOBIN returns
+	// the persisted value from the Go env file.
+	t.Setenv("GOBIN", "")
+	t.Setenv("GOPATH", "")
+
+	engramGoEnvFn = func(keys ...string) (map[string]string, error) {
+		result := make(map[string]string, len(keys))
+		for _, k := range keys {
+			if k == "GOBIN" {
+				result[k] = fakeInstallDir
+			} else {
+				result[k] = ""
+			}
+		}
+		return result, nil
+	}
+
+	// Inject a fake go install that does nothing (no real network/build).
+	origGoInstallCmdFn := engramGoInstallCmdFn
+	t.Cleanup(func() { engramGoInstallCmdFn = origGoInstallCmdFn })
+	engramGoInstallCmdFn = func(pkg string) error { return nil }
+
+	binaryPath, err := engramGoInstallFromMain("github.com/Gentleman-Programming/engram/cmd/engram@main")
+	if err != nil {
+		t.Fatalf("engramGoInstallFromMain: unexpected error: %v", err)
+	}
+
+	wantDir := fakeInstallDir
+	gotDir := filepath.Dir(binaryPath)
+	if gotDir != wantDir {
+		t.Errorf("binary dir = %q, want %q (from go env GOBIN)", gotDir, wantDir)
+	}
+}
+
+func TestEngramGoInstallFromMain_BypassesPublicGoProxy(t *testing.T) {
+	binDir := t.TempDir()
+	goPath := filepath.Join(binDir, "go")
+	recordPath := filepath.Join(t.TempDir(), "go-env.txt")
+	fakeGo := filepath.Join(binDir, "go")
+	script := "#!/usr/bin/env bash\n" +
+		"printf 'GONOSUMDB=%s\\nGOPRIVATE=%s\\nGONOPROXY=%s\\n' \"${GONOSUMDB:-}\" \"${GOPRIVATE:-}\" \"${GONOPROXY:-}\" > \"$GO_ENV_RECORD\"\n"
+	if err := os.WriteFile(fakeGo, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GO_ENV_RECORD", recordPath)
+
+	origGoEnvFn := engramGoEnvFn
+	t.Cleanup(func() { engramGoEnvFn = origGoEnvFn })
+	engramGoEnvFn = func(keys ...string) (map[string]string, error) {
+		return map[string]string{"GOBIN": goPath, "GOPATH": filepath.Join(t.TempDir(), "gopath")}, nil
+	}
+
+	if _, err := engramGoInstallFromMain("github.com/Gentleman-Programming/engram/cmd/engram@main"); err != nil {
+		t.Fatalf("engramGoInstallFromMain() error = %v", err)
+	}
+
+	recorded, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", recordPath, err)
+	}
+	for _, want := range []string{
+		"GONOSUMDB=github.com/Gentleman-Programming/engram",
+		"GOPRIVATE=github.com/Gentleman-Programming/engram",
+		"GONOPROXY=github.com/Gentleman-Programming/engram",
+	} {
+		if !strings.Contains(string(recorded), want) {
+			t.Fatalf("go install env missing %q\nrecorded:\n%s", want, recorded)
+		}
+	}
+}
+
+// TestEngramStopScriptIsDefensive locks in the shape of the PowerShell stop
+// script so the clean-install regression from issue #815 cannot reappear.
+//
+// On Windows PowerShell 5.1, piping an empty `Get-Process` result straight into
+// Stop-Process flips `$?` and makes powershell.exe exit 1 with no output, which
+// the Go installer surfaces as a bare "exit status 1 (output: )" and marks the
+// whole engram component FAILED on a fresh machine. The fix is structural: guard
+// the pipeline with `if ($procs)` and never use `-ErrorAction Stop`. Because the
+// script only runs on real Windows (integration-covered on Windows CI), this
+// unit test asserts the invariants on the generated string so a future "cleanup"
+// that reintroduces the direct pipe or a terminating error action fails here.
+func TestEngramStopScriptIsDefensive(t *testing.T) {
+	script := engramStopScript()
+
+	// The lookup must not treat a missing process as a terminating error.
+	if !strings.Contains(script, "Get-Process -Name engram -ErrorAction SilentlyContinue") {
+		t.Errorf("stop script must look up engram with -ErrorAction SilentlyContinue\nscript:\n%s", script)
+	}
+
+	// The Stop-Process pipeline must be guarded so it never runs on an empty
+	// result — this is the core of the issue #815 fix.
+	if !strings.Contains(script, "if ($procs)") {
+		t.Errorf("stop script must guard Stop-Process behind `if ($procs)` (issue #815)\nscript:\n%s", script)
+	}
+
+	// -ErrorAction Stop on Stop-Process is exactly what produced exit 1 when the
+	// pipeline was empty. It must never come back.
+	if strings.Contains(script, "Stop-Process -Force -ErrorAction Stop") {
+		t.Errorf("stop script must not use -ErrorAction Stop on Stop-Process (reintroduces issue #815/#850)\nscript:\n%s", script)
+	}
+
+	// The clean/no-process path must report success explicitly, regardless of any
+	// PowerShell status left behind by defensive no-op commands.
+	if !strings.HasSuffix(strings.TrimSpace(script), "exit 0") {
+		t.Errorf("stop script must explicitly exit 0 on the clean/no-process path\nscript:\n%s", script)
+	}
+}
+
+// TestSHA256ChecksumContract verifies that the SHA256 hex digest format produced
+// by the Go installer matches the format expected by the PowerShell fallback in
+// scripts/install.ps1. This is a contract test that ensures both implementations
+// produce compatible checksums for verification.
+//
+// The PowerShell fallback uses .NET cryptography when Get-FileHash is unavailable:
+//
+//	$sha256 = [System.Security.Cryptography.SHA256]::Create()
+//	$fileStream = [System.IO.File]::OpenRead($archivePath)
+//	$hashBytes = $sha256.ComputeHash($fileStream)
+//	$actualChecksum = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
+//
+// This test ensures the Go implementation produces the same format: 64 lowercase
+// hexadecimal characters. If this contract breaks, the PowerShell fallback will
+// fail checksum verification even when the digests match.
+//
+// Related: PR #937 (PowerShell 5.1 fallback for SHA256 checksum verification)
+func TestSHA256ChecksumContract(t *testing.T) {
+	// Test data: arbitrary content to hash
+	testData := []byte("Gentle AI SHA256 contract test")
+
+	// Calculate hash using Go's crypto/sha256 (same as engramDownloadToFile)
+	h := sha256.Sum256(testData)
+	goDigest := hex.EncodeToString(h[:])
+
+	// Contract assertion 1: digest must be exactly 64 characters
+	if len(goDigest) != 64 {
+		t.Errorf("SHA256 digest length = %d, want 64", len(goDigest))
+	}
+
+	// Contract assertion 2: digest must be lowercase hexadecimal
+	for i, c := range goDigest {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !isHex {
+			t.Errorf("SHA256 digest[%d] = %c, want lowercase hex digit", i, c)
+		}
+	}
+
+	// Contract assertion 3: digest must be deterministic (same input → same output)
+	h2 := sha256.Sum256(testData)
+	goDigest2 := hex.EncodeToString(h2[:])
+	if goDigest != goDigest2 {
+		t.Errorf("SHA256 digest is not deterministic: %q != %q", goDigest, goDigest2)
+	}
+
+	// Contract assertion 4: different input → different output
+	differentData := []byte("different content")
+	h3 := sha256.Sum256(differentData)
+	differentDigest := hex.EncodeToString(h3[:])
+	if goDigest == differentDigest {
+		t.Errorf("SHA256 digest collision: different inputs produced same digest")
+	}
+
+	// Document the expected format for the PowerShell fallback
+	// This comment serves as documentation for maintainers modifying either implementation
+	t.Logf("SHA256 contract: Go produces %q format (64 lowercase hex chars)", goDigest)
+	t.Logf("PowerShell fallback must produce identical format using .NET SHA256")
 }

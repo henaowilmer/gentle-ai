@@ -14,14 +14,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gentleman-programming/gentle-ai/internal/cli"
 	"github.com/gentleman-programming/gentle-ai/internal/components/engram"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
 	"github.com/gentleman-programming/gentle-ai/internal/update"
 )
 
-// engramDownloadFn is the function used to download the engram binary.
+// engramDownloadFn is the function used to download the engram binary on the stable channel.
 // Package-level var for testability — swapped in tests to avoid real network calls.
-var engramDownloadFn = engram.DownloadLatestBinary
+var engramDownloadFn = func(profile system.PlatformProfile) (string, error) {
+	return engram.DownloadLatestBinary(profile, false)
+}
+
+// engramBetaInstallFn installs engram from HEAD via `go install @main` (beta channel).
+// It delegates to engram.DownloadLatestBinary(profile, true), which is the single
+// canonical beta path shared with the install-time flow. Package-level var for
+// testability — swapped in tests to avoid real go install/network calls.
+var engramBetaInstallFn = func(profile system.PlatformProfile) (string, error) {
+	return engram.DownloadLatestBinary(profile, true)
+}
 
 // execCommand is a package-level var declared in executor.go (same package).
 
@@ -54,6 +65,10 @@ const maxScriptSize = 1 * 1024 * 1024 // 1 MB
 //   - OpenCode plugin method → update materialized package in ~/.config/opencode when possible
 //   - unknown method → manualFallback with explicit message
 func runStrategy(ctx context.Context, r update.UpdateResult, profile system.PlatformProfile) (bool, error) {
+	if isBetaGentleAIUpgrade(r) && profile.OS != "windows" {
+		return false, goInstallMainUpgrade(r.Tool)
+	}
+
 	method := effectiveMethod(r.Tool, profile)
 
 	switch method {
@@ -64,7 +79,7 @@ func runStrategy(ctx context.Context, r update.UpdateResult, profile system.Plat
 	case update.InstallBinary:
 		return false, binaryUpgrade(ctx, r, profile)
 	case update.InstallInstaller:
-		return installerUpgrade(ctx, r.Tool, r.ReleaseURL)
+		return installerUpgrade(ctx, r.Tool, r.ReleaseURL, isBetaGentleAIUpgrade(r))
 	case update.InstallScript:
 		// GGA's install.sh expects to run from within a cloned repo — it references
 		// $SCRIPT_DIR/bin/gga and $SCRIPT_DIR/lib/*.sh. The generic scriptUpgrade
@@ -387,6 +402,77 @@ func goInstallUpgrade(ctx context.Context, tool update.ToolInfo, latestVersion s
 	return nil
 }
 
+func isBetaGentleAIUpgrade(r update.UpdateResult) bool {
+	return r.Tool.Name == "gentle-ai" &&
+		strings.EqualFold(r.Tool.Owner, "Gentleman-Programming") &&
+		r.Tool.Repo == "gentle-ai" &&
+		strings.HasPrefix(strings.TrimSpace(r.LatestVersion), "main@")
+}
+
+func goInstallMainUpgrade(tool update.ToolInfo) error {
+	module := strings.ToLower(fmt.Sprintf("github.com/%s/%s", strings.TrimSpace(tool.Owner), strings.TrimSpace(tool.Repo)))
+	if module == "github.com//" {
+		module = "github.com/gentleman-programming/gentle-ai"
+	}
+	target := module + "/cmd/gentle-ai@main"
+	cmd := execCommand("go", "install", target)
+	cmd.Stdin = nil
+	cmd.Env = goProxyBypassEnv(cmd.Env, module)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("go install %s: %w (output: %s)", target, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func goProxyBypassEnv(base []string, module string) []string {
+	if base == nil {
+		base = os.Environ()
+	}
+	env := append([]string{}, base...)
+	for _, key := range []string{"GONOSUMDB", "GOPRIVATE", "GONOPROXY"} {
+		env = setEnvValue(env, key, prependGoPattern(getEnvValue(env, key), module))
+	}
+	return env
+}
+
+func getEnvValue(env []string, key string) string {
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return strings.TrimPrefix(env[i], prefix)
+		}
+	}
+	return ""
+}
+
+func setEnvValue(env []string, key, value string) []string {
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func prependGoPattern(existing, pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return existing
+	}
+	parts := strings.Split(existing, ",")
+	for _, part := range parts {
+		if strings.TrimSpace(part) == pattern {
+			return existing
+		}
+	}
+	if strings.TrimSpace(existing) == "" {
+		return pattern
+	}
+	return pattern + "," + existing
+}
+
 // binaryUpgrade handles binary-release upgrades via GitHub Releases asset download.
 //
 // engram has its own cross-platform binary downloader (DownloadLatestBinary) that
@@ -417,10 +503,33 @@ func binaryUpgrade(ctx context.Context, r update.UpdateResult, profile system.Pl
 	return downloadAndReplace(ctx, r, profile)
 }
 
+// installerUpgradeArgs builds the PowerShell command argument list for launching
+// install.ps1 as a detached process. When beta is true, "-Channel beta" is
+// appended after "-File <tmpPath>" so install.ps1 routes to go install @main
+// instead of downloading the latest stable release binary.
+func installerUpgradeArgs(tmpPath string, beta bool) []string {
+	args := []string{
+		"/C",
+		"start",
+		"",
+		"powershell",
+		"-NoProfile",
+		"-NoExit",
+		"-ExecutionPolicy", "Bypass",
+		"-File", tmpPath,
+	}
+	if beta {
+		args = append(args, "-Channel", "beta")
+	}
+	return args
+}
+
 // installerUpgrade launches the PowerShell installer (install.ps1) for gentle-ai on Windows.
 // This is used for the Windows self-replace workaround — the running process
 // exits immediately after launching the installer, which then replaces the binary.
-func installerUpgrade(ctx context.Context, tool update.ToolInfo, releaseURL string) (bool, error) {
+// When beta is true, "-Channel beta" is passed to install.ps1 so it installs
+// from HEAD via go install @main instead of downloading the latest stable release.
+func installerUpgrade(ctx context.Context, tool update.ToolInfo, releaseURL string, beta bool) (bool, error) {
 	if runtime.GOOS != "windows" {
 		return false, fmt.Errorf("installer upgrade is only supported on Windows")
 	}
@@ -461,17 +570,7 @@ func installerUpgrade(ctx context.Context, tool update.ToolInfo, releaseURL stri
 	}
 	tmpFile.Close()
 
-	cmd := execCommand(
-		"cmd",
-		"/C",
-		"start",
-		"",
-		"powershell",
-		"-NoProfile",
-		"-NoExit",
-		"-ExecutionPolicy", "Bypass",
-		"-File", tmpFile.Name(),
-	)
+	cmd := execCommand("cmd", installerUpgradeArgs(tmpFile.Name(), beta)...)
 
 	fmt.Printf("\nLaunching installer for %s...\n", tool.Name)
 	fmt.Println("gentle-ai will now exit so the installer can replace the binary.")
@@ -485,18 +584,46 @@ func installerUpgrade(ctx context.Context, tool update.ToolInfo, releaseURL stri
 	return true, nil
 }
 
-// engramBinaryUpgrade downloads the latest engram binary using its dedicated
-// cross-platform downloader and adds the install directory to PATH.
-// On Windows the PATH change is also persisted to the user registry via PowerShell.
+// engramBinaryUpgrade downloads or installs the latest engram binary.
+// It honors GENTLE_AI_CHANNEL: when the channel is beta, engram is installed
+// from source via `go install @main`. For stable (the default when the env var
+// is unset or unknown), the pre-built release binary is downloaded via
+// engramDownloadFn. On Windows, PATH changes are persisted to the user registry
+// via PowerShell.
 func engramBinaryUpgrade(profile system.PlatformProfile) error {
-	binaryPath, err := engramDownloadFn(profile)
+	// Resolve the install channel from the environment. Unknown values fall back
+	// to stable (ResolveInstallChannel returns an error for truly unrecognized
+	// values; we treat those as stable and emit a warning so users are not silently
+	// misrouted).
+	channel, err := cli.ResolveInstallChannel("")
 	if err != nil {
-		return fmt.Errorf("download engram binary: %w", err)
+		fmt.Fprintf(os.Stderr, "WARNING: unrecognized GENTLE_AI_CHANNEL value (%v); defaulting to stable\n", err)
+		channel = cli.ChannelStable
 	}
+
+	var binaryPath string
+	if channel.IsBeta() {
+		// Beta channel: install engram from HEAD via engramBetaInstallFn, which
+		// delegates to engram.DownloadLatestBinary(profile, true). This is the
+		// single canonical beta path shared with the install-time flow in
+		// internal/cli/run.go (installBetaEngramFromMain). The previous inline
+		// `go install` block is removed — all beta logic lives in download.go.
+		binaryPath, err = engramBetaInstallFn(profile)
+		if err != nil {
+			return fmt.Errorf("install engram from main (beta): %w", err)
+		}
+	} else {
+		// Stable channel (default): download the latest release binary.
+		binaryPath, err = engramDownloadFn(profile)
+		if err != nil {
+			return fmt.Errorf("download engram binary: %w", err)
+		}
+	}
+
 	// Add install dir to PATH. On Windows this also persists via PowerShell (user registry).
 	binDir := filepath.Dir(binaryPath)
 	if err := system.AddToUserPath(binDir); err != nil {
-		// Non-fatal: the binary was downloaded successfully. Warn and continue.
+		// Non-fatal: the binary was downloaded or installed successfully. Warn and continue.
 		fmt.Fprintf(os.Stderr, "WARNING: could not add %s to PATH: %v\n", binDir, err)
 	}
 	return nil

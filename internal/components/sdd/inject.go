@@ -10,6 +10,7 @@ import (
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
+	"github.com/gentleman-programming/gentle-ai/internal/catalog"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/components/skills"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
@@ -58,6 +59,12 @@ type InjectOptions struct {
 	// skills.InjectWithCapability will be called with empty capability
 	// (no section extraction, full content written).
 	Capability string
+
+	// triggerRulesContent is an internal field set by step 1c in Inject()
+	// for OpenCode/Kilocode adapters. It holds the rendered trigger-rules
+	// block so inlineOpenCodeSDDPrompts can append it to the gentle-orchestrator
+	// prompt content without re-computing the render.
+	triggerRulesContent string
 }
 
 // workflowInjector is an optional adapter capability: if an adapter
@@ -271,6 +278,71 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 		}
 	}
 
+	// sectionTriggerRules is the section ID used for marker-based injection.
+	// openMarker("trigger-rules") produces <!-- gentle-ai:trigger-rules -->.
+	// No new marker constant is needed — filemerge derives it from the section ID string.
+	const sectionTriggerRules = "trigger-rules"
+
+	// 1c. Inject the trigger-rules section into every agent's system prompt.
+	// Approach mirrors the strict-tdd-mode step (1b) with an additional path for
+	// OpenCode/Kilocode whose content lives in the gentle-orchestrator agent prompt
+	// (scoped to that agent only, not in a global AGENTS.md section).
+	//
+	// Decision (4.10): OpenCode and Kilocode deliver trigger-rules inside the
+	// gentle-orchestrator prompt where all existing SDD content lives — this keeps
+	// the rules in the always-loaded scope for those agents.
+	//
+	// Decision (4.11): Only Kimi uses StrategyJinjaModules today. If a future
+	// adapter adopts Jinja modules it must add its own {% include "trigger-rules.md" %}
+	// line and will be handled by the StrategyJinjaModules branch below.
+	{
+		rendered := RenderTriggerRules(catalog.DefaultTriggerRuleSet())
+
+		if adapter.Agent() == model.AgentOpenCode || adapter.Agent() == model.AgentKilocode {
+			// OpenCode / Kilocode: trigger-rules is appended to the gentle-orchestrator
+			// prompt content inside opencode.json (handled by inlineOpenCodeSDDPrompts
+			// via the triggerRulesContent variable set on InjectOptions — see below).
+			// We store the rendered content in opts so inlineOpenCodeSDDPrompts can pick it up.
+			opts.triggerRulesContent = rendered
+		} else if adapter.SystemPromptStrategy() == model.StrategyJinjaModules {
+			// Jinja agents (currently only Kimi): write the rendered block as a
+			// standalone module file. The static KIMI.md template includes it via
+			// {% include "trigger-rules.md" ignore missing %}.
+			configDir := adapter.GlobalConfigDir(homeDir)
+			modulePath := filepath.Join(configDir, "trigger-rules.md")
+			writeResult, err := filemerge.WriteFileAtomic(modulePath, []byte(rendered), 0o644)
+			if err != nil {
+				return InjectionResult{}, err
+			}
+			changed = changed || writeResult.Changed
+			files = append(files, modulePath)
+		} else {
+			// All other system-prompt agents: inject via marker-based section.
+			promptPath := adapter.SystemPromptFile(homeDir)
+			existing, readErr := readFileOrEmpty(promptPath)
+			if readErr != nil {
+				return InjectionResult{}, readErr
+			}
+			updated := filemerge.InjectMarkdownSection(existing, sectionTriggerRules, rendered)
+			writeResult, writeErr := filemerge.WriteFileAtomic(promptPath, []byte(updated), 0o644)
+			if writeErr != nil {
+				return InjectionResult{}, writeErr
+			}
+			changed = changed || writeResult.Changed
+			// Dedupe the path — it may already be present from step 1.
+			alreadyInFiles := false
+			for _, f := range files {
+				if f == promptPath {
+					alreadyInFiles = true
+					break
+				}
+			}
+			if !alreadyInFiles {
+				files = append(files, promptPath)
+			}
+		}
+	}
+
 	// 1b. If StrictTDD is enabled, inject the strict-tdd-mode marker section
 	// into the system prompt file so agents know Strict TDD is active.
 	if opts.StrictTDD && adapter.Agent() != model.AgentOpenCode && adapter.Agent() != model.AgentKilocode {
@@ -388,7 +460,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				changed = changed || promptsChanged
 			}
 
-			overlayBytes, err = inlineOpenCodeSDDPrompts(overlayBytes, homeDir, settingsPath, opts.PreserveOpenCodeOrchestratorPrompt)
+			overlayBytes, err = inlineOpenCodeSDDPrompts(overlayBytes, homeDir, settingsPath, opts.PreserveOpenCodeOrchestratorPrompt, opts.triggerRulesContent)
 			if err != nil {
 				return InjectionResult{}, fmt.Errorf("inline OpenCode SDD prompts: %w", err)
 			}
@@ -446,6 +518,11 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				if profile.Name == "" || profile.Name == "default" {
 					continue
 				}
+				cleanupResult, cleanupErr := cleanupStaleProfileJDAgents(settingsPath, profile)
+				if cleanupErr != nil {
+					return InjectionResult{}, fmt.Errorf("clean stale profile JD agents %q: %w", profile.Name, cleanupErr)
+				}
+				changed = changed || cleanupResult.Changed
 				profileOverlay, profileErr := GenerateProfileOverlay(profile, homeDir)
 				if profileErr != nil {
 					return InjectionResult{}, fmt.Errorf("generate profile overlay %q: %w", profile.Name, profileErr)
@@ -734,7 +811,7 @@ func validateOpenClawWorkspacePath(workspaceDir string, adapter agents.Adapter) 
 	return nil
 }
 
-func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string, preserveExistingOrchestratorPrompt bool) ([]byte, error) {
+func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string, preserveExistingOrchestratorPrompt bool, triggerRulesContent string) ([]byte, error) {
 	var overlay map[string]any
 	if err := json.Unmarshal(overlayBytes, &overlay); err != nil {
 		return nil, fmt.Errorf("unmarshal OpenCode SDD overlay: %w", err)
@@ -785,6 +862,15 @@ func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string,
 		orchestratorMap["prompt"] = assets.MustRead(sddOrchestratorAsset(model.AgentOpenCode))
 	}
 
+	// Append the trigger-rules section to the orchestrator prompt when provided.
+	// This keeps the rules in the always-loaded scope for OpenCode/Kilocode agents
+	// (the orchestrator prompt is the only per-agent content they read at session start).
+	if triggerRulesContent != "" {
+		if existingPrompt, ok := orchestratorMap["prompt"].(string); ok {
+			orchestratorMap["prompt"] = filemerge.InjectMarkdownSection(existingPrompt, "trigger-rules", triggerRulesContent)
+		}
+	}
+
 	// Replace sub-agent prompt placeholders with {file:<absolutePath>} references.
 	// The placeholder format is __PROMPT_FILE_{phase}__ where {phase} is the agent name.
 	if homeDir != "" {
@@ -823,8 +909,82 @@ func migratePreservedOpenCodeOrchestratorPrompt(prompt string) string {
 		"Bind this to the dedicated `gentle-orchestrator` agent only.",
 		"agent.sdd-orchestrator.model",
 		"agent.gentle-orchestrator.model",
+		"Before continuing with SDD, choose one option per group.\n",
+		"",
+		"Before continuing with SDD, choose one option per group.\r\n",
+		"",
+		"Antes de continuar con SDD, elija una opción por grupo.\n",
+		"",
+		"Antes de continuar con SDD, elija una opción por grupo.\r\n",
+		"",
 	)
-	return ensurePreservedOpenCodeDelegationHardGates(ensurePreservedOpenCodeOrchestratorPreflight(replacer.Replace(prompt)))
+	migrated := removeLegacyOpenCodePlainChatPreflightLines(replacer.Replace(prompt))
+	return ensurePreservedOpenCodeDelegationHardGates(ensurePreservedOpenCodeOrchestratorPreflight(migrated))
+}
+
+func removeLegacyOpenCodePlainChatPreflightLines(prompt string) string {
+	legacyFragments := []string{
+		"Ask the user directly with a compact, numbered preflight prompt.",
+		"Keep option codes",
+		"Do NOT ask the user to type raw keys",
+		"Use this shape for English users",
+		"If the user's current language is Spanish, use this localized shape:",
+		"Do NOT mix languages inside one preflight prompt",
+		"Spanish localized shape below as the neutral fallback",
+		"translate user-facing prose to the user's current language while preserving option codes",
+		"Before continuing with SDD, choose one option per group.",
+		"Reply with \"use recommended\" or with codes like:",
+		"A. Pace",
+		"A1 Interactive",
+		"A2 Automatic",
+		"B. Artifacts",
+		"B1 OpenSpec",
+		"B2 Engram",
+		"B3 Both",
+		"C. PRs",
+		"C1 Ask me",
+		"C2 Single PR",
+		"C3 Chained",
+		"C4 Auto",
+		"D. Review",
+		"D1 400 lines",
+		"D2 800 lines",
+		"D3 Other",
+		"After asking this, STOP and wait for the user's answer.",
+		"Antes de continuar con SDD, elija una opción por grupo.",
+		"Responda con \"usar recomendado\" o con códigos como:",
+		"A. Ritmo",
+		"A1 Interactivo",
+		"A2 Automático",
+		"B. Artefactos",
+		"B1 OpenSpec",
+		"B2 Engram",
+		"B3 Ambos",
+		"C1 Preguntarme",
+		"C2 Un solo PR",
+		"C3 Encadenados",
+		"D. Revisión",
+		"D1 400 líneas",
+		"D2 800 líneas",
+		"D3 Otro",
+		"Map answers to canonical values: A1/Interactive",
+	}
+
+	lines := strings.Split(prompt, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		stale := false
+		for _, fragment := range legacyFragments {
+			if strings.Contains(line, fragment) {
+				stale = true
+				break
+			}
+		}
+		if !stale {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
@@ -885,74 +1045,35 @@ Before executing ANY SDD command or natural-language SDD request, ensure this se
 
 Required preflight choices: execution mode, artifact store, chained PR strategy, and review budget.
 
-Ask the user directly with a compact, numbered preflight prompt. Match the user's current language for all user-facing prose. If the user writes Spanish, ask the preflight in Spanish. Keep option codes (` + "`A1`" + `, ` + "`B1`" + `, ` + "`C1`" + `, ` + "`D1`" + `) and canonical values unchanged. Do NOT ask the user to type raw keys like ` + "`execution mode`" + `, ` + "`artifact store`" + `, ` + "`chained PR strategy`" + `, or ` + "`review budget`" + `. Do NOT mention non-existent tools. Do NOT invent informal values; use only the canonical values after the user chooses.
+Use the ` + "`question`" + ` tool for SDD Session Preflight. Do NOT render the full preflight menu as plain chat text.
 
-Do NOT mix languages inside one preflight prompt: headings, option titles, descriptions, and follow-up text must all be in the user's current language. If the current language is Spanish, use the Spanish localized shape below as the neutral fallback; if an active persona defines a direct-conversation Spanish style, adapt only user-facing prose to that persona while preserving option codes and canonical values. Do not translate only the intro while keeping English labels like ` + "`Pace`" + `, ` + "`Artifacts`" + `, ` + "`Review`" + `, ` + "`recommended`" + `, ` + "`forecast`" + `, or ` + "`budget`" + `.
+Ask all four preflight groups in one single ` + "`question`" + ` tool call so OpenCode can render the groups as tabs. Do NOT run this as a sequential wizard. Do NOT issue four separate ` + "`question`" + ` tool calls.
 
-Use this shape for English users, or translate user-facing prose to the user's current language while preserving option codes. Translation means the whole shape: headings, option titles, and descriptions together.
+The single ` + "`question`" + ` tool call must contain these four localized groups in this order:
 
-` + "```text" + `
-Before continuing with SDD, choose one option per group.
-Reply with "use recommended" or with codes like: A1, B1, C1, D1.
+1. Pace: Interactive, Automatic.
+2. Artifacts: OpenSpec, Engram, Both.
+3. PRs: Ask me, Single PR, Chained, Auto.
+4. Review: 400 lines, 800 lines, Other.
 
-A. Pace
-   A1 Interactive (recommended): show each phase and wait for confirmation before continuing.
-   A2 Automatic: run phases back-to-back and stop only on high risk.
+Match the user's current language and active persona for question labels and descriptions. Treat the preflight UI as direct orchestrator conversation, not as a generated technical artifact. Technical artifacts still default to English, but this UI follows the user's conversation language/persona. Do NOT mix languages inside one grouped question.
 
-B. Artifacts
-   B1 OpenSpec (recommended): repo files, traceable in review.
-   B2 Engram: faster, no spec files in the repo.
-   B3 Both: OpenSpec files plus Engram copy.
+Do NOT show option codes in the interactive UI. Do NOT show canonical values or other internal values in the interactive UI labels or descriptions.
 
-C. PRs
-   C1 Ask me (recommended): stop and ask if the forecast exceeds the budget.
-   C2 Single PR: try to keep the change in one PR.
-   C3 Chained: split into chained PRs from the start.
-   C4 Auto: decide from the size forecast.
+After the single grouped ` + "`question`" + ` tool call returns, map the selected human labels to canonical values internally. Do not reveal the canonical values in the UI.
 
-D. Review
-   D1 400 lines (recommended): stop if forecast exceeds 400 changed lines.
-   D2 800 lines: more permissive; useful for medium changes.
-   D3 Other: ask for the number afterwards.
-` + "```" + `
+If Other is selected for review budget, ask one follow-up question for the numeric budget.
 
-After asking this, STOP and wait for the user's answer.
+Only after all four preflight choices are collected, summarize them as the ` + "`SDD Session Preflight`" + ` decision block and continue with the SDD init guard/requested phase.
 
-If the user's current language is Spanish, use this localized shape:
-
-` + "```text" + `
-Antes de continuar con SDD, elija una opción por grupo.
-Responda con "usar recomendado" o con códigos como: A1, B1, C1, D1.
-
-A. Ritmo
-   A1 Interactivo (recomendado): mostrar cada fase y esperar confirmación antes de continuar.
-   A2 Automático: ejecutar las fases seguidas y frenar solo ante riesgo alto.
-
-B. Artefactos
-   B1 OpenSpec (recomendado): archivos en el repo, trazables en revisión.
-   B2 Engram: más rápido, sin archivos de especificación en el repo.
-   B3 Ambos: archivos OpenSpec más copia en Engram.
-
-C. PRs
-   C1 Preguntarme (recomendado): frenar y preguntar si la estimación supera el presupuesto.
-   C2 Un solo PR: intentar mantener el cambio en un PR.
-   C3 Encadenados: separar en PRs encadenados desde el inicio.
-   C4 Auto: decidir según la estimación de tamaño.
-
-D. Revisión
-   D1 400 líneas (recomendado): frenar si la estimación supera 400 líneas cambiadas.
-   D2 800 líneas: más permisivo; útil para cambios medianos.
-   D3 Otro: preguntar el número después.
-` + "```" + `
-
-Map answers to canonical values: A1/Interactive -> ` + "`interactive`" + `; A2/Automatic -> ` + "`auto`" + `; B1/OpenSpec -> ` + "`openspec`" + `; B2/Engram -> ` + "`engram`" + `; B3/Both -> ` + "`both`" + `; C1/Ask me -> ` + "`ask-always`" + `; C2/Single PR -> ` + "`single-pr-default`" + `; C3/Chained -> ` + "`force-chained`" + `; C4/Auto -> ` + "`auto-forecast`" + `; D1/400 lines -> ` + "`review_budget_lines: 400`" + `; D2/800 lines -> ` + "`review_budget_lines: 800`" + `; D3/Other -> ask one follow-up for the number.
+Map answers to canonical values: Interactive -> ` + "`interactive`" + `; Automatic -> ` + "`auto`" + `; OpenSpec -> ` + "`openspec`" + `; Engram -> ` + "`engram`" + `; Both -> ` + "`both`" + `; Ask me -> ` + "`ask-always`" + `; Single PR -> ` + "`single-pr-default`" + `; Chained -> ` + "`force-chained`" + `; Auto -> ` + "`auto-forecast`" + `; 400 lines -> ` + "`review_budget_lines: 400`" + `; 800 lines -> ` + "`review_budget_lines: 800`" + `; Other -> ask one follow-up for the number.
 
 Hard gate rules:
 
 - ` + "`openspec/config.yaml`" + `, existing SDD artifacts, previous ` + "`sdd-init`" + ` results, or installed SDD assets do NOT satisfy session preflight.
-- If the session has no preflight block, ask the localized user-facing preflight prompt above and STOP. Do not run init, delegate phases, edit files, or apply tasks in the same turn.
+- If the session has no preflight block, ask the single grouped ` + "`question`" + ` tool preflight above. Do not run init, delegate phases, edit files, or apply tasks until all four choices are collected.
 - For a new feature request that says to use SDD, start at preflight -> init guard -> explore/proposal. Never launch ` + "`sdd-apply`" + ` just because the user asked to implement a feature.
-- In ` + "`interactive`" + ` mode, pause after each delegated phase returns, summarize the phase, ask before launching the next phase, and STOP. Match the user's language and active persona for direct conversation only; for Spanish neutral fallback ask: "¿Quiere ajustar algo o continuamos?". Do not run /sdd-ff phases back-to-back unless execution mode is ` + "`auto`" + `.
+- In ` + "`interactive`" + ` mode, pause after each delegated phase returns, summarize the phase, then ask before launching the next phase via the ` + "`question`" + ` tool, and STOP. Use the ` + "`question`" + ` tool for this between-phase decision: present the proceed/adjust/stop options through a single ` + "`question`" + ` tool call; do NOT render the options as a plain markdown bullet list or plain chat text. Match the user's language and active persona for the question labels; for Spanish neutral fallback frame it as: "¿Quiere ajustar algo o continuamos?". Do not run /sdd-ff phases back-to-back unless execution mode is ` + "`auto`" + `.
 - Interactive approval is phase-scoped. Words like "continue", "dale", or "go on" approve only the immediate next phase, not the rest of the SDD pipeline. Do not treat a generated artifact as approved until the user has had a chance to review or explicitly delegate that review.
 - Before the ` + "`sdd-propose`" + ` phase in interactive mode, offer the user a proposal question round instead of silently deciding whether the proposal is clear enough. Ask 3–5 concrete product questions to improve the PRD/proposal by uncovering business rules, implications, impact, edge cases, product tradeoffs, and decision gaps; then summarize assumptions and ask whether the user wants corrections or a second question round. Do not ask about test commands, PR shape, changed-line budget, or other harness mechanics at proposal time unless the user explicitly asks to discuss delivery.
 <!-- /gentle-ai:sdd-session-preflight-migration -->
@@ -962,14 +1083,16 @@ Hard gate rules:
 		strings.Contains(prompt, "openspec/config.yaml") &&
 		strings.Contains(prompt, "Never launch `sdd-apply`") &&
 		strings.Contains(prompt, "Match the user's current language") &&
-		strings.Contains(prompt, "Do NOT mix languages inside one preflight prompt") &&
-		strings.Contains(prompt, "Spanish localized shape below as the neutral fallback") &&
+		strings.Contains(prompt, "Ask all four preflight groups in one single `question` tool call") &&
+		strings.Contains(prompt, "groups as tabs") &&
+		strings.Contains(prompt, "Do NOT run this as a sequential wizard") &&
+		strings.Contains(prompt, "Do NOT mix languages inside one grouped question") &&
+		strings.Contains(prompt, "map the selected human labels to canonical values internally") &&
 		strings.Contains(prompt, "pause after each delegated phase returns") &&
+		strings.Contains(prompt, "ask before launching the next phase via the `question` tool") &&
 		strings.Contains(prompt, "approve only the immediate next phase") &&
 		strings.Contains(prompt, "proposal question round") &&
 		strings.Contains(prompt, "business rules, implications, impact, edge cases") &&
-		strings.Contains(prompt, "Before continuing with SDD") &&
-		!strings.Contains(prompt, "question` tool") &&
 		!containsOpenCodeOrchestratorLanguageLeak(prompt) {
 		return prompt
 	}
@@ -1316,6 +1439,10 @@ func mergeJSONFile(path string, overlay []byte) (mergeJSONResult, error) {
 	if err != nil {
 		return mergeJSONResult{}, fmt.Errorf("migrate opencode sdd orchestrator agent: %w", err)
 	}
+	baseJSON, err = migrateLegacyOpenCodeCommandPrompt(baseJSON)
+	if err != nil {
+		return mergeJSONResult{}, fmt.Errorf("migrate opencode command prompt field: %w", err)
+	}
 
 	merged, err := filemerge.MergeJSONObjects(baseJSON, overlay)
 	if err != nil {
@@ -1515,6 +1642,62 @@ func migrateLegacyOpenCodeAgentsKey(baseJSON []byte) ([]byte, error) {
 
 	root["agent"] = current
 	delete(root, "agents")
+
+	encoded, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	return append(encoded, '\n'), nil
+}
+
+// migrateLegacyOpenCodeCommandPrompt normalizes inline OpenCode command entries
+// that still use the deprecated "prompt" field to the current "template" field.
+//
+// OpenCode renamed the command body field from "prompt" to "template" and made
+// the command schema strict (additionalProperties: false). A stale "prompt" key
+// left over from an older install therefore fails schema validation and aborts
+// OpenCode startup ("Missing key" / ConfigInvalidError). For each command entry
+// we move "prompt" into "template" when "template" is absent, then drop "prompt".
+// Entries that already define "template" keep it and simply shed the stale key.
+func migrateLegacyOpenCodeCommandPrompt(baseJSON []byte) ([]byte, error) {
+	if len(strings.TrimSpace(string(baseJSON))) == 0 {
+		return baseJSON, nil
+	}
+
+	root := map[string]any{}
+	if err := json.Unmarshal(baseJSON, &root); err != nil {
+		// Preserve prior behavior for non-JSON/non-parseable inputs.
+		return baseJSON, nil
+	}
+
+	commandsRaw, ok := root["command"].(map[string]any)
+	if !ok {
+		return baseJSON, nil
+	}
+
+	changed := false
+	for _, entryRaw := range commandsRaw {
+		entry, ok := entryRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		promptRaw, hasPrompt := entry["prompt"]
+		if !hasPrompt {
+			continue
+		}
+		if _, hasTemplate := entry["template"]; !hasTemplate {
+			if prompt, ok := promptRaw.(string); ok {
+				entry["template"] = prompt
+			}
+		}
+		delete(entry, "prompt")
+		changed = true
+	}
+
+	if !changed {
+		return baseJSON, nil
+	}
 
 	encoded, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -1869,7 +2052,7 @@ var claudeModelAssignmentReasons = map[string]string{
 	"jd-judge-a":   "Adversarial review — blind judge A",
 	"jd-judge-b":   "Adversarial review — blind judge B",
 	"jd-fix-agent": "Surgical fixes from confirmed issues",
-	"default":      "Non-SDD general delegation",
+	"default":      "SDD/JD phase fallback",
 }
 
 func injectClaudeModelAssignments(content string, assignments map[string]model.ClaudeModelAlias) (string, error) {
@@ -1950,9 +2133,9 @@ func renderClaudeEffortFrontmatter(assignment model.ClaudePhaseAssignment) strin
 func renderClaudeModelAssignmentsSection(assignments map[string]model.ClaudePhaseAssignment) string {
 	var b strings.Builder
 	b.WriteString("## Model Assignments\n\n")
-	b.WriteString("Read this table at session start (or before first delegation), cache it for the session, and pass the mapped alias in every Agent tool call via the `model` parameter. If a phase is missing, use the `default` row. If you do not have access to the assigned model (for example, no Opus access), substitute `sonnet` and continue.\n\n")
-	b.WriteString("The Claude Code session model is controlled by Claude Code itself; Gentle AI does not configure the main orchestrator model. This table applies only to Agent tool calls for SDD phase sub-agents and general delegation.\n\n")
-	b.WriteString("**Mandatory model gate:** Every Agent tool call MUST include `model`. Calling Agent without `model` is invalid. Before each Agent call, resolve the target phase to an alias from this table; for general/non-SDD delegation use `default`. If you are about to call Agent and have not chosen a `model`, STOP and choose the mapped alias first.\n\n")
+	b.WriteString("Read this table at session start (or before first SDD/Judgment-Day delegation), cache it for the session, and use the mapped alias only for SDD/Judgment-Day phase agents. If an SDD/Judgment-Day phase is missing, use the `default` fallback row. If you do not have access to the assigned model (for example, no Opus access), substitute `sonnet` and continue.\n\n")
+	b.WriteString("The Claude Code session model is controlled by Claude Code itself; Gentle AI does not configure the main orchestrator model. This table applies only to Agent tool calls for SDD/Judgment-Day phase sub-agents, not generic delegation.\n\n")
+	b.WriteString("**Mandatory phase model gate:** Agent tool calls for SDD/Judgment-Day phase agents MUST include `model`. Generic/non-SDD delegation MUST NOT use this table; omit `model` unless the user explicitly requested an override. Before each SDD/Judgment-Day Agent call, resolve the target phase to an alias from this table.\n\n")
 	b.WriteString("| Phase | Default Model | Effort | Reason |\n")
 	b.WriteString("|-------|---------------|--------|--------|\n")
 	for _, key := range claudeModelAssignmentRowOrder {

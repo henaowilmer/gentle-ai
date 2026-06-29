@@ -2,10 +2,12 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agentbuilder"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
 	"github.com/gentleman-programming/gentle-ai/internal/catalog"
+	"github.com/gentleman-programming/gentle-ai/internal/components/communitytool"
 	"github.com/gentleman-programming/gentle-ai/internal/components/opencodeplugin"
 	"github.com/gentleman-programming/gentle-ai/internal/components/sdd"
 	componentuninstall "github.com/gentleman-programming/gentle-ai/internal/components/uninstall"
@@ -29,6 +32,54 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/update/upgrade"
 )
 
+// tuiNowFn returns the current time for the update-check cooldown gate.
+// Package-level var so tests can inject a deterministic clock.
+var tuiNowFn = time.Now
+
+// tuiOpenBrowserFn opens a URL in the default system browser.
+// Package-level var so tests can inject a stub without spawning a process.
+// Returns a non-nil error when the browser cannot be opened; callers fall back
+// to printing the URL to stdout.
+var tuiOpenBrowserFn = func(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = execCommandFn("open", url)
+	case "windows":
+		cmd = execCommandFn("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = execCommandFn("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
+// advisoryFetchFn is the function used to fetch the advisory manifest.
+// Package-level var so tests can override without network calls.
+var advisoryFetchFn = update.FetchAdvisory
+
+// ansiEscapeRe matches ANSI/VT100 escape sequences (CSI sequences and bare ESC).
+// These must be stripped from remote-controlled content before it is rendered
+// in the TUI to prevent layout corruption or terminal injection attacks.
+var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-9;]*[A-Za-z]|[^[]|)`)
+
+// sanitizeAdvisoryMessage removes ANSI escape sequences and ASCII control
+// characters from a remote-sourced advisory message, keeping only printable
+// characters (≥ 0x20, excluding DEL 0x7f) and the ASCII space (0x20).
+// The function is pure and allocation-minimal for typical short strings.
+func sanitizeAdvisoryMessage(s string) string {
+	// First pass: strip ANSI escape sequences.
+	s = ansiEscapeRe.ReplaceAllString(s, "")
+	// Second pass: remove remaining control characters (0x00–0x1f, 0x7f).
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r >= 0x20 && r != 0x7f {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // osStatModelCache is a package-level variable so tests can override it to
 // simulate a missing or present OpenCode model cache file.
 var osStatModelCache = os.Stat
@@ -37,6 +88,8 @@ var osGetwdFn = os.Getwd
 var osExecutableFn = os.Executable
 var osRemoveFn = os.Remove
 var execCommandFn = exec.Command
+var communityToolInstallFn = communitytool.Install
+var communityToolStatusFn = communitytool.DetectStatus
 
 // readCurrentAssignmentsFn is a package-level variable so tests can override
 // how current model assignments are read from opencode.json. It wraps
@@ -154,6 +207,12 @@ type UpdateCheckResultMsg struct {
 	Results []update.UpdateResult
 }
 
+// AdvisoryMsg is sent when the background advisory manifest fetch completes.
+// Advisory is the zero value (Advisory{}) when there is no message to display.
+type AdvisoryMsg struct {
+	Advisory update.Advisory
+}
+
 // UpgradeDoneMsg is sent when the upgrade operation completes.
 type UpgradeDoneMsg struct {
 	Report upgrade.UpgradeReport
@@ -197,6 +256,16 @@ type AgentBuilderInstallDoneMsg struct {
 type OpenCodePluginRegistrationDoneMsg struct {
 	Results []opencodeplugin.Result
 	Err     error
+}
+
+type CommunityToolInstallationDoneMsg struct {
+	Results []communitytool.Result
+	Err     error
+}
+
+type CommunityToolStatusLoadedMsg struct {
+	Statuses []communitytool.Status
+	Err      error
 }
 
 // AgentBuilderState holds all transient state for the agent-builder TUI flow.
@@ -270,6 +339,9 @@ const (
 	ScreenStrictTDD
 	ScreenOpenCodePlugins
 	ScreenOpenCodePluginResult
+	ScreenCommunityTools
+	ScreenCommunityToolInstalling
+	ScreenCommunityToolResult
 	ScreenDependencyTree
 	ScreenSkillPicker
 	ScreenReview
@@ -303,6 +375,10 @@ const (
 	ScreenAgentBuilderPreview
 	ScreenAgentBuilderInstalling
 	ScreenAgentBuilderComplete
+	// ScreenUpdatePrompt is shown BEFORE ScreenWelcome when an update is available
+	// at launch. No snooze or skip state is persisted — shown on every launch with
+	// a pending update. Keys: u=update+quit, c/Enter=keep→Welcome, v=view changes.
+	ScreenUpdatePrompt
 )
 
 type Model struct {
@@ -379,6 +455,11 @@ type Model struct {
 
 	// UpdateCheckDone is true once the background update check has completed.
 	UpdateCheckDone bool
+
+	// AdvisoryMessage holds the informational text from the advisory manifest
+	// fetch, when a non-empty message was returned. Empty string means no
+	// advisory to display. Set asynchronously via AdvisoryMsg.
+	AdvisoryMessage string
 
 	// pipelineRunning tracks whether the pipeline goroutine is active.
 	pipelineRunning bool
@@ -480,10 +561,18 @@ type Model struct {
 	// OpenCodePluginsStandalone is true when ScreenOpenCodePlugins was opened
 	// from the main menu shortcut instead of the full installation flow.
 	OpenCodePluginsStandalone bool
+	InstallFlowActive         bool
 
 	// OpenCodePluginRegistrationResults and Err hold the dedicated shortcut result.
 	OpenCodePluginRegistrationResults []opencodeplugin.Result
 	OpenCodePluginRegistrationErr     error
+
+	CommunityToolsStandalone   bool
+	CommunityToolStatusLoading bool
+	CommunityToolStatuses      []communitytool.Status
+	CommunityToolStatusErr     error
+	CommunityToolResults       []communitytool.Result
+	CommunityToolErr           error
 }
 
 // NewModel constructs the initial TUI model for the given detection result.
@@ -606,13 +695,31 @@ func installStateModelAssignments(assignments map[string]state.ModelAssignmentSt
 func (m Model) Init() tea.Cmd {
 	version := m.Version
 	profile := m.Detection.System.Profile
+	home := homeDir()
 
-	return func() tea.Msg {
+	updateCmd := func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		results := update.CheckAll(ctx, version, profile)
+		results := update.CheckAllWithCooldown(ctx, version, profile, home, update.UpdateCheckTTL,
+			tuiNowFn,
+			update.CheckAll,
+		)
 		return UpdateCheckResultMsg{Results: results}
 	}
+
+	// Fetch the advisory manifest concurrently with the update check.
+	// advisoryFetchFn is a package-level var so tests can override it.
+	// The fetch is fully non-blocking: it runs in its own goroutine and
+	// delivers an AdvisoryMsg when done. Zero latency is added to TUI launch.
+	advisoryCmd := func() tea.Msg {
+		a, ok := advisoryFetchFn(context.Background())
+		if !ok {
+			return AdvisoryMsg{}
+		}
+		return AdvisoryMsg{Advisory: a}
+	}
+
+	return tea.Batch(updateCmd, advisoryCmd)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -629,6 +736,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep spinner running for operation screens.
 		if m.OperationRunning || (m.Screen == ScreenUpgrade && !m.UpdateCheckDone) ||
 			(m.Screen == ScreenUpgradeSync && !m.UpdateCheckDone) {
+			m.SpinnerFrame = (m.SpinnerFrame + 1) % 10
+			return m, tickCmd()
+		}
+		// Keep spinner running on ScreenUpdatePrompt while the update check is
+		// still in-flight. Once UpdateCheckDone is true, the ticker is no longer
+		// needed for this screen and is intentionally not re-scheduled.
+		if m.Screen == ScreenUpdatePrompt && !m.UpdateCheckDone {
 			m.SpinnerFrame = (m.SpinnerFrame + 1) % 10
 			return m, tickCmd()
 		}
@@ -679,6 +793,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.OpenCodePluginRegistrationErr = msg.Err
 		m.setScreen(ScreenOpenCodePluginResult)
 		return m, nil
+	case CommunityToolInstallationDoneMsg:
+		m.OperationRunning = false
+		m.CommunityToolResults = msg.Results
+		m.CommunityToolErr = msg.Err
+		m.CommunityToolStatuses = communityToolStatusesFromResults(msg.Results, m.CommunityToolStatuses)
+		m.setScreen(ScreenCommunityToolResult)
+		return m, nil
+	case CommunityToolStatusLoadedMsg:
+		m.CommunityToolStatusLoading = false
+		m.CommunityToolStatuses = msg.Statuses
+		m.CommunityToolStatusErr = msg.Err
+		return m, nil
 	case StepProgressMsg:
 		updated, cmd := m.handleStepProgress(msg)
 		state := updated.(Model)
@@ -693,6 +819,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case UpdateCheckResultMsg:
 		m.UpdateResults = msg.Results
 		m.UpdateCheckDone = true
+		// Show the pre-Welcome update prompt only when the user is still on the
+		// initial Welcome screen. The update check is async (~10 s) so if the user
+		// has already navigated into a flow we must not interrupt them mid-action.
+		if update.HasUpdates(m.UpdateResults) && m.Screen == ScreenWelcome {
+			m.setScreen(ScreenUpdatePrompt)
+		}
+		return m, nil
+	case AdvisoryMsg:
+		// Store the advisory message for display on the Welcome screen.
+		// Empty Advisory.Message (no advisory or fetch failed) is a no-op.
+		// Sanitize before storing: strip ANSI escape sequences and control
+		// characters so remote-controlled content cannot corrupt the TUI layout.
+		m.AdvisoryMessage = sanitizeAdvisoryMessage(msg.Advisory.Message)
 		return m, nil
 	case UpgradeDoneMsg:
 		m.OperationRunning = false
@@ -862,9 +1001,18 @@ func (m Model) View() string {
 		if m.UpdateCheckDone && update.HasUpdates(m.UpdateResults) {
 			banner = "Updates available: " + update.UpdateSummaryLine(m.UpdateResults)
 		}
-		return screens.RenderWelcome(m.Cursor, m.Version, banner, m.UpdateResults, m.UpdateCheckDone, m.hasDetectedOpenCode(), len(m.ProfileList), m.hasAgentBuilderEngines())
+		// Append advisory message below the update banner when present.
+		// The advisory is purely informational and never replaces or blocks
+		// any other launch behavior.
+		if m.AdvisoryMessage != "" {
+			if banner != "" {
+				banner += "\n"
+			}
+			banner += "Advisory: " + m.AdvisoryMessage
+		}
+		return screens.RenderWelcomeWithWidth(m.Cursor, m.Version, banner, m.UpdateResults, m.UpdateCheckDone, m.hasDetectedOpenCode(), len(m.ProfileList), m.hasAgentBuilderEngines(), m.Width)
 	case ScreenUpgrade:
-		return screens.RenderUpgrade(m.UpdateResults, m.UpgradeReport, m.UpgradeErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame)
+		return screens.RenderUpgradeWithWidth(m.UpdateResults, m.UpgradeReport, m.UpgradeErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame, m.Width)
 	case ScreenSync:
 		return screens.RenderSync(m.SyncFiles, m.SyncErr, m.OperationRunning, m.HasSyncRun, m.SpinnerFrame)
 	case ScreenModelConfig:
@@ -886,7 +1034,7 @@ func (m Model) View() string {
 	case ScreenProfileDelete:
 		return screens.RenderProfileDelete(m.ProfileDeleteTarget, m.Cursor)
 	case ScreenUpgradeSync:
-		return screens.RenderUpgradeSync(m.UpdateResults, m.UpgradeReport, m.SyncFiles, m.UpgradeErr, m.SyncErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame)
+		return screens.RenderUpgradeSyncWithWidth(m.UpdateResults, m.UpgradeReport, m.SyncFiles, m.UpgradeErr, m.SyncErr, m.OperationRunning, m.UpdateCheckDone, m.Cursor, m.SpinnerFrame, m.Width)
 	case ScreenUninstallMode:
 		return screens.RenderUninstallMode(m.Cursor)
 	case ScreenUninstall:
@@ -921,6 +1069,12 @@ func (m Model) View() string {
 		return screens.RenderOpenCodePlugins(m.Selection.OpenCodePlugins, m.Cursor)
 	case ScreenOpenCodePluginResult:
 		return screens.RenderOpenCodePluginResult(m.OpenCodePluginRegistrationResults, m.OpenCodePluginRegistrationErr)
+	case ScreenCommunityTools:
+		return screens.RenderCommunityTools(m.Selection.CommunityTools, m.Cursor, m.CommunityToolStatuses, m.CommunityToolStatusLoading, m.CommunityToolStatusErr)
+	case ScreenCommunityToolInstalling:
+		return screens.RenderCommunityToolInstalling(m.Selection.CommunityTools, screens.SpinnerChar(m.SpinnerFrame), m.CommunityToolStatuses)
+	case ScreenCommunityToolResult:
+		return screens.RenderCommunityToolResult(m.CommunityToolResults, m.CommunityToolErr)
 	case ScreenModelPicker:
 		return screens.RenderModelPicker(m.Selection.ModelAssignments, m.ModelPicker, m.Cursor)
 	case ScreenDependencyTree:
@@ -972,6 +1126,8 @@ func (m Model) View() string {
 		return screens.RenderABInstalling(engineName, m.SpinnerFrame, m.AgentBuilder.InstallErr)
 	case ScreenAgentBuilderComplete:
 		return screens.RenderABComplete(m.AgentBuilder.Generated, m.AgentBuilder.InstallResults)
+	case ScreenUpdatePrompt:
+		return screens.RenderUpdatePrompt(m.UpdateResults, m.Cursor, m.SpinnerFrame, m.UpdateCheckDone)
 	default:
 		return ""
 	}
@@ -999,6 +1155,17 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.Screen == ScreenProfileCreate && m.ProfileCreateStep == 1 &&
+		m.ModelPicker.Mode == screens.ModePhaseList && keyStr == "backspace" &&
+		len(m.ModelPicker.AvailableIDs) > 0 {
+		rows := screens.ModelPickerRowsForProfile()
+		if m.Cursor < len(rows) && m.Cursor != screens.SeparatorRowIdx() {
+			m.ModelPicker.SelectedPhaseIdx = m.Cursor
+			m.Selection.ModelAssignments = screens.ClearModelPickerAssignment(&m.ModelPicker, m.Selection.ModelAssignments)
+			return m, nil
+		}
+	}
+
 	if m.Screen == ScreenClaudeModelPicker {
 		wasInCustomMode := m.ClaudeModelPicker.InCustomMode
 		previousMode := m.ClaudeModelPicker.Mode
@@ -1022,33 +1189,8 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
-				} else if m.shouldShowKiroModelPickerScreen() {
-					m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
-					m.setScreen(ScreenKiroModelPicker)
-				} else if m.shouldShowCodexModelPickerScreen() {
-					m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
-					m.setScreen(ScreenCodexModelPicker)
-				} else if m.shouldShowSDDModeScreen() {
-					m.setScreen(ScreenSDDMode)
-				} else if m.Selection.Preset == model.PresetCustom {
-					// Custom preset: dependency plan was already built before model picker.
-					// Check StrictTDD, then skill picker before going to review.
-					if m.shouldShowStrictTDDScreen() {
-						m.setScreen(ScreenStrictTDD)
-					} else if m.shouldShowSkillPickerScreen() {
-						if len(m.SkillPicker) == 0 {
-							m.initSkillPicker()
-						}
-						m.setScreen(ScreenSkillPicker)
-					} else {
-						m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
-						m.setScreen(ScreenReview)
-					}
-				} else if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
-				} else {
-					m.buildDependencyPlan()
-					m.setScreen(ScreenDependencyTree)
+				} else if next, ok := m.pickerNextScreen(); ok {
+					m.advanceToNextPickerScreen(next)
 				}
 			}
 			return m, nil
@@ -1072,28 +1214,8 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
-				} else if m.shouldShowCodexModelPickerScreen() {
-					m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
-					m.setScreen(ScreenCodexModelPicker)
-				} else if m.shouldShowSDDModeScreen() {
-					m.setScreen(ScreenSDDMode)
-				} else if m.Selection.Preset == model.PresetCustom {
-					if m.shouldShowStrictTDDScreen() {
-						m.setScreen(ScreenStrictTDD)
-					} else if m.shouldShowSkillPickerScreen() {
-						if len(m.SkillPicker) == 0 {
-							m.initSkillPicker()
-						}
-						m.setScreen(ScreenSkillPicker)
-					} else {
-						m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
-						m.setScreen(ScreenReview)
-					}
-				} else if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
-				} else {
-					m.buildDependencyPlan()
-					m.setScreen(ScreenDependencyTree)
+				} else if next, ok := m.pickerNextScreen(); ok {
+					m.advanceToNextPickerScreen(next)
 				}
 			}
 			return m, nil
@@ -1149,29 +1271,19 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)
-				} else if m.shouldShowSDDModeScreen() {
-					m.setScreen(ScreenSDDMode)
-				} else if m.Selection.Preset == model.PresetCustom {
-					if m.shouldShowStrictTDDScreen() {
-						m.setScreen(ScreenStrictTDD)
-					} else if m.shouldShowSkillPickerScreen() {
-						if len(m.SkillPicker) == 0 {
-							m.initSkillPicker()
-						}
-						m.setScreen(ScreenSkillPicker)
-					} else {
-						m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
-						m.setScreen(ScreenReview)
-					}
-				} else if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
-				} else {
-					m.buildDependencyPlan()
-					m.setScreen(ScreenDependencyTree)
+				} else if next, ok := m.pickerNextScreen(); ok {
+					m.advanceToNextPickerScreen(next)
 				}
 			}
 			return m, nil
 		}
+	}
+
+	// ScreenUpdatePrompt has its own dedicated key handlers that take priority
+	// over the generic navigation below. All three actions (u/v/c) are handled
+	// here so the generic enter/esc/up/down logic is bypassed for this screen.
+	if m.Screen == ScreenUpdatePrompt {
+		return m.handleUpdatePromptKey(keyStr)
 	}
 
 	switch keyStr {
@@ -1201,7 +1313,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		// Skip separator row in model picker — it is not selectable.
-		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() && m.Cursor > 0 {
+		if m.shouldSkipModelPickerSeparator() && m.Cursor == screens.SeparatorRowIdx() && m.Cursor > 0 {
 			m.Cursor--
 		}
 		return m, nil
@@ -1225,7 +1337,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		// Skip separator row in model picker — it is not selectable.
-		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() {
+		if m.shouldSkipModelPickerSeparator() && m.Cursor == screens.SeparatorRowIdx() {
 			if m.Cursor+1 < count {
 				m.Cursor++
 			}
@@ -1248,7 +1360,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		// Skip separator row in model picker — it is not selectable.
-		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() && m.Cursor > 0 {
+		if m.shouldSkipModelPickerSeparator() && m.Cursor == screens.SeparatorRowIdx() && m.Cursor > 0 {
 			m.Cursor--
 		}
 		return m, nil
@@ -1267,7 +1379,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		// Skip separator row in model picker — it is not selectable.
-		if m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile && m.Cursor == screens.SeparatorRowIdx() {
+		if m.shouldSkipModelPickerSeparator() && m.Cursor == screens.SeparatorRowIdx() {
 			if m.Cursor+1 < count {
 				m.Cursor++
 			}
@@ -1275,7 +1387,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "esc":
 		// Don't allow going back while pipeline is running.
-		if m.Screen == ScreenInstalling && m.pipelineRunning {
+		if (m.Screen == ScreenInstalling && m.pipelineRunning) || m.Screen == ScreenCommunityToolInstalling {
 			return m, nil
 		}
 		if _, ok := m.GentleAIUpgradeVersion(); ok {
@@ -1304,6 +1416,8 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.toggleCurrentSkill()
 		case ScreenOpenCodePlugins:
 			m.toggleCurrentOpenCodePlugin()
+		case ScreenCommunityTools:
+			m.toggleCurrentCommunityTool()
 		}
 		return m, nil
 	case "r":
@@ -1365,11 +1479,20 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) shouldSkipModelPickerSeparator() bool {
+	if len(m.ModelPicker.AvailableIDs) == 0 {
+		return false
+	}
+	return (m.Screen == ScreenModelPicker && !m.ModelPicker.ForProfile) ||
+		(m.Screen == ScreenProfileCreate && m.ProfileCreateStep == 1 && m.ModelPicker.Mode == screens.ModePhaseList)
+}
+
 func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 	switch m.Screen {
 	case ScreenWelcome:
 		switch m.Cursor {
 		case 0:
+			m.InstallFlowActive = true
 			m.setScreen(ScreenDetection)
 		case 1:
 			m = m.withResetOperationState()
@@ -1434,6 +1557,19 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			if m.Cursor == next {
 				m.setScreen(ScreenUninstallMode)
 				return m, nil
+			}
+			next++
+
+			if m.Cursor == next {
+				m.CommunityToolsStandalone = true
+				m.CommunityToolResults = nil
+				m.CommunityToolErr = nil
+				m.CommunityToolStatuses = nil
+				m.CommunityToolStatusErr = nil
+				m.CommunityToolStatusLoading = true
+				m.Selection.CommunityTools = nil
+				m.setScreen(ScreenCommunityTools)
+				return m, m.startCommunityToolStatusDetection()
 			}
 			next++
 
@@ -1765,27 +1901,23 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				componentsForPreset(options[m.Cursor], m.Selection.Persona),
 				m.Selection.Agents,
 			)
-			if m.shouldShowClaudeModelPickerScreen() {
-				m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments))
-				m.setScreen(ScreenClaudeModelPicker)
+			// Enter the conditional picker chain through the single source of
+			// truth. pickerNextScreen(ScreenPreset) returns the first chain member
+			// for the current selection (Claude → Kiro → Codex → SDDMode →
+			// ModelPicker → StrictTDD); applyPickerEntry initializes its state.
+			// DependencyTree is the slice's terminal anchor, not a "picker": when
+			// it is the only next member, no SDD/picker screen applies, so fall
+			// through to the OpenCodePlugins guard below.
+			if next, ok := m.pickerNextScreen(); ok && next != ScreenDependencyTree {
+				m.applyPickerEntry(next)
 				return m, nil
 			}
-			if m.shouldShowKiroModelPickerScreen() {
-				m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
-				m.setScreen(ScreenKiroModelPicker)
-				return m, nil
-			}
-			if m.shouldShowCodexModelPickerScreen() {
-				m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
-				m.setScreen(ScreenCodexModelPicker)
-				return m, nil
-			}
-			if m.shouldShowSDDModeScreen() {
-				m.setScreen(ScreenSDDMode)
-				return m, nil
-			}
-			if m.shouldShowStrictTDDScreen() {
-				m.setScreen(ScreenStrictTDD)
+			// No picker/SDDMode/StrictTDD applies. CommunityTools and OpenCodePlugins
+			// are NOT in the slice (OpenCode's predicate reads m.Screen); optional
+			// setup screens are offered before the dependency tree. The community
+			// tools guard must stay AFTER pickerNextScreen so SDD reaches SDDMode first.
+			if m.shouldShowCommunityToolsScreen() {
+				m.setScreen(ScreenCommunityTools)
 				return m, nil
 			}
 			if m.shouldShowOpenCodePluginsScreen() {
@@ -1801,16 +1933,14 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 	case ScreenClaudeModelPicker:
 		if !m.ClaudeModelPicker.InCustomMode && m.Cursor == screens.ClaudeModelPickerOptionCount(m.ClaudeModelPicker)-1 {
 			// "Back" option: in ModelConfigMode return to the config menu,
-			// otherwise navigate to the previous install-flow screen.
+			// otherwise use pickerPreviousScreen for unified reverse navigation.
 			if m.ModelConfigMode {
 				m.ModelConfigMode = false
 				m.setScreen(ScreenModelConfig)
 				return m, nil
 			}
-			if m.Selection.Preset == model.PresetCustom {
-				m.setScreen(ScreenDependencyTree)
-			} else {
-				m.setScreen(ScreenPreset)
+			if prev, ok := m.pickerPreviousScreen(); ok {
+				m.applyPickerEntry(prev)
 			}
 			return m, nil
 		}
@@ -1821,12 +1951,8 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.setScreen(ScreenModelConfig)
 				return m, nil
 			}
-			if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else if m.Selection.Preset == model.PresetCustom {
-				m.setScreen(ScreenDependencyTree)
-			} else {
-				m.setScreen(ScreenPreset)
+			if prev, ok := m.pickerPreviousScreen(); ok {
+				m.applyPickerEntry(prev)
 			}
 			return m, nil
 		}
@@ -1837,12 +1963,8 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.setScreen(ScreenModelConfig)
 				return m, nil
 			}
-			if m.shouldShowKiroModelPickerScreen() {
-				m.setScreen(ScreenKiroModelPicker)
-			} else if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else {
-				m.setScreen(ScreenPreset)
+			if prev, ok := m.pickerPreviousScreen(); ok {
+				m.applyPickerEntry(prev)
 			}
 			return m, nil
 		}
@@ -1851,54 +1973,26 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		if m.Cursor < len(options) {
 			m.Selection.SDDMode = options[m.Cursor]
 			if m.Selection.SDDMode == model.SDDModeMulti {
-				cachePath := opencode.DefaultCachePath()
-				m.ModelPicker = screens.NewModelPickerState(cachePath, opencode.DefaultSettingsPath())
+				// SDDModeMulti: initialize ModelPicker explicitly and transition to it.
+				// pickerFlowSlice includes ScreenModelPicker only when SDDMode==Multi AND
+				// cache is present; we always show ModelPicker here (even cache-absent)
+				// because the user may have custom providers in opencode.json.
+				m.ModelPicker = screens.NewModelPickerState(opencode.DefaultCachePath(), opencode.DefaultSettingsPath())
 				m.Selection.ModelAssignments = nil
 				m.setScreen(ScreenModelPicker)
 				return m, nil
 			}
 			// Clear assignments for single mode.
 			m.Selection.ModelAssignments = nil
-			// Show StrictTDD screen when OpenCode + SDD are selected.
-			// This is the next step before the dependency tree.
-			if m.shouldShowSDDModeScreen() {
-				m.setScreen(ScreenStrictTDD)
-				return m, nil
-			}
-			if m.Selection.Preset == model.PresetCustom {
-				// Custom preset: dependency plan was already built before SDD mode.
-				// Check skill picker before going to review.
-				if m.shouldShowSkillPickerScreen() {
-					if len(m.SkillPicker) == 0 {
-						m.initSkillPicker()
-					}
-					m.setScreen(ScreenSkillPicker)
-				} else {
-					m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
-					m.setScreen(ScreenReview)
-				}
-			} else {
-				m.buildDependencyPlan()
-				m.setScreen(ScreenDependencyTree)
+			// Use pickerNextScreen to advance through the remaining slice.
+			if next, ok := m.pickerNextScreen(); ok {
+				m.advanceToNextPickerScreen(next)
 			}
 			return m, nil
 		}
-		// Back — in custom preset, return to ClaudeModelPicker if applicable,
-		// otherwise DependencyTree (component selector).
-		// NOTE: SDDMode back logic is also in goBack() — keep in sync.
-		if m.Selection.Preset == model.PresetCustom {
-			if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else {
-				m.setScreen(ScreenDependencyTree)
-			}
-		} else {
-			// NOTE: Back logic also in goBack() — keep in sync.
-			if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else {
-				m.setScreen(ScreenPreset)
-			}
+		// Back — use pickerPreviousScreen for unified reverse navigation.
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
 		}
 	case ScreenModelPicker:
 		// When no providers are detected the screen offers Continue with defaults
@@ -1910,10 +2004,13 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Continue with OpenCode defaults when no providers are available yet.
-			if m.Selection.Preset == model.PresetCustom {
-				if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
-				} else if m.shouldShowSkillPickerScreen() {
+			// ScreenModelPicker may not be in the picker slice when the cache is absent
+			// (pickerFlowSlice gates ModelPicker on SDDMode==Multi AND cache present).
+			// Fall back to explicit predicate checks to find the correct next screen.
+			if m.shouldShowStrictTDDScreen() {
+				m.setScreen(ScreenStrictTDD)
+			} else if m.Selection.Preset == model.PresetCustom {
+				if m.shouldShowSkillPickerScreen() {
 					if len(m.SkillPicker) == 0 {
 						m.initSkillPicker()
 					}
@@ -1922,11 +2019,16 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 					m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
 					m.setScreen(ScreenReview)
 				}
-			} else if m.shouldShowStrictTDDScreen() {
-				m.setScreen(ScreenStrictTDD)
 			} else {
-				m.buildDependencyPlan()
-				m.setScreen(ScreenDependencyTree)
+				if m.shouldShowCommunityToolsScreen() {
+					m.setScreen(ScreenCommunityTools)
+				} else if m.shouldShowOpenCodePluginsScreen() {
+					m.initDefaultOpenCodePlugins()
+					m.setScreen(ScreenOpenCodePlugins)
+				} else {
+					m.buildDependencyPlan()
+					m.setScreen(ScreenDependencyTree)
+				}
 			}
 			return m, nil
 		}
@@ -1957,48 +2059,31 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.setScreen(ScreenSync)
 				return m, nil
 			}
-			if m.Selection.Preset == model.PresetCustom {
-				// Custom preset: dependency plan was already built before SDD mode.
-				// Check StrictTDD, then skill picker before going to review.
-				if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
-				} else if m.shouldShowSkillPickerScreen() {
-					if len(m.SkillPicker) == 0 {
-						m.initSkillPicker()
-					}
-					m.setScreen(ScreenSkillPicker)
-				} else {
-					m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
-					m.setScreen(ScreenReview)
-				}
-			} else {
-				// Continue -> check StrictTDD before dependency tree.
-				if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
-				} else {
-					m.buildDependencyPlan()
-					m.setScreen(ScreenDependencyTree)
-				}
+			// Continue → advance to next screen in the picker slice.
+			if next, ok := m.pickerNextScreen(); ok {
+				m.advanceToNextPickerScreen(next)
 			}
 			return m, nil
 		}
-		// Back -> return to SDDMode (or ModelConfig in shortcut mode).
-		// ModelPicker sits BETWEEN SDDMode and StrictTDD in the forward flow:
-		//   SDDMode → ModelPicker → StrictTDD → DependencyTree
-		// So Back from ModelPicker must go to SDDMode, NOT StrictTDD
-		// (going to StrictTDD would create a loop: ModelPicker ↔ StrictTDD).
+		// Back → ModelConfigMode early-return, then pickerPreviousScreen (SDDMode).
 		if m.ModelConfigMode {
 			m.ModelConfigMode = false
 			m.setScreen(ScreenModelConfig)
 			return m, nil
 		}
-		m.setScreen(ScreenSDDMode)
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
+		}
 	case ScreenStrictTDD:
 		options := screens.StrictTDDOptions()
 		if m.Cursor < len(options) {
 			// Enable is index 0, Disable is index 1.
 			m.Selection.StrictTDD = (m.Cursor == screens.StrictTDDOptionEnable)
-			if m.shouldShowOpenCodePluginsScreen() {
+			if m.shouldShowCommunityToolsScreen() {
+				// Early-return guard: CommunityTools is outside the picker slice.
+				m.setScreen(ScreenCommunityTools)
+			} else if m.shouldShowOpenCodePluginsScreen() {
+				// Early-return guard: OpenCodePlugins is outside the picker slice.
 				m.initDefaultOpenCodePlugins()
 				m.setScreen(ScreenOpenCodePlugins)
 			} else if m.Selection.Preset == model.PresetCustom {
@@ -2013,30 +2098,17 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 					m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
 					m.setScreen(ScreenReview)
 				}
-			} else {
+			} else if next, ok := m.pickerNextScreen(); ok {
+				// Non-custom: advance to the next screen in the picker slice
+				// (always DependencyTree for StrictTDD, the last non-custom anchor).
 				m.buildDependencyPlan()
-				m.setScreen(ScreenDependencyTree)
+				m.applyPickerEntry(next)
 			}
 			return m, nil
 		}
-		// Back — depends on which flow brought us here.
-		if m.shouldShowSDDModeScreen() {
-			// OpenCode path: ModelPicker (if multi + cache) or SDDMode.
-			if m.Selection.SDDMode == model.SDDModeMulti {
-				cachePath := opencode.DefaultCachePath()
-				if _, err := osStatModelCache(cachePath); err == nil {
-					m.setScreen(ScreenModelPicker)
-					return m, nil
-				}
-			}
-			m.setScreen(ScreenSDDMode)
-		} else if m.shouldShowClaudeModelPickerScreen() {
-			m.setScreen(ScreenClaudeModelPicker)
-		} else if m.Selection.Preset == model.PresetCustom {
-			// Custom preset: DependencyTree is the component selector that precedes StrictTDD.
-			m.setScreen(ScreenDependencyTree)
-		} else {
-			m.setScreen(ScreenPreset)
+		// Back — use pickerPreviousScreen for unified reverse navigation.
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
 		}
 	case ScreenOpenCodePlugins:
 		return m.confirmOpenCodePlugins()
@@ -2047,6 +2119,18 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		m.OpenCodePluginRegistrationErr = nil
 		m.setScreen(ScreenWelcome)
 		return m, nil
+	case ScreenCommunityTools:
+		return m.confirmCommunityTools()
+	case ScreenCommunityToolResult:
+		m.CommunityToolsStandalone = false
+		m.Selection.CommunityTools = nil
+		m.CommunityToolStatuses = nil
+		m.CommunityToolStatusErr = nil
+		m.CommunityToolStatusLoading = false
+		m.CommunityToolResults = nil
+		m.CommunityToolErr = nil
+		m.setScreen(ScreenWelcome)
+		return m, nil
 	case ScreenDependencyTree:
 		if m.Selection.Preset == model.PresetCustom {
 			allComps := screens.AllComponents()
@@ -2055,18 +2139,17 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.toggleCurrentComponent()
 			case m.Cursor == len(allComps):
 				m.buildDependencyPlan()
-				// Show model picker screens if needed (components are now set).
-				if m.shouldShowClaudeModelPickerScreen() {
-					m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments))
-					m.setScreen(ScreenClaudeModelPicker)
+				// Advance to the next screen in the picker slice.
+				// applyPickerEntry handles Claude/Kiro/Codex-first paths correctly,
+				// initializing each picker's state regardless of which agent is first.
+				if next, ok := m.pickerNextScreen(); ok {
+					m.applyPickerEntry(next)
 					return m, nil
 				}
-				if m.shouldShowSDDModeScreen() {
-					m.setScreen(ScreenSDDMode)
-					return m, nil
-				}
-				if m.shouldShowStrictTDDScreen() {
-					m.setScreen(ScreenStrictTDD)
+				// No slice member after DependencyTree (no picker agents selected):
+				// check for CommunityTools guard, SkillPicker, or fall to Review.
+				if m.shouldShowCommunityToolsScreen() {
+					m.setScreen(ScreenCommunityTools)
 					return m, nil
 				}
 				if m.shouldShowOpenCodePluginsScreen() {
@@ -2074,7 +2157,6 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 					m.setScreen(ScreenOpenCodePlugins)
 					return m, nil
 				}
-				// Show skill picker if Skills component is selected.
 				if m.shouldShowSkillPickerScreen() {
 					if len(m.SkillPicker) == 0 {
 						m.initSkillPicker()
@@ -2094,27 +2176,23 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			m.setScreen(ScreenReview)
 			return m, nil
 		}
-		// NOTE: Back logic also in goBack() — keep in sync.
+		// Non-custom Back: mirrors goBack (Esc) — isPiOnlyAgents early check,
+		// then optional setup guards (outside the slice), then pickerPreviousScreen.
+		// INV-2: Enter-on-Back and Esc must produce identical results.
 		if isPiOnlyAgents(m.Selection.Agents) {
 			m.setScreen(ScreenAgents)
-		} else if m.shouldShowStrictTDDScreen() {
-			// StrictTDD screen is between ModelPicker/SDDMode and DependencyTree.
-			m.setScreen(ScreenStrictTDD)
-		} else if m.shouldShowSDDModeScreen() {
-			if m.Selection.SDDMode == model.SDDModeMulti {
-				cachePath := opencode.DefaultCachePath()
-				if _, err := osStatModelCache(cachePath); err == nil {
-					m.setScreen(ScreenModelPicker)
-				} else {
-					m.setScreen(ScreenSDDMode)
-				}
-			} else {
-				m.setScreen(ScreenSDDMode)
-			}
-		} else if m.shouldShowClaudeModelPickerScreen() {
-			m.setScreen(ScreenClaudeModelPicker)
-		} else {
-			m.setScreen(ScreenPreset)
+		} else if m.shouldShowOpenCodePluginsScreen() {
+			// OpenCodePlugins sits between CommunityTools and DependencyTree.
+			m.initDefaultOpenCodePlugins()
+			m.setScreen(ScreenOpenCodePlugins)
+		} else if m.shouldShowCommunityToolsScreen() {
+			// CommunityTools sits between the picker chain and DependencyTree in
+			// the actual flow but is NOT in pickerFlowSlice. Check it so
+			// Enter-on-Back matches Esc behavior (INV-2).
+			m.setScreen(ScreenCommunityTools)
+		} else if prev, ok := m.pickerPreviousScreen(); ok {
+			// No OpenCode; step back through the picker slice.
+			m.applyPickerEntry(prev)
 		}
 	case ScreenSkillPicker:
 		allSkills := screens.AllSkillsOrdered()
@@ -2306,6 +2384,24 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		}
 	case ScreenAgentBuilderComplete:
 		m.setScreen(ScreenWelcome)
+	case ScreenUpdatePrompt:
+		// Cursor maps to: 0=Update now, 1=View changes, 2=Keep current version.
+		// Enter always confirms the currently highlighted option.
+		// Direct key presses (u/v/c) are handled separately in handleUpdatePromptKey.
+		switch m.Cursor {
+		case 0: // Update now — guard against duplicate/concurrent upgrades.
+			if m.OperationRunning {
+				return m, nil
+			}
+			m.OperationRunning = true
+			m.OperationMode = "upgrade"
+			m.setScreen(ScreenUpgrade)
+			return m, tea.Batch(tickCmd(), m.startUpgrade())
+		case 1: // View changes
+			return m.openUpdateReleaseURL()
+		default: // Keep current version (cursor=2) or any other position
+			m.setScreen(ScreenWelcome)
+		}
 	}
 
 	return m, nil
@@ -2317,8 +2413,8 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 	m.setScreen(ScreenInstalling)
 	m.SpinnerFrame = 0
 
-	// Build progress labels from the resolved plan.
-	labels := buildProgressLabels(m.DependencyPlan)
+	// Build progress labels from the resolved plan and selected tools.
+	labels := buildProgressLabels(m.DependencyPlan, m.Selection.CommunityTools)
 	if len(labels) == 0 {
 		// Fallback labels when the plan is empty (dev/test).
 		labels = []string{
@@ -2418,6 +2514,78 @@ func (m Model) withResetUninstallState() Model {
 	return m
 }
 
+// handleUpdatePromptKey processes key events on ScreenUpdatePrompt.
+//
+// Key bindings:
+//
+//	up / down → move cursor through the three options (wraps around)
+//	enter     → confirm the currently highlighted option (cursor-driven)
+//	u         → shortcut: run upgrade regardless of cursor position
+//	v         → shortcut: open release notes URL in browser; fallback: print URL; stay on screen
+//	c         → shortcut: keep current version (go to Welcome) regardless of cursor
+//	q, ctrl+c → quit
+func (m Model) handleUpdatePromptKey(keyStr string) (tea.Model, tea.Cmd) {
+	const optCount = 3
+	switch keyStr {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "up":
+		if m.Cursor > 0 {
+			m.Cursor--
+		} else {
+			m.Cursor = optCount - 1
+		}
+		return m, nil
+	case "down":
+		if m.Cursor+1 < optCount {
+			m.Cursor++
+		} else {
+			m.Cursor = 0
+		}
+		return m, nil
+	case "enter":
+		// Confirm the highlighted option — same as confirmSelection() for this screen.
+		return m.confirmSelection()
+	case "u":
+		// Guard against duplicate/concurrent upgrades — mirrors ScreenUpgrade behavior.
+		if m.OperationRunning {
+			return m, nil
+		}
+		m.OperationRunning = true
+		m.OperationMode = "upgrade"
+		m.setScreen(ScreenUpgrade)
+		return m, tea.Batch(tickCmd(), m.startUpgrade())
+	case "v":
+		return m.openUpdateReleaseURL()
+	case "c":
+		m.setScreen(ScreenWelcome)
+		return m, nil
+	}
+	return m, nil
+}
+
+// openUpdateReleaseURL attempts to open the release notes URL for the first
+// available update result in the default system browser. When the browser cannot
+// be opened the URL is printed to stdout as a fallback. The screen stays on
+// ScreenUpdatePrompt in both cases (the user may still choose to update or keep).
+func (m Model) openUpdateReleaseURL() (tea.Model, tea.Cmd) {
+	var releaseURL string
+	for _, r := range m.UpdateResults {
+		if r.Status == update.UpdateAvailable && r.ReleaseURL != "" {
+			releaseURL = r.ReleaseURL
+			break
+		}
+	}
+	if releaseURL != "" {
+		if err := tuiOpenBrowserFn(releaseURL); err != nil {
+			// Fallback: print the URL so the user can open it manually.
+			fmt.Println("Release notes:", releaseURL)
+		}
+	}
+	// Stay on ScreenUpdatePrompt so the user can still choose to update or keep.
+	return m, nil
+}
+
 // startUpgrade launches the upgrade goroutine and returns a tea.Cmd.
 func (m Model) startUpgrade() tea.Cmd {
 	upgradeFn := m.UpgradeFn
@@ -2459,6 +2627,82 @@ func (m Model) startOpenCodePluginRegistration() tea.Cmd {
 		}
 		return OpenCodePluginRegistrationDoneMsg{Results: results}
 	}
+}
+
+func (m Model) startCommunityToolInstallation() tea.Cmd {
+	tools := append([]model.CommunityToolID(nil), m.Selection.CommunityTools...)
+	workspaceDir, _ := osGetwdFn()
+	runner := communitytool.RunnerFunc(runCommunityToolCommand)
+	return func() tea.Msg {
+		results := make([]communitytool.Result, 0, len(tools))
+		for _, tool := range tools {
+			result, err := communityToolInstallFn(tool, workspaceDir, runner)
+			if err != nil {
+				if hasCommunityToolResultContext(result) {
+					results = append(results, result)
+				}
+				return CommunityToolInstallationDoneMsg{Results: results, Err: err}
+			}
+			results = append(results, result)
+		}
+		return CommunityToolInstallationDoneMsg{Results: results}
+	}
+}
+
+func (m Model) startCommunityToolStatusDetection() tea.Cmd {
+	tools := []model.CommunityToolID{model.CommunityToolCodeGraph}
+	home := homeDir()
+	detector := communitytool.DetectorFunc(func(name string) (string, error) {
+		path, err := exec.LookPath(name)
+		return path, err
+	})
+	return func() tea.Msg {
+		statuses := make([]communitytool.Status, 0, len(tools))
+		for _, tool := range tools {
+			statuses = append(statuses, communityToolStatusFn(tool, home, detector))
+		}
+		return CommunityToolStatusLoadedMsg{Statuses: statuses}
+	}
+}
+
+func communityToolStatusesFromResults(results []communitytool.Result, fallback []communitytool.Status) []communitytool.Status {
+	if len(results) == 0 {
+		return fallback
+	}
+	statuses := make([]communitytool.Status, 0, len(results))
+	for _, result := range results {
+		if result.StatusAfter != nil {
+			statuses = append(statuses, *result.StatusAfter)
+			continue
+		}
+		if result.StatusBefore != nil {
+			statuses = append(statuses, *result.StatusBefore)
+		}
+	}
+	if len(statuses) == 0 {
+		return fallback
+	}
+	return statuses
+}
+
+func hasCommunityToolResultContext(result communitytool.Result) bool {
+	return result.Tool != "" || len(result.CommandsRun) > 0 || len(result.ManualActions) > 0
+}
+
+func runCommunityToolCommand(name string, args ...string) error {
+	return executeExternalCommand(execCommandFn, name, args...)
+}
+
+func executeExternalCommand(commandFn func(string, ...string) *exec.Cmd, name string, args ...string) error {
+	cmd := commandFn(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(output) > 0 {
+			return fmt.Errorf("%w\noutput:\n%s", err, strings.TrimSpace(string(output)))
+		}
+		return err
+	}
+	return nil
 }
 
 func (m Model) startUninstall() tea.Cmd {
@@ -2581,6 +2825,24 @@ func (m Model) startUpgradeSync() tea.Cmd {
 
 	syncCmd := func() tea.Msg {
 		if gentleAIUpdated {
+			// Deferred sync (task 4.8): gentle-ai was upgraded in this session.
+			// Set PendingSync=true so the new binary runs sync on next launch
+			// instead of silently skipping it. Non-fatal if state write fails.
+			//
+			// No-clobber guard: only fall back to a fresh InstallState{} when
+			// the file is genuinely missing (ErrNotExist). Any other read error
+			// (e.g. corrupt JSON, permission denied) means an existing file is
+			// present — skip writing to avoid dropping installed_agents, model
+			// assignments, and other persisted fields.
+			if h := homeDir(); h != "" {
+				s, readErr := state.Read(h)
+				if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+					// File exists but unreadable/corrupt — skip to avoid clobber.
+				} else {
+					s.PendingSync = true
+					_ = state.Write(h, s)
+				}
+			}
 			return SyncDoneMsg{}
 		}
 		if syncFn == nil {
@@ -2635,8 +2897,8 @@ func (m Model) restoreBackup(manifest backup.Manifest) (tea.Model, tea.Cmd) {
 
 // buildProgressLabels creates step labels from the resolved plan that match
 // the step IDs the pipeline will produce.
-func buildProgressLabels(resolved planner.ResolvedPlan) []string {
-	labels := make([]string, 0, 2+len(resolved.Agents)+len(resolved.OrderedComponents)+1)
+func buildProgressLabels(resolved planner.ResolvedPlan, communityTools []model.CommunityToolID) []string {
+	labels := make([]string, 0, 3+len(resolved.Agents)+len(communityTools)+len(resolved.OrderedComponents))
 
 	labels = append(labels, "prepare:check-dependencies")
 	labels = append(labels, "prepare:backup-snapshot")
@@ -2644,6 +2906,10 @@ func buildProgressLabels(resolved planner.ResolvedPlan) []string {
 
 	for _, agent := range resolved.Agents {
 		labels = append(labels, "agent:"+string(agent))
+	}
+
+	for _, tool := range communityTools {
+		labels = append(labels, "community-tool:"+string(tool))
 	}
 
 	for _, component := range resolved.OrderedComponents {
@@ -2664,11 +2930,27 @@ func (m Model) goBack() Model {
 		return m
 	}
 
+	// Esc on the update prompt dismisses it and proceeds to Welcome
+	// (equivalent to "Keep current version").
+	if m.Screen == ScreenUpdatePrompt {
+		m.setScreen(ScreenWelcome)
+		return m
+	}
+
 	if m.Screen == ScreenOpenCodePluginResult {
 		m.OpenCodePluginsStandalone = false
 		m.Selection.OpenCodePlugins = nil
 		m.OpenCodePluginRegistrationResults = nil
 		m.OpenCodePluginRegistrationErr = nil
+		m.setScreen(ScreenWelcome)
+		return m
+	}
+
+	if m.Screen == ScreenCommunityToolResult {
+		m.CommunityToolsStandalone = false
+		m.Selection.CommunityTools = nil
+		m.CommunityToolResults = nil
+		m.CommunityToolErr = nil
 		m.setScreen(ScreenWelcome)
 		return m
 	}
@@ -2763,136 +3045,78 @@ func (m Model) goBack() Model {
 		return m
 	}
 
-	// If going back from DependencyTree and the SDDMode/ClaudeModelPicker/StrictTDD
-	// screens were shown BEFORE it (non-custom presets only), navigate to them.
-	// In custom mode these screens appear AFTER the dependency tree, so
-	// going back should return to the preset screen (handled by linearRoutes).
-	// NOTE: DependencyTree back logic also in confirmSelection() — keep in sync.
+	// Non-custom DependencyTree Esc: isPiOnlyAgents early check, then optional
+	// setup guards (outside the slice), then pickerPreviousScreen.
+	// INV-2: Esc and Enter-on-Back must produce identical results.
 	if m.Screen == ScreenDependencyTree && m.Selection.Preset != model.PresetCustom {
 		if isPiOnlyAgents(m.Selection.Agents) {
 			m.setScreen(ScreenAgents)
 			return m
 		}
 		if m.shouldShowOpenCodePluginsScreen() {
+			// OpenCodePlugins sits between CommunityTools and DependencyTree.
+			m.initDefaultOpenCodePlugins()
 			m.setScreen(ScreenOpenCodePlugins)
 			return m
 		}
-		if m.shouldShowStrictTDDScreen() {
-			// StrictTDD screen is between (SDDMode/ClaudeModelPicker/Preset) and DependencyTree.
-			m.setScreen(ScreenStrictTDD)
+		if m.shouldShowCommunityToolsScreen() {
+			// CommunityTools sits between the picker chain and DependencyTree but
+			// is NOT in pickerFlowSlice; check it so Esc matches Enter-on-Back.
+			m.setScreen(ScreenCommunityTools)
 			return m
 		}
-		if m.shouldShowClaudeModelPickerScreen() {
-			m.setScreen(ScreenClaudeModelPicker)
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			// No OpenCode; step back through the picker slice.
+			m.applyPickerEntry(prev)
 			return m
 		}
 	}
 
-	// Going back from ScreenStrictTDD depends on which flow brought us here:
-	//   - OpenCode flow: ModelPicker (multi + cache) → SDDMode
-	//   - ClaudeCode flow: ClaudeModelPicker
-	//   - Custom preset (other agents): DependencyTree (the component selector)
-	//   - Non-custom other agents: Preset
+	// goBack for picker flow screens: use pickerPreviousScreen for unified
+	// reverse navigation (StrictTDD, SDDMode, ClaudeModelPicker, KiroModelPicker,
+	// CodexModelPicker). The OpenCodePluginsStandalone guard is preserved as an
+	// early-return BEFORE the slice walk.
 	if m.Screen == ScreenStrictTDD {
-		if m.shouldShowSDDModeScreen() {
-			// OpenCode path: ModelPicker (if multi + cache) or SDDMode.
-			if m.Selection.SDDMode == model.SDDModeMulti {
-				cachePath := opencode.DefaultCachePath()
-				if _, err := osStatModelCache(cachePath); err == nil {
-					m.setScreen(ScreenModelPicker)
-					return m
-				}
-			}
-			m.setScreen(ScreenSDDMode)
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
 			return m
 		}
-		if m.shouldShowCodexModelPickerScreen() {
-			m.setScreen(ScreenCodexModelPicker)
-			return m
-		}
-		if m.shouldShowKiroModelPickerScreen() {
-			m.setScreen(ScreenKiroModelPicker)
-			return m
-		}
-		if m.shouldShowClaudeModelPickerScreen() {
-			m.setScreen(ScreenClaudeModelPicker)
-			return m
-		}
-		// Custom preset: DependencyTree is the component selector that precedes StrictTDD.
-		if m.Selection.Preset == model.PresetCustom {
-			m.setScreen(ScreenDependencyTree)
-			return m
-		}
-		// All other non-custom agents: go back to Preset selection.
-		m.setScreen(ScreenPreset)
-		return m
 	}
 
 	if m.Screen == ScreenOpenCodePlugins {
 		return m.goBackFromOpenCodePlugins()
 	}
 
-	// In custom preset, going back from SDDMode should return to ClaudeModelPicker
-	// if applicable, otherwise DependencyTree (the component selector).
-	// For non-custom, check if ClaudeModelPicker was shown first.
-	// NOTE: SDDMode back logic is also in confirmSelection — keep in sync.
+	if m.Screen == ScreenCommunityTools {
+		return m.goBackFromCommunityTools()
+	}
+
 	if m.Screen == ScreenSDDMode {
-		if m.Selection.Preset == model.PresetCustom {
-			if m.shouldShowKiroModelPickerScreen() {
-				m.setScreen(ScreenKiroModelPicker)
-			} else if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else {
-				m.setScreen(ScreenDependencyTree)
-			}
-			return m
-		}
-		if m.shouldShowKiroModelPickerScreen() {
-			m.setScreen(ScreenKiroModelPicker)
-			return m
-		}
-		if m.shouldShowClaudeModelPickerScreen() {
-			m.setScreen(ScreenClaudeModelPicker)
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
 			return m
 		}
 	}
 
-	// In custom preset, going back from ClaudeModelPicker should return to DependencyTree.
-	if m.Screen == ScreenClaudeModelPicker && m.Selection.Preset == model.PresetCustom {
-		m.setScreen(ScreenDependencyTree)
-		return m
+	if m.Screen == ScreenClaudeModelPicker {
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
+			return m
+		}
 	}
 
 	if m.Screen == ScreenKiroModelPicker {
-		if m.Selection.Preset == model.PresetCustom {
-			// Custom preset: Kiro → Claude (if present) → DependencyTree.
-			if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else {
-				m.setScreen(ScreenDependencyTree)
-			}
-		} else {
-			// Non-custom preset: Kiro → Claude (if present) → Preset.
-			// This keeps Esc consistent with Enter on "← Back".
-			if m.shouldShowClaudeModelPickerScreen() {
-				m.setScreen(ScreenClaudeModelPicker)
-			} else {
-				m.setScreen(ScreenPreset)
-			}
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
+			return m
 		}
-		return m
 	}
 
 	if m.Screen == ScreenCodexModelPicker {
-		// Codex picker back: Kiro (if present) → Claude (if present) → Preset.
-		if m.shouldShowKiroModelPickerScreen() {
-			m.setScreen(ScreenKiroModelPicker)
-		} else if m.shouldShowClaudeModelPickerScreen() {
-			m.setScreen(ScreenClaudeModelPicker)
-		} else {
-			m.setScreen(ScreenPreset)
+		if prev, ok := m.pickerPreviousScreen(); ok {
+			m.applyPickerEntry(prev)
+			return m
 		}
-		return m
 	}
 
 	// In custom preset, going back from Review walks through intermediate screens.
@@ -2949,6 +3173,11 @@ func (m *Model) setScreen(next Screen) {
 	m.PreviousScreen = m.Screen
 	m.Screen = next
 	m.Cursor = 0
+	// Safe default: start on "Keep current version" (index 2) so an accidental
+	// Enter press does not trigger an upgrade.
+	if next == ScreenUpdatePrompt {
+		m.Cursor = 2
+	}
 	if next == ScreenBackups {
 		m.BackupScroll = 0
 		m.PinErr = nil
@@ -3081,9 +3310,15 @@ func (m Model) optionCount() int {
 		return screens.OpenCodePluginsOptionCount()
 	case ScreenOpenCodePluginResult:
 		return 1
+	case ScreenCommunityTools:
+		return screens.CommunityToolsOptionCount()
+	case ScreenCommunityToolInstalling:
+		return 0
+	case ScreenCommunityToolResult:
+		return 1
 	case ScreenModelPicker:
 		if len(m.ModelPicker.AvailableIDs) == 0 {
-			return 2 // Continue with defaults + Back to SDD mode
+			return 2 // Continue with defaults + Back
 		}
 		return len(screens.ModelPickerRows()) + 2 // rows + Continue + Back
 	case ScreenDependencyTree:
@@ -3136,6 +3371,8 @@ func (m Model) optionCount() int {
 		return 0 // no cursor navigation while installing
 	case ScreenAgentBuilderComplete:
 		return 1 // Done
+	case ScreenUpdatePrompt:
+		return len(screens.UpdatePromptOptions()) // Update now / View changes / Keep current
 	default:
 		return 0
 	}
@@ -3304,6 +3541,108 @@ func (m *Model) toggleCurrentOpenCodePlugin() {
 	m.Selection.OpenCodePlugins = append(m.Selection.OpenCodePlugins, id)
 }
 
+func (m *Model) toggleCurrentCommunityTool() {
+	defs := communityToolDefinitions()
+	if m.Cursor%2 != 0 || m.Cursor/2 >= len(defs) {
+		return
+	}
+	id := defs[m.Cursor/2].ID
+	for idx, selected := range m.Selection.CommunityTools {
+		if selected == id {
+			m.Selection.CommunityTools = append(m.Selection.CommunityTools[:idx], m.Selection.CommunityTools[idx+1:]...)
+			return
+		}
+	}
+	m.Selection.CommunityTools = append(m.Selection.CommunityTools, id)
+}
+
+func (m Model) confirmCommunityTools() (tea.Model, tea.Cmd) {
+	defs := communityToolDefinitions()
+	toolRows := len(defs) * 2
+	switch {
+	case m.Cursor < toolRows && m.Cursor%2 == 0:
+		m.toggleCurrentCommunityTool()
+		return m, nil
+	case m.Cursor < toolRows && m.Cursor%2 == 1:
+		return m, openBrowserCmd(defs[m.Cursor/2].RepoURL)
+	case m.Cursor == toolRows:
+		if m.CommunityToolsStandalone {
+			m.CommunityToolResults = nil
+			m.CommunityToolErr = nil
+			m.OperationRunning = len(m.Selection.CommunityTools) > 0
+			if len(m.Selection.CommunityTools) == 0 {
+				m.setScreen(ScreenCommunityToolResult)
+				return m, nil
+			}
+			m.setScreen(ScreenCommunityToolInstalling)
+			return m, tea.Batch(m.startCommunityToolInstallation(), tickCmd())
+		}
+		return m.continueAfterCommunityTools(), nil
+	default:
+		return m.goBackFromCommunityTools(), nil
+	}
+}
+
+func (m Model) continueAfterCommunityTools() Model {
+	if m.shouldShowOpenCodePluginsScreen() {
+		m.initDefaultOpenCodePlugins()
+		m.setScreen(ScreenOpenCodePlugins)
+		return m
+	}
+	if m.Selection.Preset == model.PresetCustom {
+		if m.shouldShowSkillPickerScreen() {
+			if len(m.SkillPicker) == 0 {
+				m.initSkillPicker()
+			}
+			m.setScreen(ScreenSkillPicker)
+		} else {
+			m.Review = planner.BuildReviewPayload(m.Selection, m.DependencyPlan)
+			m.setScreen(ScreenReview)
+		}
+		return m
+	}
+	m.buildDependencyPlan()
+	m.setScreen(ScreenDependencyTree)
+	return m
+}
+
+func (m Model) goBackFromCommunityTools() Model {
+	if m.CommunityToolsStandalone {
+		m.CommunityToolsStandalone = false
+		m.Selection.CommunityTools = nil
+		m.CommunityToolResults = nil
+		m.CommunityToolErr = nil
+		m.setScreen(ScreenWelcome)
+		return m
+	}
+	if m.shouldShowStrictTDDScreen() {
+		m.setScreen(ScreenStrictTDD)
+		return m
+	}
+	if m.shouldShowSDDModeScreen() {
+		m.setScreen(ScreenSDDMode)
+		return m
+	}
+	if m.shouldShowCodexModelPickerScreen() {
+		m.setScreen(ScreenCodexModelPicker)
+		return m
+	}
+	if m.shouldShowKiroModelPickerScreen() {
+		m.setScreen(ScreenKiroModelPicker)
+		return m
+	}
+	if m.shouldShowClaudeModelPickerScreen() {
+		m.setScreen(ScreenClaudeModelPicker)
+		return m
+	}
+	if m.Selection.Preset == model.PresetCustom {
+		m.setScreen(ScreenDependencyTree)
+		return m
+	}
+	m.setScreen(ScreenPreset)
+	return m
+}
+
 func (m Model) confirmOpenCodePlugins() (tea.Model, tea.Cmd) {
 	defs := opencodepluginDefinitions()
 	pluginRows := len(defs) * 2
@@ -3367,6 +3706,10 @@ func (m Model) goBackFromOpenCodePlugins() Model {
 		return m
 	}
 
+	if m.shouldShowCommunityToolsScreen() {
+		m.setScreen(ScreenCommunityTools)
+		return m
+	}
 	if m.shouldShowStrictTDDScreen() {
 		m.setScreen(ScreenStrictTDD)
 		return m
@@ -3393,6 +3736,10 @@ func opencodepluginDefinitions() []model.OpenCodeCommunityPluginID {
 		out = append(out, def.ID)
 	}
 	return out
+}
+
+func communityToolDefinitions() []communitytool.Definition {
+	return communitytool.Definitions()
 }
 
 func opencodepluginRepoURLs() []string {
@@ -3448,6 +3795,10 @@ func (m Model) shouldShowOpenCodePluginsScreen() bool {
 	}
 
 	return true
+}
+
+func (m Model) shouldShowCommunityToolsScreen() bool {
+	return m.InstallFlowActive && !m.CommunityToolsStandalone
 }
 
 func (m *Model) buildDependencyPlan() {
@@ -3630,6 +3981,113 @@ func (m Model) shouldShowKiroModelPickerScreen() bool {
 func (m Model) shouldShowCodexModelPickerScreen() bool {
 	return m.Selection.HasAgent(model.AgentCodex) &&
 		hasSelectedComponent(m.Selection.Components, model.ComponentSDD)
+}
+
+// pickerFlowSlice returns the ordered conditional picker chain for the current
+// Selection, filtered by shouldShow* predicates. ScreenPreset is always the
+// first anchor. In non-custom mode ScreenDependencyTree is always the last
+// anchor. In custom mode ScreenDependencyTree is the second element (component
+// selector precedes pickers). The slice is rebuilt per call (≤8 elements —
+// trivial cost, no stale-state risk).
+//
+// Invariant: no predicate that reads m.Screen may be used here.
+// shouldShowOpenCodePluginsScreen is screen-sensitive and must NOT be included;
+// it remains an early-return guard at every call site.
+func (m Model) pickerFlowSlice() []Screen {
+	custom := m.Selection.Preset == model.PresetCustom
+	s := []Screen{ScreenPreset}
+	if custom {
+		// Custom preset: component selector (DependencyTree) precedes pickers.
+		s = append(s, ScreenDependencyTree)
+	}
+	if m.shouldShowClaudeModelPickerScreen() {
+		s = append(s, ScreenClaudeModelPicker)
+	}
+	if m.shouldShowKiroModelPickerScreen() {
+		s = append(s, ScreenKiroModelPicker)
+	}
+	if m.shouldShowCodexModelPickerScreen() {
+		s = append(s, ScreenCodexModelPicker)
+	}
+	if m.shouldShowSDDModeScreen() {
+		s = append(s, ScreenSDDMode)
+		if m.Selection.SDDMode == model.SDDModeMulti {
+			if _, err := osStatModelCache(opencode.DefaultCachePath()); err == nil {
+				s = append(s, ScreenModelPicker)
+			}
+		}
+	}
+	if m.shouldShowStrictTDDScreen() {
+		s = append(s, ScreenStrictTDD)
+	}
+	if !custom {
+		// Non-custom: DependencyTree is the last anchor.
+		s = append(s, ScreenDependencyTree)
+	}
+	return s
+}
+
+// pickerNextScreen returns the screen that follows m.Screen in the picker flow
+// slice. ok=false when m.Screen is not a chain member or is at the last
+// position (DependencyTree in non-custom, StrictTDD or last picker in custom).
+func (m Model) pickerNextScreen() (Screen, bool) {
+	slice := m.pickerFlowSlice()
+	for i, s := range slice {
+		if s == m.Screen && i < len(slice)-1 {
+			return slice[i+1], true
+		}
+	}
+	return 0, false
+}
+
+// pickerPreviousScreen returns the screen that precedes m.Screen in the picker
+// flow slice. ok=false when m.Screen is not a chain member or is at position 0
+// (ScreenPreset).
+func (m Model) pickerPreviousScreen() (Screen, bool) {
+	slice := m.pickerFlowSlice()
+	for i, s := range slice {
+		if s == m.Screen && i > 0 {
+			return slice[i-1], true
+		}
+	}
+	return 0, false
+}
+
+func (m *Model) advanceToNextPickerScreen(next Screen) {
+	if next == ScreenDependencyTree && m.shouldShowCommunityToolsScreen() {
+		m.setScreen(ScreenCommunityTools)
+		return
+	}
+	if next == ScreenDependencyTree && m.shouldShowOpenCodePluginsScreen() {
+		m.initDefaultOpenCodePlugins()
+		m.setScreen(ScreenOpenCodePlugins)
+		return
+	}
+	if next == ScreenDependencyTree {
+		m.buildDependencyPlan()
+	}
+	m.applyPickerEntry(next)
+}
+
+// applyPickerEntry initializes the target picker's state and transitions to it.
+// This is the single place that sets up picker-specific state (model selections,
+// presets) before calling setScreen. It handles every target a caller may
+// navigate to, including Kiro-first and Codex-first custom paths where Claude is
+// absent and navigation comes directly from ScreenDependencyTree.
+func (m *Model) applyPickerEntry(next Screen) {
+	switch next {
+	case ScreenClaudeModelPicker:
+		m.ClaudeModelPicker = screens.NewClaudeModelPickerStateFromPhaseAssignments(
+			claudePickerAssignments(m.Selection.ClaudeModelAssignments, m.Selection.ClaudePhaseAssignments),
+		)
+	case ScreenKiroModelPicker:
+		m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
+	case ScreenCodexModelPicker:
+		m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
+	case ScreenModelPicker:
+		m.ModelPicker = screens.NewModelPickerState(opencode.DefaultCachePath(), opencode.DefaultSettingsPath())
+	}
+	m.setScreen(next)
 }
 
 func componentsForPreset(preset model.PresetID, persona model.PersonaID) []model.ComponentID {
@@ -3826,9 +4284,27 @@ func (m Model) confirmProfileCreate() (tea.Model, tea.Cmd) {
 	case 1:
 		// Model assignment picker: orchestrator + all sub-agent phases in one screen.
 		// Reuse the same enter-on-row logic as ScreenModelPicker.
-		// Profile creation uses filtered rows (no JD agents).
+		// Profile creation uses the profile-specific row list.
+		if len(m.ModelPicker.AvailableIDs) == 0 {
+			switch m.Cursor {
+			case 0:
+				m.ProfileCreateStep = 2
+				m.Cursor = 0
+			case 1:
+				if m.ProfileEditMode {
+					m.setScreen(ScreenProfiles)
+				} else {
+					m.ProfileCreateStep = 0
+					m.Cursor = 0
+				}
+			}
+			return m, nil
+		}
 		rows := screens.ModelPickerRowsForProfile()
 		if m.Cursor < len(rows) {
+			if m.Cursor == screens.SeparatorRowIdx() {
+				return m, nil
+			}
 			// Enter sub-selection: pick provider then model.
 			m.ModelPicker.SelectedPhaseIdx = m.Cursor
 			m.ModelPicker.Mode = screens.ModeProviderSelect
@@ -3839,19 +4315,20 @@ func (m Model) confirmProfileCreate() (tea.Model, tea.Cmd) {
 		if m.Cursor == len(rows) {
 			// "Continue": extract orchestrator + phase assignments, advance to confirm.
 			assignments := sanitizeKnownModelEfforts(m.Selection.ModelAssignments, m.ModelPicker.SDDModels)
-			if assignments != nil {
-				// Extract orchestrator model.
+			m.ProfileDraft.OrchestratorModel = model.ModelAssignment{}
+			m.ProfileDraft.PhaseAssignments = nil
+			if len(assignments) > 0 {
 				if orch, ok := assignments[screens.SDDOrchestratorPhase]; ok {
 					m.ProfileDraft.OrchestratorModel = orch
 				}
-				// Copy all phase assignments (excluding orchestrator).
-				if m.ProfileDraft.PhaseAssignments == nil {
-					m.ProfileDraft.PhaseAssignments = make(map[string]model.ModelAssignment)
-				}
+				phaseAssignments := make(map[string]model.ModelAssignment)
 				for k, v := range assignments {
 					if k != screens.SDDOrchestratorPhase {
-						m.ProfileDraft.PhaseAssignments[k] = v
+						phaseAssignments[k] = v
 					}
+				}
+				if len(phaseAssignments) > 0 {
+					m.ProfileDraft.PhaseAssignments = phaseAssignments
 				}
 			}
 			m.ProfileCreateStep = 2
@@ -3955,7 +4432,10 @@ func (m Model) buildAgentBuilderAdapters() []agentbuilder.AdapterInfo {
 	return adapters
 }
 
-// homeDir returns the current user's home directory path.
+// homeDir returns the current user's home directory path, or "" if it cannot
+// be resolved. Callers that use the result for cooldown state must treat "" as
+// "no persistence" (always-check, never write) to avoid routing state under
+// /tmp or any other fallback path that could pollute unrelated sessions.
 func homeDir() string {
 	if h, err := os.UserHomeDir(); err == nil && h != "" {
 		return h
@@ -3963,7 +4443,7 @@ func homeDir() string {
 	if h := os.Getenv("HOME"); h != "" {
 		return h
 	}
-	return "/tmp"
+	return ""
 }
 
 // buildInstalledAgentIDs returns the list of AgentIDs from the adapter list.

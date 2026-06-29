@@ -18,6 +18,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agents/kimi"
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/components/communitytool"
 	"github.com/gentleman-programming/gentle-ai/internal/components/engram"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/mcp"
@@ -48,16 +49,23 @@ type InstallResult struct {
 }
 
 var (
-	osUserHomeDir       = os.UserHomeDir
-	osLookupEnv         = os.LookupEnv
-	osSetenv            = os.Setenv
-	osUnsetenv          = os.Unsetenv
-	osStat              = os.Stat
-	runCommand          = executeCommand
-	cmdLookPath         = exec.LookPath
-	streamCommandOutput = true
-	goEnv               = defaultGoEnv
-	detectDependencies  = system.DetectDependencies
+	osUserHomeDir        = os.UserHomeDir
+	osLookupEnv          = os.LookupEnv
+	osSetenv             = os.Setenv
+	osUnsetenv           = os.Unsetenv
+	osStat               = os.Stat
+	runCommand           = executeCommand
+	cmdLookPath          = exec.LookPath
+	streamCommandOutput  = true
+	goEnv                = defaultGoEnv
+	detectDependencies   = system.DetectDependencies
+	installCommunityTool = communitytool.Install
+	pathEnvEntries       = func(profile system.PlatformProfile) []string {
+		return splitPathForOS(os.Getenv("PATH"), profile.OS)
+	}
+	addUserPath         = system.AddToUserPath
+	ensureUserPathFirst = system.PrioritizeUserPath
+	userPathEntries     = system.UserPathEntries
 
 	// ggaAvailableCheck is an optional override for ggaAvailable behavior.
 	// When set, it is called instead of the default filesystem check.
@@ -65,7 +73,11 @@ var (
 
 	// engramDownloadFn is the function used to download the engram binary on non-brew platforms.
 	// Package-level var for testability — tests can replace this to avoid real HTTP calls.
-	engramDownloadFn = engram.DownloadLatestBinary
+	// Always uses the stable (release) path; beta channel at install time is handled
+	// separately via installBetaEngramFromMain.
+	engramDownloadFn = func(profile system.PlatformProfile) (string, error) {
+		return engram.DownloadLatestBinary(profile, false)
+	}
 
 	// AppVersion is the gentle-ai version that will be written into backup manifests.
 	// It is set by app.go before any CLI operation so that every backup created during
@@ -237,6 +249,22 @@ func withPostInstallNotes(report verify.Report, resolved planner.ResolvedPlan) v
 		report.FinalNote = report.FinalNote + "\n\nGGA is now installed globally. To enable project hooks, run in each repo:\n- gga init\n- gga install"
 	}
 	report = withGoInstallPathNote(report, resolved)
+	report = withOpenCodeExperimentalNote(report, resolved)
+	return report
+}
+
+// withOpenCodeExperimentalNote appends guidance to enable OpenCode
+// experimental features, but only when OpenCode is among the selected agents.
+// It only prints copy-paste guidance — it never writes to the user's shell
+// config — mirroring the engram PATH guidance pattern.
+func withOpenCodeExperimentalNote(report verify.Report, resolved planner.ResolvedPlan) verify.Report {
+	if !containsAgent(resolved.Agents, model.AgentOpenCode) {
+		return report
+	}
+	report.FinalNote = report.FinalNote + fmt.Sprintf(
+		"\n\nTo enable OpenCode experimental features, add this to your shell:\n  %s",
+		openCodeExperimentalGuidance(os.Getenv("SHELL")),
+	)
 	return report
 }
 
@@ -309,9 +337,10 @@ func goInstallBinDirFromGoEnv() (string, error) {
 	return "", fmt.Errorf("go env returned empty GOBIN and GOPATH")
 }
 
+const engramBetaGoInstallPackage = "github.com/Gentleman-Programming/engram/cmd/engram@main"
+
 func installBetaEngramFromMain() (string, error) {
-	const pkg = "github.com/Gentleman-Programming/engram/cmd/engram@main"
-	if err := runCommand("go", "install", pkg); err != nil {
+	if err := runCommand("go", "install", engramBetaGoInstallPackage); err != nil {
 		return "", err
 	}
 
@@ -432,7 +461,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 		},
 	}
 
-	apply := make([]pipeline.Step, 0, len(r.resolved.Agents)+len(r.resolved.OrderedComponents)+1)
+	apply := make([]pipeline.Step, 0, len(r.resolved.Agents)+len(r.selection.CommunityTools)+len(r.resolved.OrderedComponents)+1)
 	apply = append(apply, rollbackRestoreStep{id: "apply:rollback-restore", state: r.state})
 
 	// Before installing components, ensure modular agents have their system prompt hub.
@@ -452,6 +481,10 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 		for _, plugin := range r.selection.OpenCodePlugins {
 			apply = append(apply, openCodePluginInstallStep{id: "opencode-plugin:" + string(plugin), plugin: plugin, homeDir: r.homeDir})
 		}
+	}
+
+	for _, tool := range r.selection.CommunityTools {
+		apply = append(apply, communityToolInstallStep{id: "community-tool:" + string(tool), tool: tool, workspaceDir: r.workspaceDir})
 	}
 
 	for _, component := range r.resolved.OrderedComponents {
@@ -648,6 +681,22 @@ type componentApplyStep struct {
 	channel      InstallChannel
 }
 
+type communityToolInstallStep struct {
+	id           string
+	tool         model.CommunityToolID
+	workspaceDir string
+}
+
+func (s communityToolInstallStep) ID() string { return s.id }
+
+func (s communityToolInstallStep) Run() error {
+	_, err := installCommunityTool(s.tool, s.workspaceDir, communitytool.RunnerFunc(runCommand))
+	if err != nil {
+		return fmt.Errorf("install community tool %q: %w", s.tool, err)
+	}
+	return nil
+}
+
 func (s componentApplyStep) ID() string {
 	return s.id
 }
@@ -665,6 +714,74 @@ func resolveAdapters(agentIDs []model.AgentID) []agents.Adapter {
 	return adapters
 }
 
+func shouldRefreshWindowsEngram(profile system.PlatformProfile, resolvedPath string, pathEntries []string) bool {
+	if profile.OS != "windows" || profile.PackageManager == "brew" || strings.TrimSpace(resolvedPath) == "" {
+		return false
+	}
+	return len(engramBinaryDirsOnPath(pathEntries, profile.OS)) > 1
+}
+
+func ensureRepairableWindowsEngramShadowing(profile system.PlatformProfile, installedPath, managedDir string) error {
+	userEntries, err := userPathEntries(profile.OS)
+	if err != nil {
+		return fmt.Errorf("read user PATH: %w", err)
+	}
+
+	staleDir := filepath.Dir(installedPath)
+	if !pathEntriesContainDir(userEntries, staleDir) {
+		return fmt.Errorf("%s is not in the user PATH, so user-scoped PATH repair cannot guarantee future shells will resolve %s before %s", staleDir, managedDir, staleDir)
+	}
+
+	return nil
+}
+
+func pathEntriesContainDir(entries []string, dir string) bool {
+	dir = strings.Trim(strings.TrimSpace(dir), `"`)
+	if dir == "" {
+		return false
+	}
+	for _, entry := range entries {
+		entry = strings.Trim(strings.TrimSpace(entry), `"`)
+		if entry == "" {
+			continue
+		}
+		if strings.EqualFold(filepath.Clean(entry), filepath.Clean(dir)) {
+			return true
+		}
+	}
+	return false
+}
+
+func engramBinaryDirsOnPath(pathEntries []string, goos string) []string {
+	var dirs []string
+	for _, entry := range pathEntries {
+		entry = strings.Trim(strings.TrimSpace(entry), `"`)
+		if entry == "" {
+			continue
+		}
+		binaryName := "engram"
+		if goos == "windows" {
+			binaryName = "engram.exe"
+		}
+		candidate := filepath.Join(entry, binaryName)
+		if _, err := os.Stat(candidate); err == nil {
+			dirs = append(dirs, entry)
+		}
+	}
+	return dirs
+}
+
+func splitPathForOS(value, goos string) []string {
+	separator := string(os.PathListSeparator)
+	if goos == "windows" {
+		separator = ";"
+	}
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, separator)
+}
+
 func (s componentApplyStep) Run() error {
 	adapters := resolveAdapters(s.agents)
 
@@ -677,7 +794,7 @@ func (s componentApplyStep) Run() error {
 				return fmt.Errorf("install beta engram from main: %w", err)
 			}
 			engramCommand = binaryPath
-		} else if _, err := cmdLookPath("engram"); err != nil {
+		} else if installedPath, err := cmdLookPath("engram"); err != nil {
 			// Engram not on PATH — install it.
 			if s.profile.PackageManager == "brew" {
 				// macOS (or Linux with Homebrew): use brew tap + brew install.
@@ -699,11 +816,25 @@ func (s componentApplyStep) Run() error {
 				// (engram setup, engram.Inject → resolveEngramCommand) can find it.
 				// On Windows this also persists the change to the user registry via PowerShell.
 				binDir := filepath.Dir(binaryPath)
-				if err := system.AddToUserPath(binDir); err != nil {
+				if err := addUserPath(binDir); err != nil {
 					// Non-fatal: warn but continue — the binary was downloaded successfully.
 					fmt.Fprintf(os.Stderr, "WARNING: could not add %s to PATH: %v\n", binDir, err)
 				}
 			}
+		} else if shouldRefreshWindowsEngram(s.profile, installedPath, pathEnvEntries(s.profile)) {
+			binaryPath, err := engramDownloadFn(s.profile)
+			if err != nil {
+				return fmt.Errorf("refresh shadowed engram binary: %w", err)
+			}
+			engramCommand = binaryPath
+			binDir := filepath.Dir(binaryPath)
+			if err := ensureRepairableWindowsEngramShadowing(s.profile, installedPath, binDir); err != nil {
+				return fmt.Errorf("repair Windows Engram PATH shadowing: refreshed managed Engram at %s, but cannot safely repair PATH order: %w. Move %s before %s in your user PATH or remove the stale Machine/System PATH entry, then rerun install", binaryPath, err, binDir, filepath.Dir(installedPath))
+			}
+			if err := ensureUserPathFirst(binDir); err != nil {
+				return fmt.Errorf("repair Windows Engram PATH shadowing: refreshed managed Engram at %s, but could not move %s ahead of stale PATH entry %s: %w. Move %s before %s in your user PATH, then rerun install", binaryPath, binDir, installedPath, err, binDir, filepath.Dir(installedPath))
+			}
+			fmt.Fprintf(os.Stderr, "WARNING: multiple engram.exe entries were found on PATH and %s resolved first. Refreshed managed Engram at %s and moved %s ahead of the stale entry in the user PATH.\n", installedPath, binaryPath, binDir)
 		}
 		setupMode := engram.ParseSetupMode(os.Getenv(engram.SetupModeEnvVar))
 		setupStrict := engram.ParseSetupStrict(os.Getenv(engram.SetupStrictEnvVar))
@@ -821,10 +952,13 @@ func (s componentApplyStep) Run() error {
 			if err := gga.EnsurePowerShellShim(s.homeDir); err != nil {
 				return fmt.Errorf("ensure gga powershell shim: %w", err)
 			}
+			if err := gga.EnsureCommandShim(s.homeDir); err != nil {
+				return fmt.Errorf("ensure gga command shim: %w", err)
+			}
 			// Add GGA bin dir to the user PATH persistently on Windows.
 			// GGA's install.sh drops the binary into ~/bin which is not on PATH by default.
 			ggaBinDir := filepath.Join(s.homeDir, "bin")
-			if err := system.AddToUserPath(ggaBinDir); err != nil {
+			if err := addUserPath(ggaBinDir); err != nil {
 				// Non-fatal: warn but continue — GGA was installed successfully.
 				fmt.Fprintf(os.Stderr, "WARNING: could not add %s to PATH: %v\n", ggaBinDir, err)
 			}
@@ -1151,7 +1285,7 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 				if skills.IsSDDSkill(skillID) {
 					continue
 				}
-				path := skills.SkillPathForAgent(homeDir, adapter, skillID)
+				path := skills.SkillPathForAgent(targetDir, adapter, skillID)
 				if path != "" {
 					paths = append(paths, path)
 				}
@@ -1567,6 +1701,23 @@ func engramPathGuidance(shellPath string) string {
 		return fmt.Sprintf("echo 'export PATH=\"%s:$PATH\"' >> ~/.bashrc && source ~/.bashrc", binDir)
 	}
 	return fmt.Sprintf("Add %s to your shell PATH and restart the terminal.", binDir)
+}
+
+// openCodeExperimentalGuidance returns shell-aware copy-paste guidance to
+// persist OPENCODE_EXPERIMENTAL=true. It only produces a command string and
+// never writes to the user's shell config files.
+func openCodeExperimentalGuidance(shellPath string) string {
+	if strings.Contains(shellPath, "fish") {
+		return "set -Ux OPENCODE_EXPERIMENTAL true"
+	}
+	if strings.Contains(shellPath, "zsh") {
+		return "echo 'export OPENCODE_EXPERIMENTAL=true' >> ~/.zshrc && source ~/.zshrc"
+	}
+	if strings.Contains(shellPath, "bash") {
+		return "echo 'export OPENCODE_EXPERIMENTAL=true' >> ~/.bashrc && source ~/.bashrc"
+	}
+	return "Set the OPENCODE_EXPERIMENTAL=true environment variable " +
+		"(on Windows PowerShell: [Environment]::SetEnvironmentVariable('OPENCODE_EXPERIMENTAL','true','User'))."
 }
 
 // checkDependenciesStep verifies that required system dependencies are present.

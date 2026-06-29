@@ -40,6 +40,14 @@ var (
 		p := tea.NewProgram(m, opts...)
 		return p.Run()
 	}
+	// deferredSyncFn is the function called when PendingSync=true is found on
+	// launch. Swappable for tests; production value calls cli.RunSync directly.
+	// cli.RunSync is idempotent (re-reads state + re-applies configs each call),
+	// so retrying on failure (spec scenario "deferred sync fails → retry") is safe.
+	deferredSyncFn = func() error {
+		_, err := cli.RunSync(nil)
+		return err
+	}
 )
 
 func Run() error {
@@ -51,6 +59,9 @@ func RunArgs(args []string, stdout io.Writer) error {
 	// manifests record which version of gentle-ai created them.
 	cli.AppVersion = Version
 	upgrade.AppVersion = Version
+
+	// --yes as a global CLI flag for self-update is handled via GENTLE_AI_YES=1.
+	// Per-subcommand --yes flags (e.g. restore --yes) are parsed by each subcommand.
 
 	// Info commands: no system detection, no self-update, no platform validation.
 	if len(args) > 0 {
@@ -125,6 +136,26 @@ func RunArgs(args []string, stdout io.Writer) error {
 		// A missing or unreadable state file is not an error — NewModel falls
 		// back to filesystem detection for first-time installs.
 		installedState, _ := state.Read(homeDir)
+
+		// Deferred sync: if a previous gentle-ai self-upgrade set PendingSync=true,
+		// run sync now with the new binary before entering the TUI. On success,
+		// clear the flag. On failure, log and leave the flag set for idempotent
+		// retry on the next launch (per spec scenario "deferred sync fails → retry").
+		// This is non-fatal — a sync failure must never block the TUI from opening.
+		if installedState.PendingSync {
+			if err := deferredSyncFn(); err != nil {
+				_, _ = fmt.Fprintf(stdout, "Warning: deferred sync failed: %v\n", err)
+				// Leave PendingSync=true so the next launch retries.
+			} else {
+				installedState.PendingSync = false
+				if writeErr := state.Write(homeDir, installedState); writeErr != nil {
+					// Best-effort: surface the failure so it's not silently swallowed.
+					// Idempotent re-sync on the next launch is acceptable.
+					_, _ = fmt.Fprintf(stdout, "Warning: failed to clear PendingSync flag: %v\n", writeErr)
+				}
+			}
+		}
+
 		m := tui.NewModel(result, Version, installedState)
 		m.ExecuteFn = tuiExecute
 		m.RestoreFn = tuiRestore

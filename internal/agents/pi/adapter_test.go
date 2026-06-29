@@ -9,7 +9,6 @@ import (
 
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/versions"
 )
 
 func TestAdapterIdentityAndCapabilities(t *testing.T) {
@@ -30,7 +29,7 @@ func TestAdapterIdentityAndCapabilities(t *testing.T) {
 		{"SupportsAutoInstall", a.SupportsAutoInstall(), true},
 		{"SupportsSkills", a.SupportsSkills(), false},
 		{"SupportsMCP", a.SupportsMCP(), true},
-		{"SupportsSystemPrompt", a.SupportsSystemPrompt(), false},
+		{"SupportsSystemPrompt", a.SupportsSystemPrompt(), true},
 		{"SupportsSlashCommands", a.SupportsSlashCommands(), false},
 		{"SupportsOutputStyles", a.SupportsOutputStyles(), false},
 		{"SupportsSubAgents", a.SupportsSubAgents(), false},
@@ -57,8 +56,8 @@ func TestAdapterPaths(t *testing.T) {
 		want string
 	}{
 		{"GlobalConfigDir", a.GlobalConfigDir(homeDir), piDir},
-		{"SystemPromptDir", a.SystemPromptDir(homeDir), ""},
-		{"SystemPromptFile", a.SystemPromptFile(homeDir), ""},
+		{"SystemPromptDir", a.SystemPromptDir(homeDir), piAgentDir},
+		{"SystemPromptFile", a.SystemPromptFile(homeDir), filepath.Join(piAgentDir, "APPEND_SYSTEM.md")},
 		{"SkillsDir", a.SkillsDir(homeDir), ""},
 		{"SettingsPath", a.SettingsPath(homeDir), filepath.Join(piAgentDir, "settings.json")},
 		{"CommandsDir", a.CommandsDir(homeDir), ""},
@@ -79,7 +78,7 @@ func TestAdapterPaths(t *testing.T) {
 
 func TestAdapterDetectUsesPiBinaryAndConfigPath(t *testing.T) {
 	homeDir := t.TempDir()
-	configDir := filepath.Join(homeDir, ".pi")
+	configDir := filepath.Join(homeDir, ".pi", "agent")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +130,8 @@ func TestAdapterDetectMissingPiBinary(t *testing.T) {
 	if binaryPath != "" {
 		t.Fatalf("Detect() binaryPath = %q, want empty", binaryPath)
 	}
-	if configPath != filepath.Join(homeDir, ".pi") {
-		t.Fatalf("Detect() configPath = %q, want ~/.pi under home", configPath)
+	if configPath != filepath.Join(homeDir, ".pi", "agent") {
+		t.Fatalf("Detect() configPath = %q, want ~/.pi/agent under home", configPath)
 	}
 	if configFound {
 		t.Fatalf("Detect() configFound = true, want false")
@@ -158,8 +157,8 @@ func TestAdapterInstallCommandSequenceUsesNpmWhenPnpmIsUnavailable(t *testing.T)
 		{"pi", "install", "npm:gentle-pi"},
 		{"pi", "install", "npm:gentle-engram"},
 		{"pi", "install", "npm:pi-mcp-adapter"},
-		{"npm", "exec", "--yes", "--package", "gentle-engram@" + versions.GentleEngram, "--", "pi-engram", "init"},
-		{"pi", "install", "npm:pi-subagents"},
+		{"npm", "exec", "--yes", "--package", "gentle-engram@latest", "--", "pi-engram", "init"},
+		piSubagentsInstallCommand(system.PlatformProfile{}),
 		{"pi", "install", "npm:pi-intercom"},
 		{"pi", "install", "npm:@juicesharp/rpiv-ask-user-question"},
 		{"pi", "install", "npm:pi-web-access"},
@@ -168,6 +167,27 @@ func TestAdapterInstallCommandSequenceUsesNpmWhenPnpmIsUnavailable(t *testing.T)
 	}
 	if !reflect.DeepEqual(commands, want) {
 		t.Fatalf("InstallCommand() = %#v, want %#v", commands, want)
+	}
+}
+
+func TestAdapterInstallCommandSequenceUsesSameSubagentsPackageForWindows(t *testing.T) {
+	a := &Adapter{
+		lookPath: func(file string) (string, error) {
+			if file == "pnpm" {
+				return "", os.ErrNotExist
+			}
+			return "/usr/local/bin/" + file, nil
+		},
+		statPath: defaultStat,
+	}
+	commands, err := a.InstallCommand(system.PlatformProfile{OS: "windows"})
+	if err != nil {
+		t.Fatalf("InstallCommand() error = %v", err)
+	}
+
+	want := []string{"pi", "install", "npm:pi-subagents-j0k3r"}
+	if !reflect.DeepEqual(commands[4], want) {
+		t.Fatalf("InstallCommand()[4] = %#v, want %#v", commands[4], want)
 	}
 }
 
@@ -186,7 +206,7 @@ func TestAdapterInstallCommandSequenceUsesPnpmForEngramInitWhenAvailable(t *test
 		t.Fatalf("InstallCommand() error = %v", err)
 	}
 
-	want := []string{"pnpm", "dlx", "gentle-engram@" + versions.GentleEngram, "pi-engram", "init"}
+	want := []string{"pnpm", "dlx", "gentle-engram@latest", "pi-engram", "init"}
 	if !reflect.DeepEqual(commands[3], want) {
 		t.Fatalf("InstallCommand()[3] = %#v, want %#v", commands[3], want)
 	}

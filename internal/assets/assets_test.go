@@ -258,7 +258,9 @@ func TestAllEmbeddedAssetsAreReadable(t *testing.T) {
 		"skills/go-testing/SKILL.md",
 		"skills/go-testing/references/examples.md",
 		"skills/skill-creator/SKILL.md",
+		"skills/skill-creator/references/skill-style-guide.md",
 		"skills/skill-improver/SKILL.md",
+		"skills/skill-improver/references/skill-style-guide.md",
 		"skills/chained-pr/references/chaining-details.md",
 	}
 
@@ -302,8 +304,15 @@ func TestOpenCodeEmbeddedAssetLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir(opencode/commands) error = %v", err)
 	}
-	if len(commandEntries) != 10 {
-		t.Fatalf("opencode commands count = %d, want 10", len(commandEntries))
+	if len(commandEntries) != 12 {
+		t.Fatalf("opencode commands count = %d, want 12", len(commandEntries))
+	}
+	wantCommands := map[string]bool{"skill-creator.md": true, "skill-registry.md": true}
+	for _, entry := range commandEntries {
+		delete(wantCommands, entry.Name())
+	}
+	for name := range wantCommands {
+		t.Fatalf("opencode embedded commands missing %q", name)
 	}
 
 	pluginEntries, err := FS.ReadDir("opencode/plugins")
@@ -556,19 +565,24 @@ func TestOpenCodeSDDOrchestratorRequiresSessionPreflight(t *testing.T) {
 		"Chained PR strategy",
 		"Review budget",
 		"`openspec/config.yaml`, existing SDD artifacts, previous `sdd-init` results, or installed SDD assets do NOT satisfy session preflight",
-		"ask the localized user-facing preflight prompt above and STOP",
-		"Ask the user directly with a compact, numbered preflight prompt",
-		"Match the user's current language",
-		"Do NOT mix languages inside one preflight prompt",
-		"If the current language is Spanish, use the Spanish localized shape below as the neutral fallback",
-		"adapt only user-facing prose to that persona",
-		"translate user-facing prose to the user's current language",
+		"Use the `question` tool for SDD Session Preflight",
+		"Ask all four preflight groups in one single `question` tool call",
+		"OpenCode can render the groups as tabs",
+		"Do NOT run this as a sequential wizard",
+		"Do NOT issue four separate `question` tool calls",
+		"The single `question` tool call must contain these four localized groups in this order",
+		"Match the user's current language and active persona",
+		"Treat the preflight UI as direct orchestrator conversation",
+		"not as a generated technical artifact",
+		"Technical artifacts still default to English",
+		"this UI follows the user's conversation language/persona",
+		"Do NOT mix languages inside one grouped question",
+		"Do NOT show option codes",
+		"Do NOT show canonical values",
+		"map the selected human labels to canonical values internally",
 		"¿Quiere ajustar algo o continuamos?",
-		"B. Artefactos",
-		"D. Revisión",
-		"la estimación supera el presupuesto",
-		"Do NOT mention non-existent tools",
-		"A1, B1, C1, D1",
+		"Artifacts: OpenSpec, Engram, Both",
+		"Review: 400 lines, 800 lines, Other",
 		"### SDD Entry Routing (MANDATORY)",
 		"Never launch `sdd-apply` just because the user asked to implement a feature",
 		"In **Interactive** mode, between phases",
@@ -584,21 +598,21 @@ func TestOpenCodeSDDOrchestratorRequiresSessionPreflight(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSDDOrchestratorSpanishPreflightIsLocalized(t *testing.T) {
+func TestOpenCodeSDDOrchestratorPreflightDoesNotUseVisibleCodesOrCanonicalUIValues(t *testing.T) {
 	content := MustRead("opencode/sdd-orchestrator.md")
-	start := strings.Index(content, "Antes de continuar con SDD")
+	start := strings.Index(content, "User-facing preflight question format:")
 	if start < 0 {
-		t.Fatal("opencode/sdd-orchestrator.md missing Spanish preflight block")
+		t.Fatal("opencode/sdd-orchestrator.md missing preflight question format block")
 	}
 	end := strings.Index(content[start:], "Map answers to canonical values")
 	if end < 0 {
-		t.Fatal("opencode/sdd-orchestrator.md missing end of Spanish preflight block")
+		t.Fatal("opencode/sdd-orchestrator.md missing end of preflight question format block")
 	}
-	spanishBlock := content[start : start+end]
+	uiBlock := content[start : start+end]
 
-	for _, forbidden := range []string{"B. Artifacts", "D. Review", "forecast", "budget"} {
-		if strings.Contains(spanishBlock, forbidden) {
-			t.Fatalf("Spanish preflight block should localize user-facing prose; found %q", forbidden)
+	for _, forbidden := range []string{"A1", "A2", "B1", "C1", "D1", "`interactive`", "`openspec`", "`ask-always`"} {
+		if strings.Contains(uiBlock, forbidden) {
+			t.Fatalf("preflight UI instructions should not expose option codes or canonical values; found %q", forbidden)
 		}
 	}
 }
@@ -903,6 +917,72 @@ func TestGentlemanLanguageInstructionsDoNotBiasEnglishSessions(t *testing.T) {
 	}
 }
 
+func TestClaudeManagedOutputStylesAnchorReplyLanguageToLatestUserRequest(t *testing.T) {
+	tests := []struct {
+		path              string
+		artifactContracts []string
+	}{
+		{
+			path: "claude/output-style-gentleman.md",
+			artifactContracts: []string{
+				"Default to English. UI labels, comments, identifiers, and copy are in English",
+				"The persona styles HOW YOU TALK, not WHAT YOU BUILD.",
+			},
+		},
+		{
+			path: "claude/output-style-neutral.md",
+			artifactContracts: []string{
+				"This output style governs direct replies to the user only.",
+				"Generated technical artifacts default to English",
+			},
+		},
+	}
+
+	languageGuardrails := []string{
+		"Determine the reply language from the latest actual user request",
+		"not from Engram or memory context, repository/project language, tool output, previous assistant turns",
+		"For mixed-language prompts, use the dominant language of the user's direct request.",
+		"Quoted text, filenames, project names, isolated borrowed words",
+		`phrases like "the Spanish part" do not switch the reply language by themselves.`,
+		"If the selected reply language is English, every part of the direct reply must be English: greetings, interjections, acknowledgements, transition phrases, and the first sentence.",
+		"Do not use Hola, dale, listo, Spanish punctuation, or other Spanish fragments.",
+		"Prompts starting with or dominated by hi, hello, hey, or similar English greetings are English prompts unless the user explicitly asks for another language.",
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			content := MustRead(tc.path)
+
+			for _, required := range languageGuardrails {
+				if !strings.Contains(content, required) {
+					t.Fatalf("%s missing language-drift guardrail %q", tc.path, required)
+				}
+			}
+
+			for _, required := range tc.artifactContracts {
+				if !strings.Contains(content, required) {
+					t.Fatalf("%s lost artifact-language contract %q", tc.path, required)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeGentlemanPersonaPreventsEnglishGreetingCodeSwitching(t *testing.T) {
+	content := MustRead("claude/persona-gentleman.md")
+
+	for _, required := range []string{
+		"If the selected reply language is English, every part of the direct reply must be English: greetings, interjections, acknowledgements, transition phrases, and the first sentence.",
+		"Do not use Hola, dale, listo, Spanish punctuation, or other Spanish fragments.",
+		"Prompts starting with or dominated by hi, hello, hey, or similar English greetings are English prompts unless the user explicitly asks for another language.",
+		"Do not switch languages unless the user does, asks you to, or you are quoting/translating content.",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("claude/persona-gentleman.md missing code-switching guardrail %q", required)
+		}
+	}
+}
+
 // TestPersonasContainContextualSkillLoadingDirective verifies that every
 // persona asset injected into a host's system prompt carries the mandatory
 // "Contextual Skill Loading" directive (design Decisions 1 and 2 of the
@@ -999,9 +1079,9 @@ func TestEmbeddedAssetCount(t *testing.T) {
 		}
 	}
 
-	// We expect 22 skill directories (10 SDD + judgment-day + 6 foundation + 4 sustainable-review + _shared).
-	if skillDirs != 22 {
-		t.Fatalf("expected 22 skill directories, got %d", skillDirs)
+	// We expect 23 skill directories (10 SDD + judgment-day + 6 foundation + 4 sustainable-review + hermes-ephemeral-delegation + _shared).
+	if skillDirs != 23 {
+		t.Fatalf("expected 23 skill directories, got %d", skillDirs)
 	}
 
 	// Verify each skill directory has a SKILL.md.
@@ -1119,6 +1199,23 @@ func TestOpenCodeSDDOverlaySubagentsAreExplicitExecutors(t *testing.T) {
 			// inlineOpenCodeSDDPrompts. Verify the placeholder format.
 			// single overlay still uses inline prompt strings.
 			isMulti := assetPath == "opencode/sdd-overlay-multi.json"
+
+			orchestrator, ok := agents["gentle-orchestrator"].(map[string]any)
+			if !ok {
+				t.Fatalf("%q missing gentle-orchestrator agent", assetPath)
+			}
+			permissions, ok := orchestrator["permission"].(map[string]any)
+			if !ok || permissions["question"] != "allow" {
+				t.Fatalf("%q gentle-orchestrator must allow question permission", assetPath)
+			}
+			tools, ok := orchestrator["tools"].(map[string]any)
+			if !ok {
+				t.Fatalf("%q gentle-orchestrator missing tools", assetPath)
+			}
+			replacedTools, ok := tools["__replace__"].(map[string]any)
+			if !ok || replacedTools["question"] != true {
+				t.Fatalf("%q gentle-orchestrator must enable question tool", assetPath)
+			}
 
 			for _, phase := range []string{"sdd-init", "sdd-explore", "sdd-propose", "sdd-spec", "sdd-design", "sdd-tasks", "sdd-apply", "sdd-verify", "sdd-archive"} {
 				agentDef, ok := agents[phase].(map[string]any)
@@ -1247,6 +1344,42 @@ func TestClaudeCommandsDetectWorkspaceAgentSide(t *testing.T) {
 		}
 		if strings.Contains(content, "Working directory:") && !strings.Contains(content, requiredHint) {
 			t.Errorf("%s mentions \"Working directory:\" without the agent-side detection hint %q (see #837)", path, requiredHint)
+		}
+	}
+}
+
+// TestOrchestratorsRequireAutomaticGatekeeper asserts that every orchestrator
+// template carries the Automatic Mode Gatekeeper anchor phrases, so the
+// per-phase validation contract cannot silently drift out of any one template.
+func TestOrchestratorsRequireAutomaticGatekeeper(t *testing.T) {
+	paths := []string{
+		"antigravity/sdd-orchestrator.md",
+		"claude/sdd-orchestrator.md",
+		"codex/sdd-orchestrator.md",
+		"cursor/sdd-orchestrator.md",
+		"gemini/sdd-orchestrator.md",
+		"generic/sdd-orchestrator.md",
+		"hermes/sdd-orchestrator.md",
+		"kimi/sdd-orchestrator.md",
+		"kiro/sdd-orchestrator.md",
+		"opencode/sdd-orchestrator.md",
+		"qwen/sdd-orchestrator.md",
+		"windsurf/sdd-orchestrator.md",
+	}
+	anchors := []string{
+		"Automatic Mode Gatekeeper",
+		"The gatekeeper runs after every phase",
+		"Inline for low-risk phases",
+		"Fresh-context reviewer for high-risk phases",
+		"re-run the same phase exactly once",
+		"STOP the automatic chain",
+	}
+	for _, path := range paths {
+		content := MustRead(path)
+		for _, anchor := range anchors {
+			if !strings.Contains(content, anchor) {
+				t.Fatalf("%s missing Automatic Mode Gatekeeper anchor %q", path, anchor)
+			}
 		}
 	}
 }

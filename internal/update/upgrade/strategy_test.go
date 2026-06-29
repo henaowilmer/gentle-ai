@@ -90,6 +90,85 @@ func TestRunStrategy_GoInstallUpgrade(t *testing.T) {
 	}
 }
 
+func TestRunStrategy_BetaGentleAISelfUpgradeUsesGoInstallMain(t *testing.T) {
+	origExecCommand := execCommand
+	t.Cleanup(func() { execCommand = origExecCommand })
+
+	var gotName string
+	var gotArgs []string
+	var gotCmd *exec.Cmd
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		gotName = name
+		gotArgs = args
+		gotCmd = mockCmd("true")
+		return gotCmd
+	}
+
+	r := update.UpdateResult{
+		Tool: update.ToolInfo{
+			Name:          "gentle-ai",
+			Owner:         "Gentleman-Programming",
+			Repo:          "gentle-ai",
+			InstallMethod: update.InstallBinary,
+		},
+		LatestVersion: "main@972997650b51",
+		Status:        update.UpdateAvailable,
+	}
+	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt", Supported: true}
+
+	_, err := runStrategy(context.Background(), r, profile)
+	if err != nil {
+		t.Fatalf("runStrategy beta gentle-ai: unexpected error: %v", err)
+	}
+
+	if gotName != "go" {
+		t.Fatalf("exec name = %q, want %q", gotName, "go")
+	}
+	wantArgs := []string{"install", "github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@main"}
+	if len(gotArgs) != len(wantArgs) || gotArgs[0] != wantArgs[0] || gotArgs[1] != wantArgs[1] {
+		t.Fatalf("exec args = %v, want %v", gotArgs, wantArgs)
+	}
+	for _, want := range []string{
+		"GONOSUMDB=github.com/gentleman-programming/gentle-ai",
+		"GOPRIVATE=github.com/gentleman-programming/gentle-ai",
+		"GONOPROXY=github.com/gentleman-programming/gentle-ai",
+	} {
+		if !envContains(gotCmd.Env, want) {
+			t.Fatalf("go install env missing %q in %v", want, gotCmd.Env)
+		}
+	}
+}
+
+func envContains(env []string, want string) bool {
+	for _, entry := range env {
+		if entry == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestGoProxyBypassEnvPreservesExistingPatterns(t *testing.T) {
+	module := "github.com/gentleman-programming/gentle-ai"
+	env := goProxyBypassEnv([]string{
+		"PATH=/usr/bin",
+		"GONOSUMDB=example.com/private",
+		"GOPRIVATE=github.com/acme/*",
+		"GONOPROXY=github.com/gentleman-programming/gentle-ai",
+	}, module)
+
+	for _, want := range []string{
+		"PATH=/usr/bin",
+		"GONOSUMDB=github.com/gentleman-programming/gentle-ai,example.com/private",
+		"GOPRIVATE=github.com/gentleman-programming/gentle-ai,github.com/acme/*",
+		"GONOPROXY=github.com/gentleman-programming/gentle-ai",
+	} {
+		if !envContains(env, want) {
+			t.Fatalf("env missing %q in %v", want, env)
+		}
+	}
+}
+
 // --- TestRunStrategy_GoInstallMissingImportPath ---
 
 func TestRunStrategy_GoInstallMissingImportPath(t *testing.T) {
@@ -1401,6 +1480,222 @@ func TestRunStrategy_ScriptUpgradeExecFailure(t *testing.T) {
 	}
 }
 
+// --- TestInstallerUpgradeArgs ---
+
+// TestInstallerUpgradeArgs verifies that installerUpgradeArgs builds the correct
+// PowerShell command-line argument list for both stable and beta gentle-ai upgrades.
+// This is a pure function test — no OS gate needed.
+func TestInstallerUpgradeArgs(t *testing.T) {
+	const tmpPath = `C:\Users\user\AppData\Local\Temp\gentle-ai-install-12345.ps1`
+
+	tests := []struct {
+		name          string
+		beta          bool
+		wantContains  []string
+		wantAbsent    []string
+	}{
+		{
+			name: "stable upgrade does not include -Channel beta",
+			beta: false,
+			wantContains: []string{
+				"-NoProfile",
+				"-NoExit",
+				"-ExecutionPolicy", "Bypass",
+				"-File", tmpPath,
+			},
+			wantAbsent: []string{"-Channel", "beta"},
+		},
+		{
+			name: "beta upgrade includes -Channel beta after -File",
+			beta: true,
+			wantContains: []string{
+				"-NoProfile",
+				"-NoExit",
+				"-ExecutionPolicy", "Bypass",
+				"-File", tmpPath,
+				"-Channel", "beta",
+			},
+			wantAbsent: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := installerUpgradeArgs(tmpPath, tc.beta)
+
+			for _, want := range tc.wantContains {
+				found := false
+				for _, a := range args {
+					if a == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("installerUpgradeArgs(beta=%v): args %v missing expected %q", tc.beta, args, want)
+				}
+			}
+
+			for _, absent := range tc.wantAbsent {
+				for _, a := range args {
+					if a == absent {
+						t.Errorf("installerUpgradeArgs(beta=%v): args %v must NOT contain %q", tc.beta, args, absent)
+					}
+				}
+			}
+
+			// For beta, assert -Channel beta appears AFTER -File tmpPath.
+			if tc.beta {
+				fileIdx := -1
+				channelIdx := -1
+				for i, a := range args {
+					if a == "-File" {
+						fileIdx = i
+					}
+					if a == "-Channel" {
+						channelIdx = i
+					}
+				}
+				if fileIdx < 0 {
+					t.Fatal("beta args: -File not found")
+				}
+				if channelIdx < 0 {
+					t.Fatal("beta args: -Channel not found")
+				}
+				if channelIdx <= fileIdx {
+					t.Errorf("beta args: -Channel (idx=%d) must come after -File (idx=%d); args: %v", channelIdx, fileIdx, args)
+				}
+				// Confirm the value after -Channel is "beta".
+				if channelIdx+1 >= len(args) || args[channelIdx+1] != "beta" {
+					t.Errorf("beta args: arg after -Channel must be %q, got args[%d]=%q; args: %v", "beta", channelIdx+1, args[channelIdx+1], args)
+				}
+			}
+		})
+	}
+}
+
+// TestRunStrategy_BetaGentleAIWindowsInstallerIncludesChannelBeta verifies the
+// full runStrategy path: on Windows, a beta gentle-ai upgrade via InstallInstaller
+// must pass -Channel beta to the PowerShell installer command.
+// Because installerUpgrade calls runtime.GOOS and skips on non-Windows, this
+// test verifies the behavior indirectly by asserting on the captured execCommand
+// args, which is only reachable on Windows. On non-Windows, the test is skipped.
+func TestRunStrategy_BetaGentleAIWindowsInstallerIncludesChannelBeta(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping Windows-only installer beta channel test on non-windows platform")
+	}
+
+	origExecCommand := execCommand
+	origHTTPClient := scriptHTTPClient
+	t.Cleanup(func() {
+		execCommand = origExecCommand
+		scriptHTTPClient = origHTTPClient
+	})
+
+	scriptHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			rec.Header().Set("Content-Type", "text/plain")
+			rec.WriteHeader(http.StatusOK)
+			rec.WriteString("Write-Output 'installer ok'\n")
+			return rec.Result(), nil
+		}),
+	}
+
+	var gotArgs []string
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		gotArgs = append([]string(nil), args...)
+		return mockCmd("echo", "ok")
+	}
+
+	r := update.UpdateResult{
+		Tool: update.ToolInfo{
+			Name:          "gentle-ai",
+			Owner:         "Gentleman-Programming",
+			Repo:          "gentle-ai",
+			InstallMethod: update.InstallInstaller,
+		},
+		LatestVersion: "main@abc1234",
+		Status:        update.UpdateAvailable,
+	}
+	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true}
+
+	_, err := runStrategy(context.Background(), r, profile)
+	if err != nil {
+		t.Fatalf("runStrategy beta gentle-ai windows: unexpected error: %v", err)
+	}
+
+	// Verify -Channel beta is in the args passed to powershell.
+	foundChannel := false
+	for i, a := range gotArgs {
+		if a == "-Channel" && i+1 < len(gotArgs) && gotArgs[i+1] == "beta" {
+			foundChannel = true
+			break
+		}
+	}
+	if !foundChannel {
+		t.Errorf("runStrategy beta gentle-ai on Windows: execCommand args %v must include -Channel beta", gotArgs)
+	}
+}
+
+// TestRunStrategy_StableGentleAIWindowsInstallerExcludesChannelBeta verifies that
+// a stable (non-beta) gentle-ai upgrade on Windows does NOT pass -Channel beta.
+func TestRunStrategy_StableGentleAIWindowsInstallerExcludesChannelBeta(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping Windows-only installer stable channel test on non-windows platform")
+	}
+
+	origExecCommand := execCommand
+	origHTTPClient := scriptHTTPClient
+	t.Cleanup(func() {
+		execCommand = origExecCommand
+		scriptHTTPClient = origHTTPClient
+	})
+
+	scriptHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			rec.Header().Set("Content-Type", "text/plain")
+			rec.WriteHeader(http.StatusOK)
+			rec.WriteString("Write-Output 'installer ok'\n")
+			return rec.Result(), nil
+		}),
+	}
+
+	var gotArgs []string
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		gotArgs = append([]string(nil), args...)
+		return mockCmd("echo", "ok")
+	}
+
+	r := update.UpdateResult{
+		Tool: update.ToolInfo{
+			Name:          "gentle-ai",
+			Owner:         "Gentleman-Programming",
+			Repo:          "gentle-ai",
+			InstallMethod: update.InstallInstaller,
+		},
+		LatestVersion: "1.40.2",
+		Status:        update.UpdateAvailable,
+	}
+	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true}
+
+	_, err := runStrategy(context.Background(), r, profile)
+	if err != nil {
+		t.Fatalf("runStrategy stable gentle-ai windows: unexpected error: %v", err)
+	}
+
+	for i, a := range gotArgs {
+		if a == "-Channel" {
+			val := ""
+			if i+1 < len(gotArgs) {
+				val = gotArgs[i+1]
+			}
+			t.Errorf("runStrategy stable gentle-ai on Windows: execCommand args must NOT include -Channel, got -Channel %q; all args: %v", val, gotArgs)
+		}
+	}
+}
+
 // --- TestInstallerUpgrade_Success ---
 
 func TestInstallerUpgrade_Success(t *testing.T) {
@@ -1454,7 +1749,7 @@ func TestInstallerUpgrade_Success(t *testing.T) {
 		return rec.Result(), nil
 	})
 
-	exitReq, err := installerUpgrade(context.Background(), tool, "")
+	exitReq, err := installerUpgrade(context.Background(), tool, "", false)
 	if err != nil {
 		t.Fatalf("installerUpgrade: unexpected error: %v", err)
 	}
@@ -1508,7 +1803,7 @@ func TestInstallerUpgrade_DownloadFailure(t *testing.T) {
 		InstallMethod: update.InstallInstaller,
 	}
 
-	exitReq, err := installerUpgrade(context.Background(), tool, "")
+	exitReq, err := installerUpgrade(context.Background(), tool, "", false)
 	if err == nil {
 		t.Errorf("expected error when installer download fails, got nil")
 	}
@@ -1524,12 +1819,97 @@ func TestInstallerUpgrade_NonWindows(t *testing.T) {
 		t.Skip("skipping non-Windows test on Windows platform")
 	}
 	tool := update.ToolInfo{Name: "gentle-ai"}
-	exitReq, err := installerUpgrade(context.Background(), tool, "")
+	exitReq, err := installerUpgrade(context.Background(), tool, "", false)
 	if err == nil {
 		t.Errorf("expected error when calling installerUpgrade on non-windows, got nil")
 	}
 	if exitReq {
 		t.Errorf("expected exitReq to be false")
+	}
+}
+
+// --- TestEngramBinaryUpgrade_ChannelRouting (Slice 3) ---
+
+// TestEngramBinaryUpgrade_StableChannelCallsDownloadFn verifies that when
+// GENTLE_AI_CHANNEL is unset or "stable", engramBinaryUpgrade delegates to
+// engramDownloadFn (the release-download path) and NOT go install @main.
+func TestEngramBinaryUpgrade_StableChannelCallsDownloadFn(t *testing.T) {
+	tests := []struct {
+		name   string
+		envVal string
+	}{
+		{name: "channel unset", envVal: ""},
+		{name: "channel explicit stable", envVal: "stable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GENTLE_AI_CHANNEL", tt.envVal)
+
+			origDownloadFn := engramDownloadFn
+			origExecCommand := execCommand
+			t.Cleanup(func() {
+				engramDownloadFn = origDownloadFn
+				execCommand = origExecCommand
+			})
+
+			downloadCalled := false
+			engramDownloadFn = func(profile system.PlatformProfile) (string, error) {
+				downloadCalled = true
+				return "/tmp/engram", nil
+			}
+
+			// go install must NOT be called for stable channel.
+			execCommand = func(name string, args ...string) *exec.Cmd {
+				t.Errorf("execCommand called unexpectedly for stable channel: %s %v", name, args)
+				return mockCmd("echo", "unexpected")
+			}
+
+			profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
+			err := engramBinaryUpgrade(profile)
+			if err != nil {
+				t.Fatalf("engramBinaryUpgrade stable: unexpected error: %v", err)
+			}
+			if !downloadCalled {
+				t.Error("expected engramDownloadFn to be called for stable channel, but it was not")
+			}
+		})
+	}
+}
+
+// TestEngramBinaryUpgrade_BetaChannelUsesGoInstallMain verifies that when
+// GENTLE_AI_CHANNEL=beta, engramBinaryUpgrade delegates to
+// engramBetaInstallFn (the consolidated beta path, backed by
+// engram.DownloadLatestBinary(profile, true) in production). The stable
+// engramDownloadFn must NOT be called.
+func TestEngramBinaryUpgrade_BetaChannelUsesGoInstallMain(t *testing.T) {
+	t.Setenv("GENTLE_AI_CHANNEL", "beta")
+
+	origDownloadFn := engramDownloadFn
+	origBetaFn := engramBetaInstallFn
+	t.Cleanup(func() {
+		engramDownloadFn = origDownloadFn
+		engramBetaInstallFn = origBetaFn
+	})
+
+	engramDownloadFn = func(profile system.PlatformProfile) (string, error) {
+		t.Error("engramDownloadFn (stable path) must NOT be called for beta channel")
+		return "", nil
+	}
+
+	var betaCalled bool
+	engramBetaInstallFn = func(profile system.PlatformProfile) (string, error) {
+		betaCalled = true
+		return "/tmp/engram-beta", nil
+	}
+
+	profile := system.PlatformProfile{OS: "linux", PackageManager: "apt"}
+	err := engramBinaryUpgrade(profile)
+	if err != nil {
+		t.Fatalf("engramBinaryUpgrade beta: unexpected error: %v", err)
+	}
+	if !betaCalled {
+		t.Fatal("expected engramBetaInstallFn (beta path) to be called, but it was not")
 	}
 }
 

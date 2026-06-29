@@ -26,6 +26,44 @@ func TestListActiveOpenSpecChanges(t *testing.T) {
 	}
 }
 
+func TestResolveUsesEngramArtifactsWhenOpenSpecIsAbsent(t *testing.T) {
+	root := t.TempDir()
+	mkdir(t, filepath.Join(root, ".engram"))
+	write(t, filepath.Join(root, ".git", "config"), "[remote \"origin\"]\n\turl = git@github.com:Gentleman-Programming/gentle-ai.git\n")
+
+	restore := stubEngramExport(t, []engramObservation{
+		{Title: "sdd/add-auth/proposal", Content: "## Proposal\nAdd auth", Project: "gentle-ai", Scope: "project"},
+		{Title: "sdd/add-auth/spec", Content: "## Requirements\n- SHALL work", Project: "gentle-ai", Scope: "project"},
+		{Title: "sdd/add-auth/design", Content: "## Design\nUse middleware", Project: "gentle-ai", Scope: "project"},
+		{Title: "sdd/add-auth/tasks", Content: "- [ ] 1.1 Wire routes\n", Project: "gentle-ai", Scope: "project"},
+	})
+	defer restore()
+
+	status, err := Resolve(ResolveOptions{CWD: root, IncludeInstructions: true})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+
+	if status.ArtifactStore != ArtifactStoreEngram {
+		t.Fatalf("ArtifactStore = %q, want %q", status.ArtifactStore, ArtifactStoreEngram)
+	}
+	if status.ChangeName == nil || *status.ChangeName != "add-auth" {
+		t.Fatalf("ChangeName = %v, want add-auth", ptrValue(status.ChangeName))
+	}
+	if status.Dependencies.Apply != DependencyReady || status.NextRecommended != "apply" {
+		t.Fatalf("apply dependency = %q next = %q, want ready/apply", status.Dependencies.Apply, status.NextRecommended)
+	}
+	if status.TaskProgress != (TaskProgress{Total: 1, Pending: 1, AllComplete: false}) {
+		t.Fatalf("TaskProgress = %#v", status.TaskProgress)
+	}
+	if got := firstPath(status.ArtifactPaths.Tasks); got != "sdd/add-auth/tasks" {
+		t.Fatalf("ArtifactPaths.Tasks[0] = %q, want topic key", got)
+	}
+	if status.PhaseInstructions == nil {
+		t.Fatal("PhaseInstructions is nil")
+	}
+}
+
 func TestResolveSelectionStates(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -193,7 +231,7 @@ func TestResolveApplyVerifyArchiveGates(t *testing.T) {
 		wantBlockedAbsent string
 	}{
 		{
-			name: "apply blocked when core artifacts are missing",
+			name: "apply blocked when core artifacts are missing routes to propose",
 			seed: func(t *testing.T, root string) {
 				write(t, filepath.Join(root, "openspec", "changes", "thin", "tasks.md"), "- [ ] 1.1 Work\n")
 			},
@@ -201,7 +239,7 @@ func TestResolveApplyVerifyArchiveGates(t *testing.T) {
 			wantApplyD:  DependencyBlocked,
 			wantVerify:  DependencyBlocked,
 			wantArchive: DependencyBlocked,
-			wantNext:    "resolve-blockers",
+			wantNext:    "propose",
 			wantBlocked: "proposal.md is missing or partial.",
 		},
 		{
@@ -490,6 +528,91 @@ func TestResolveApplyVerifyArchiveGates(t *testing.T) {
 	}
 }
 
+func TestResolveNextRecommendedPlanningRouting(t *testing.T) {
+	tests := []struct {
+		name     string
+		seed     func(t *testing.T, root string)
+		wantNext string
+	}{
+		{
+			name: "no artifacts routes to propose",
+			seed: func(t *testing.T, root string) {
+				mkdir(t, filepath.Join(root, "openspec", "changes", "thin"))
+			},
+			wantNext: "propose",
+		},
+		{
+			name: "proposal only routes to spec",
+			seed: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "proposal.md"), "# Proposal\n")
+			},
+			wantNext: "spec",
+		},
+		{
+			name: "proposal and specs but no design routes to design",
+			seed: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "proposal.md"), "# Proposal\n")
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "specs", "core", "spec.md"), "# Spec\n")
+			},
+			wantNext: "design",
+		},
+		{
+			name: "proposal specs and design but no tasks routes to tasks",
+			seed: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "proposal.md"), "# Proposal\n")
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "specs", "core", "spec.md"), "# Spec\n")
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "design.md"), "# Design\n")
+			},
+			wantNext: "tasks",
+		},
+		{
+			name: "all planning done with pending tasks routes to apply",
+			seed: func(t *testing.T, root string) {
+				seedReadyChange(t, root, "thin", "- [ ] 1.1 Work\n")
+			},
+			wantNext: "apply",
+		},
+		{
+			name: "tasks only (no proposal) routes to propose not resolve-blockers",
+			seed: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "tasks.md"), "- [ ] 1.1 Work\n")
+			},
+			wantNext: "propose",
+		},
+		{
+			name: "design only (no proposal or specs) routes to propose",
+			seed: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "design.md"), "# Design\n")
+			},
+			wantNext: "propose",
+		},
+		{
+			name: "proposal and design but no specs routes to spec",
+			seed: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "proposal.md"), "# Proposal\n")
+				write(t, filepath.Join(root, "openspec", "changes", "thin", "design.md"), "# Design\n")
+			},
+			wantNext: "spec",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			tt.seed(t, root)
+
+			status, err := Resolve(ResolveOptions{CWD: root, ChangeName: "thin"})
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+
+			if status.NextRecommended != tt.wantNext {
+				t.Fatalf("NextRecommended = %q, want %q", status.NextRecommended, tt.wantNext)
+			}
+		})
+	}
+}
+
 func TestResolveNextRecommendedUsesStableTokenForCoreArtifactBlockers(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "openspec", "changes", "thin", "tasks.md"), "- [ ] 1.1 Work\n")
@@ -499,9 +622,11 @@ func TestResolveNextRecommendedUsesStableTokenForCoreArtifactBlockers(t *testing
 		t.Fatalf("Resolve() error = %v", err)
 	}
 
+	// Missing proposal routes to "propose", not "resolve-blockers".
+	// Blocked prose must live in blockedReasons, never in nextRecommended.
 	blockedProse := "proposal.md is missing or partial."
-	if status.NextRecommended != "resolve-blockers" {
-		t.Fatalf("NextRecommended = %q, want resolve-blockers", status.NextRecommended)
+	if status.NextRecommended != "propose" {
+		t.Fatalf("NextRecommended = %q, want propose", status.NextRecommended)
 	}
 	if status.NextRecommended == blockedProse || strings.Contains(status.NextRecommended, blockedProse) {
 		t.Fatalf("NextRecommended = %q, must not contain blocked reason prose %q", status.NextRecommended, blockedProse)
@@ -611,11 +736,13 @@ func TestRenderDispatcherMarkdownIncludesBlockedReasonsSeparately(t *testing.T) 
 	}
 	markdown := RenderDispatcherMarkdown(status)
 
+	// Missing proposal now routes to "propose", not "resolve-blockers".
+	// Blocked prose lives in blockedReasons, separate from nextRecommended.
 	for _, want := range []string{
-		"next_recommended: resolve-blockers",
+		"next_recommended: propose",
 		"### Blocked Reasons",
 		"proposal.md is missing or partial.",
-		`"nextRecommended": "resolve-blockers"`,
+		`"nextRecommended": "propose"`,
 	} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("RenderDispatcherMarkdown() missing %q:\n%s", want, markdown)
@@ -700,6 +827,15 @@ func write(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
+}
+
+func stubEngramExport(t *testing.T, observations []engramObservation) func() {
+	t.Helper()
+	original := engramExport
+	engramExport = func(_ string) ([]engramObservation, error) {
+		return observations, nil
+	}
+	return func() { engramExport = original }
 }
 
 func mkdir(t *testing.T, path string) {

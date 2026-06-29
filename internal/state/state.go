@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const stateDir = ".gentle-ai"
@@ -74,6 +75,22 @@ type InstallState struct {
 	// Empty for state files written before persona persistence was added —
 	// callers fall back to PersonaGentleman in that case.
 	Persona string `json:"persona,omitempty"`
+
+	// LastUpdateCheck records the last time a successful remote update check was
+	// performed. Used by the cooldown gate (UpdateCheckTTL = 6h) to avoid
+	// hitting the GitHub API on every launch. Nil = never checked, so the
+	// check will always run on first launch (safe back-compat for existing
+	// state files that lack the field entirely).
+	LastUpdateCheck *time.Time `json:"last_update_check,omitempty"`
+
+	// PendingSync is set to true when a gentle-ai self-upgrade succeeded and
+	// the process is about to exit (restart required). The next launch reads
+	// this flag and runs sync automatically before entering the normal flow,
+	// then clears the flag on success. On sync failure the flag is left set
+	// so the following launch retries idempotently.
+	// False (zero value) = no deferred sync pending. Omitted from JSON when
+	// false for backward-compatibility with existing state files.
+	PendingSync bool `json:"pending_sync,omitempty"`
 }
 
 // Path returns the absolute path to the state file for the given home directory.
@@ -132,6 +149,8 @@ func MergeAgents(existing InstallState, newAgents []string) InstallState {
 		CodexCarrilModelAssignments: existing.CodexCarrilModelAssignments,
 		CodexPhaseModelAssignments:  existing.CodexPhaseModelAssignments,
 		Persona:                     existing.Persona,
+		LastUpdateCheck:             existing.LastUpdateCheck,
+		PendingSync:                 existing.PendingSync,
 	}
 }
 
