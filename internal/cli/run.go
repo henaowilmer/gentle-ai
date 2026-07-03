@@ -904,6 +904,7 @@ func (s componentApplyStep) Run() error {
 				CodexPhaseModelAssignments:  s.selection.CodexPhaseModelAssignments,
 				WorkspaceDir:                s.workspaceDir,
 				StrictTDD:                   s.selection.StrictTDD,
+				CodeGraphGuidanceMarkdown:   codeGraphGuidanceMarkdownForSDD(s.homeDir, s.selection.CommunityTools),
 			}
 			if _, err := sdd.Inject(targetDir, adapter, s.selection.SDDMode, opts); err != nil {
 				return fmt.Errorf("inject sdd for %q: %w", adapter.Agent(), err)
@@ -1277,6 +1278,9 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 						filepath.Join(skillDir, "sdd-verify", "SKILL.md"),
 						filepath.Join(skillDir, "sdd-archive", "SKILL.md"),
 					)
+					if adapter.Agent() == model.AgentClaudeCode {
+						paths = append(paths, filepath.Join(skillDir, "_shared", "sdd-orchestrator-workflow.md"))
+					}
 				}
 			}
 			paths = append(paths, sddSubAgentPaths(targetDir, adapter)...)
@@ -1293,6 +1297,12 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 		case model.ComponentContext7:
 			switch adapter.MCPStrategy() {
 			case model.StrategySeparateMCPFiles:
+				if adapter.Agent() == model.AgentClaudeCode {
+					if p := adapter.SettingsPath(homeDir); p != "" {
+						paths = append(paths, p)
+					}
+					break
+				}
 				paths = append(paths, adapter.MCPConfigPath(homeDir, "context7"))
 			case model.StrategyMergeIntoSettings:
 				if p := adapter.SettingsPath(homeDir); p != "" {
@@ -1394,6 +1404,30 @@ func componentInjectionDirScoped(homeDir, workspaceDir string, scope InstallScop
 		return workspaceDir
 	}
 	return ResolveAgentConfigDir(scope, homeDir, workspaceDir)
+}
+
+func codeGraphGuidanceMarkdownForSDD(homeDir string, selected []model.CommunityToolID) string {
+	if !shouldInjectCodeGraphGuidanceForSDD(homeDir, selected) {
+		return ""
+	}
+	return communitytool.CodeGraphGuidanceMarkdown()
+}
+
+func shouldInjectCodeGraphGuidanceForSDD(homeDir string, selected []model.CommunityToolID) bool {
+	for _, tool := range selected {
+		if tool == model.CommunityToolCodeGraph {
+			return true
+		}
+	}
+	detector := communitytool.DetectorFunc(cmdLookPath)
+	if communitytool.HasConfiguredCodeGraph(homeDir, detector) {
+		return true
+	}
+	if !communitytool.HasLegacyCodeGraphGuidance(homeDir) {
+		return false
+	}
+	_, err := cmdLookPath("codegraph")
+	return err == nil
 }
 
 type openClawWorkspaceConfig struct {

@@ -61,7 +61,7 @@ const gentleLogoPluginFile = "gentle-logo.tsx"
 
 const gentleLogoPluginSource = `// @ts-nocheck
 /** @jsxImportSource @opentui/solid */
-import type { TuiPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
+import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createMemo } from "solid-js"
 
@@ -95,7 +95,7 @@ const roseArt = [
 
 const compactArt = ["✦ WAHH22 ✦"];
 
-const Logo = (props: { theme: TuiThemeCurrent }) => {
+const Logo = () => {
   const dim = useTerminalDimensions()
   const lines = createMemo(() => {
     const term = dim()
@@ -105,8 +105,7 @@ const Logo = (props: { theme: TuiThemeCurrent }) => {
   return (
     <box flexDirection="column" alignItems="center">
       {lines().map((line) => (
-        //<text fg={props.theme.accent}>{line}</text>
-				<text fg="347aff">{line}</text>
+        <text fg="347aff">{line}</text>
       ))}
     </box>
   )
@@ -117,8 +116,8 @@ const tui: TuiPlugin = async (api) => {
     id,
     order: 100,
     slots: {
-      home_logo(ctx) {
-        return <Logo theme={ctx.theme.current} />
+      home_logo() {
+        return <Logo />
       },
     },
   })

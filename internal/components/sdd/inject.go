@@ -60,6 +60,11 @@ type InjectOptions struct {
 	// (no section extraction, full content written).
 	Capability string
 
+	// CodeGraphGuidanceMarkdown is the shared CodeGraph search-order guidance to
+	// inject into SDD phase sub-agent prompts. Empty means disabled; normal SDD
+	// installs must leave it empty unless the Community Tool path enabled CodeGraph.
+	CodeGraphGuidanceMarkdown string
+
 	// triggerRulesContent is an internal field set by step 1c in Inject()
 	// for OpenCode/Kilocode adapters. It holds the rendered trigger-rules
 	// block so inlineOpenCodeSDDPrompts can append it to the gentle-orchestrator
@@ -453,14 +458,14 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 						}
 					}
 				}
-				promptsChanged, promptsErr := WriteSharedPromptFiles(homeDir, phaseCapabilities)
+				promptsChanged, promptsErr := WriteSharedPromptFiles(homeDir, phaseCapabilities, opts.CodeGraphGuidanceMarkdown)
 				if promptsErr != nil {
 					return InjectionResult{}, fmt.Errorf("write shared SDD prompt files: %w", promptsErr)
 				}
 				changed = changed || promptsChanged
 			}
 
-			overlayBytes, err = inlineOpenCodeSDDPrompts(overlayBytes, homeDir, settingsPath, opts.PreserveOpenCodeOrchestratorPrompt, opts.triggerRulesContent)
+			overlayBytes, err = inlineOpenCodeSDDPrompts(overlayBytes, homeDir, settingsPath, opts.PreserveOpenCodeOrchestratorPrompt, opts.triggerRulesContent, opts.CodeGraphGuidanceMarkdown)
 			if err != nil {
 				return InjectionResult{}, fmt.Errorf("inline OpenCode SDD prompts: %w", err)
 			}
@@ -523,7 +528,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 					return InjectionResult{}, fmt.Errorf("clean stale profile JD agents %q: %w", profile.Name, cleanupErr)
 				}
 				changed = changed || cleanupResult.Changed
-				profileOverlay, profileErr := GenerateProfileOverlay(profile, homeDir)
+				profileOverlay, profileErr := GenerateProfileOverlay(profile, homeDir, opts.CodeGraphGuidanceMarkdown)
 				if profileErr != nil {
 					return InjectionResult{}, fmt.Errorf("generate profile overlay %q: %w", profile.Name, profileErr)
 				}
@@ -593,6 +598,18 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 			changed = changed || sddResult.Changed
 			files = append(files, sddResult.Files...)
 		}
+	}
+
+	// Claude Code keeps the always-on CLAUDE.md bootstrap thin. The heavy SDD
+	// workflow procedure is installed as a lazy shared skill document and read
+	// only when an SDD command or SDD/Judgment-Day delegation needs it.
+	if adapter.Agent() == model.AgentClaudeCode {
+		workflowResult, workflowErr := writeClaudeLazySDDWorkflow(homeDir, adapter, opts.ClaudeModelAssignments, opts.ClaudePhaseAssignments)
+		if workflowErr != nil {
+			return InjectionResult{}, workflowErr
+		}
+		changed = changed || workflowResult.Changed
+		files = append(files, workflowResult.Files...)
 	}
 
 	// 3b. Write native workflow files (Windsurf Hybrid-First, and any future
@@ -681,6 +698,10 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				assignment := resolveClaudePhaseAssignment(opts.ClaudeModelAssignments, opts.ClaudePhaseAssignments, phase)
 				contentStr = strings.ReplaceAll(contentStr, "{{CLAUDE_MODEL}}", cmr.ClaudeModelID(assignment.Model))
 				contentStr = injectClaudeEffortFrontmatter(contentStr, assignment)
+			}
+
+			if isMarkdownSubAgentPromptFile(entry.Name()) {
+				contentStr = injectCodeGraphGuidanceIntoPrompt(contentStr, opts.CodeGraphGuidanceMarkdown)
 			}
 			outPath := filepath.Join(agentsDir, entry.Name())
 			writeResult, err := filemerge.WriteFileAtomic(outPath, []byte(contentStr), 0o644)
@@ -811,7 +832,7 @@ func validateOpenClawWorkspacePath(workspaceDir string, adapter agents.Adapter) 
 	return nil
 }
 
-func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string, preserveExistingOrchestratorPrompt bool, triggerRulesContent string) ([]byte, error) {
+func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string, preserveExistingOrchestratorPrompt bool, triggerRulesContent string, codeGraphGuidance string) ([]byte, error) {
 	var overlay map[string]any
 	if err := json.Unmarshal(overlayBytes, &overlay); err != nil {
 		return nil, fmt.Errorf("unmarshal OpenCode SDD overlay: %w", err)
@@ -890,6 +911,13 @@ func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string,
 			}
 		}
 	}
+
+	// Single-mode SDD embeds sub-agent prompts directly in opencode.json instead
+	// of using shared prompt files. Multi-mode still keeps JD/review prompts inline.
+	// When CodeGraph is enabled through the Community Tool path, every sub-agent
+	// needs the same search-order rule the orchestrator gets; task artifact
+	// references alone are not enough.
+	injectCodeGraphGuidanceIntoOpenCodeSubagentPrompts(agentsMap, codeGraphGuidance)
 
 	result, err := json.MarshalIndent(overlay, "", "  ")
 	if err != nil {
@@ -988,6 +1016,15 @@ func removeLegacyOpenCodePlainChatPreflightLines(prompt string) string {
 }
 
 func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
+	prompt = strings.NewReplacer(
+		"run a fresh-context review unless the diff is trivial docs/text",
+		"run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial docs/text",
+		"stop and run a fresh audit before continuing",
+		"stop and run the concrete audit/review lens(es) selected by Review Lens Selection before continuing",
+		"use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents",
+		"use fresh context with the selected concrete review lens(es) for adversarial review of diffs, conflicts, PR readiness, and incidents",
+	).Replace(prompt)
+
 	delegation := `
 
 <!-- gentle-ai:delegation-hard-gates-migration -->
@@ -1001,10 +1038,24 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 
 1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task. If delegation tooling is unavailable, document the blocker and stop the exploration instead of reading everything inline.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer. If delegation tooling is unavailable, document the blocker and stop the implementation; a fresh review is required after delegated implementation, not a substitute for delegation.
-3. **PR rule**: before commit, push, or PR after code changes, run a fresh-context review unless the diff is trivial docs/text.
-4. **Incident rule**: after wrong ` + "`cwd`" + `, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run a fresh audit before continuing.
+3. **PR rule**: before commit, push, or PR after code changes, run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial docs/text.
+4. **Incident rule**: after wrong ` + "`cwd`" + `, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run the concrete audit/review lens(es) selected by Review Lens Selection before continuing.
 5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate the remaining work instead of silently continuing monolithically. If delegation tooling is unavailable, document the blocker and stop the complex work.
-6. **Fresh review rule**: use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+6. **Fresh review rule**: use fresh context with the selected concrete review lens(es) for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+
+#### Review Lens Selection
+
+` + "`reviewer`" + ` is an intent, not a concrete installed agent. When a fresh review/audit is required, select concrete lenses by risk profile:
+
+| Risk signal | Review lens |
+| --- | --- |
+| Clear naming, structure, maintainability, or small refactors | ` + "`review-readability`" + ` |
+| Behavior, state, tests, determinism, or regressions | ` + "`review-reliability`" + ` |
+| Shell/process integration, partial failures, recovery, or degraded dependencies | ` + "`review-resilience`" + ` |
+| Security, permissions, data exposure/loss, architecture, or dependencies | ` + "`review-risk`" + ` |
+| Large PR, hot path, or >400 changed lines | full 4R: ` + "`review-risk`" + `, ` + "`review-resilience`" + `, ` + "`review-readability`" + `, ` + "`review-reliability`" + ` |
+
+If multiple rows match, run the narrow set that covers the risk. Example: shell integration that mutates live state should use ` + "`review-reliability`" + ` plus ` + "`review-resilience`" + `, not ` + "`review-readability`" + ` by default.
 <!-- /gentle-ai:delegation-hard-gates-migration -->
 `
 
@@ -1019,7 +1070,16 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 		strings.Contains(prompt, "Fresh review rule") &&
 		strings.Contains(prompt, "Semantic guard") &&
 		strings.Contains(prompt, "execution, not delegation") &&
-		strings.Contains(prompt, "fresh review is required after delegated implementation, not a substitute for delegation") {
+		strings.Contains(prompt, "fresh review is required after delegated implementation, not a substitute for delegation") &&
+		strings.Contains(prompt, "run the concrete review lens(es) selected by Review Lens Selection") &&
+		strings.Contains(prompt, "run the concrete audit/review lens(es) selected by Review Lens Selection") &&
+		strings.Contains(prompt, "use fresh context with the selected concrete review lens(es)") &&
+		strings.Contains(prompt, "#### Review Lens Selection") &&
+		strings.Contains(prompt, "`reviewer` is an intent, not a concrete installed agent") &&
+		strings.Contains(prompt, "`review-readability`") &&
+		strings.Contains(prompt, "`review-reliability`") &&
+		strings.Contains(prompt, "`review-resilience`") &&
+		strings.Contains(prompt, "`review-risk`") {
 		return prompt
 	}
 
@@ -1989,13 +2049,6 @@ func stripBareOrchestratorSection(content string) string {
 func injectMarkdownSections(homeDir string, adapter agents.Adapter, legacyAssignments map[string]model.ClaudeModelAlias, phaseAssignments map[string]model.ClaudePhaseAssignment) (InjectionResult, error) {
 	promptPath := adapter.SystemPromptFile(homeDir)
 	content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
-	if adapter.Agent() == model.AgentClaudeCode && (len(legacyAssignments) > 0 || len(phaseAssignments) > 0) {
-		var err error
-		content, err = injectClaudePhaseAssignments(content, legacyAssignments, phaseAssignments)
-		if err != nil {
-			return InjectionResult{}, err
-		}
-	}
 
 	existing, err := readFileOrEmpty(promptPath)
 	if err != nil {
@@ -2020,6 +2073,32 @@ func injectMarkdownSections(homeDir string, adapter agents.Adapter, legacyAssign
 	}
 
 	return InjectionResult{Changed: writeResult.Changed, Files: []string{promptPath}}, nil
+}
+
+func writeClaudeLazySDDWorkflow(homeDir string, adapter agents.Adapter, legacyAssignments map[string]model.ClaudeModelAlias, phaseAssignments map[string]model.ClaudePhaseAssignment) (InjectionResult, error) {
+	if adapter.Agent() != model.AgentClaudeCode {
+		return InjectionResult{}, nil
+	}
+	skillDir := adapter.SkillsDir(homeDir)
+	if strings.TrimSpace(skillDir) == "" {
+		return InjectionResult{}, nil
+	}
+
+	content := assets.MustRead("claude/sdd-orchestrator-workflow.md")
+	if len(legacyAssignments) > 0 || len(phaseAssignments) > 0 {
+		var err error
+		content, err = injectClaudePhaseAssignments(content, legacyAssignments, phaseAssignments)
+		if err != nil {
+			return InjectionResult{}, err
+		}
+	}
+
+	path := filepath.Join(skillDir, "_shared", "sdd-orchestrator-workflow.md")
+	writeResult, err := filemerge.WriteFileAtomic(path, []byte(content), 0o644)
+	if err != nil {
+		return InjectionResult{}, err
+	}
+	return InjectionResult{Changed: writeResult.Changed, Files: []string{path}}, nil
 }
 
 var claudeModelAssignmentRowOrder = []string{

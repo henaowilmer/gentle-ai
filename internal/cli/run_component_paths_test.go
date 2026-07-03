@@ -45,6 +45,18 @@ func TestComponentPathsSDDIncludesOpenCodeSettingsAndCommands(t *testing.T) {
 	}
 }
 
+func TestComponentPathsSDDIncludesClaudeLazyWorkflow(t *testing.T) {
+	home := t.TempDir()
+	adapters := resolveAdapters([]model.AgentID{model.AgentClaudeCode})
+
+	paths := componentPaths(home, model.Selection{}, adapters, model.ComponentSDD)
+
+	workflow := filepath.Join(home, ".claude", "skills", "_shared", "sdd-orchestrator-workflow.md")
+	if !containsPath(paths, workflow) {
+		t.Fatalf("componentPaths(sdd) missing Claude lazy workflow path %q\npaths=%v", workflow, paths)
+	}
+}
+
 func TestComponentPathsSDDMultiIncludesOpenCodePlugins(t *testing.T) {
 	home := t.TempDir()
 	adapters := resolveAdapters([]model.AgentID{model.AgentOpenCode})
@@ -356,6 +368,22 @@ func TestComponentPathsContext7KimiIncludesMCPConfig(t *testing.T) {
 	want := filepath.Join(home, ".kimi", "mcp.json")
 	if !containsPath(paths, want) {
 		t.Fatalf("componentPaths(context7,kimi) missing %q\npaths=%v", want, paths)
+	}
+}
+
+func TestComponentPathsContext7ClaudeUsesSettingsFile(t *testing.T) {
+	home := t.TempDir()
+	adapters := resolveAdapters([]model.AgentID{model.AgentClaudeCode})
+
+	paths := componentPaths(home, model.Selection{}, adapters, model.ComponentContext7)
+
+	want := filepath.Join(home, ".claude", "settings.json")
+	if !containsPath(paths, want) {
+		t.Fatalf("componentPaths(context7,claude) missing %q\npaths=%v", want, paths)
+	}
+	legacy := filepath.Join(home, ".claude", "mcp", "context7.json")
+	if containsPath(paths, legacy) {
+		t.Fatalf("componentPaths(context7,claude) should not verify legacy path %q\npaths=%v", legacy, paths)
 	}
 }
 

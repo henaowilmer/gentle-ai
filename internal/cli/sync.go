@@ -438,7 +438,7 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 		})
 	}
 
-	if shouldRefreshCodeGraphGuidance(r.homeDir) {
+	if shouldHandleCodeGraphGuidance(r.homeDir) {
 		apply = append(apply, codeGraphGuidanceSyncStep{
 			id:           "sync:community-tool:codegraph-guidance",
 			homeDir:      r.homeDir,
@@ -449,8 +449,11 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 	return pipeline.StagePlan{Prepare: prepare, Apply: apply}
 }
 
-func shouldRefreshCodeGraphGuidance(homeDir string) bool {
-	return communitytool.HasConfiguredCodeGraph(homeDir, communitytool.DetectorFunc(cmdLookPath))
+// shouldHandleCodeGraphGuidance gates both managed CodeGraph guidance refresh
+// and cleanup of legacy guidance blocks left by older installers.
+func shouldHandleCodeGraphGuidance(homeDir string) bool {
+	return communitytool.HasConfiguredCodeGraph(homeDir, communitytool.DetectorFunc(cmdLookPath)) ||
+		communitytool.HasLegacyCodeGraphGuidance(homeDir)
 }
 
 // syncBackupTargets returns the file paths that need to be backed up
@@ -464,7 +467,7 @@ func syncBackupTargets(homeDir, workspaceDir string, selection model.Selection, 
 			paths[path] = struct{}{}
 		}
 	}
-	if shouldRefreshCodeGraphGuidance(homeDir) {
+	if shouldHandleCodeGraphGuidance(homeDir) {
 		for _, path := range communitytool.CodeGraphGuidancePaths(homeDir) {
 			paths[path] = struct{}{}
 		}
@@ -586,9 +589,15 @@ func (s codeGraphGuidanceSyncStep) ID() string {
 }
 
 func (s codeGraphGuidanceSyncStep) Run() error {
-	res, _, err := communitytool.RefreshCodeGraphGuidanceIfConfigured(s.homeDir, communitytool.DetectorFunc(cmdLookPath))
+	res, configured, err := communitytool.RefreshCodeGraphGuidanceIfConfigured(s.homeDir, communitytool.DetectorFunc(cmdLookPath))
 	if err != nil {
 		return fmt.Errorf("sync CodeGraph guidance: %w", err)
+	}
+	if !configured {
+		res, err = communitytool.CleanLegacyCodeGraphGuidance(s.homeDir)
+		if err != nil {
+			return fmt.Errorf("sync legacy CodeGraph guidance cleanup: %w", err)
+		}
 	}
 	if s.changedFiles != nil && res.Changed {
 		*s.changedFiles = append(*s.changedFiles, res.Files...)
@@ -688,6 +697,7 @@ func (s componentSyncStep) Run() error {
 				StrictTDD:                          s.selection.StrictTDD,
 				PreserveOpenCodeOrchestratorPrompt: profileStrategy == model.SDDProfileStrategyExternalSingleActive,
 				Profiles:                           profiles,
+				CodeGraphGuidanceMarkdown:          codeGraphGuidanceMarkdownForSDD(s.homeDir, nil),
 			}
 			res, err := sdd.Inject(targetDir, adapter, sddMode, opts)
 			if err != nil {
