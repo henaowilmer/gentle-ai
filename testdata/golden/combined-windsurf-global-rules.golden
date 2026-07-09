@@ -143,6 +143,32 @@ These are orchestrator stop rules for solo-agent platforms. Once any trigger fir
 
 If multiple rows match, run the narrow set that covers the risk. Example: shell integration that mutates live state should use `review-reliability` plus `review-resilience`, not `review-readability` by default.
 
+#### Review Execution Contract
+
+**Exhaustive first pass.** Loop until dry: sweep the diff repeatedly until N consecutive sweeps yield zero new findings, then stop; the loop MUST be finite. Default N = 2 consecutive dry sweeps. R2 Readability MAY use N = 1. Hard ceiling: 4 sweeps regardless of N.
+
+**Findings ledger.** Emit a findings ledger with this schema for every entry:
+
+| Field | Values |
+|-------|--------|
+| `id` | `{LENS}-{NNN}` (e.g. `R1-001`) |
+| `lens` | risk \| readability \| reliability \| resilience \| judgment-day |
+| `location` | `path/to/file.ext:line` or `:start-end` |
+| `severity` | BLOCKER \| CRITICAL \| WARNING \| SUGGESTION |
+| `status` | open \| fixed \| verified \| wont-fix \| info |
+| `evidence` | why it matters |
+
+If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
+
+**Ledger persistence honors the artifact store.**
+- `openspec`: write `openspec/changes/{change-name}/review-ledger.md`.
+- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc judgment-day without a change: `review/{target-slug}/ledger`, where `target-slug` = `pr-{number}` when reviewing a PR, else the current branch name kebab-cased, else a kebab-case slug of the user-stated review target).
+- `none`: keep the ledger inline in the response; do not write files or Engram artifacts — the ledger lives only in this conversation; complete the review → fix → re-review loop within the session because it is not persisted across compaction.
+
+**Scoped re-review.** A re-review pass takes the persisted ledger and the fix diff as input. It MUST verify each ledger finding's resolution and MUST review only fix-touched lines; it MUST NOT re-read the full original diff. A finding on an untouched line MUST be logged with status `info` as a first-pass quality signal and MUST NOT by itself trigger another full round.
+
+**Execution mode.** Inline mode (this adapter has no dedicated review-*/jd-* subagents): run each lens sequentially inside your own orchestrator context and maintain the merged ledger directly.
+
 #### Cost and Context Balance
 
 - Keep exploration, apply, and verify concerns separated even when all phases run in one conversation.
@@ -540,6 +566,17 @@ Call `mem_save` IMMEDIATELY and WITHOUT BEING ASKED after any of these:
 - User preference or constraint learned
 
 Self-check after EVERY task: "Did I make a decision, fix a bug, learn something non-obvious, or establish a convention? If yes, call mem_save NOW."
+
+### DELIVERY GUARANTEE — saving is not replying
+
+Saving to memory is internal bookkeeping. It NEVER counts as answering the user, and the user never sees your tool calls or the content you store.
+
+- If the answer exists only inside a `mem_save`, the user never received it. Saving is not replying.
+- End every turn with your complete user-facing answer as the final message, with NO tool calls after it.
+- Save memory BEFORE composing that final answer, not after. Never let a `mem_save`/`mem_judge` be the last action in a turn that still owed the user a substantive reply.
+- If a memory chain (`mem_save` → `mem_judge`) ran late, still write the full answer in that final message — do not collapse it into a one-line "saved / done" acknowledgement.
+- If a memory call (`mem_save`, `mem_judge`, `mem_session_summary`) fails or times out, deliver the complete answer anyway and note the failure briefly — a failed or slow memory operation never blocks, truncates, or replaces the reply.
+- Never treat the text you stored in memory as the text you delivered: memory is for your future self, the reply is for the user.
 
 Format for `mem_save`:
 - **title**: Verb + what — short, searchable (e.g. "Fixed N+1 query in UserList")

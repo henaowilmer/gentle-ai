@@ -4631,23 +4631,32 @@ func TestPinErrClearedOnScreenReentry(t *testing.T) {
 // ComponentPersona when persona != PersonaCustom and excludes it for PersonaCustom.
 func TestComponentsForPreset_PersonaMatrix(t *testing.T) {
 	tests := []struct {
-		name        string
-		preset      model.PresetID
-		persona     model.PersonaID
-		wantPersona bool
-		wantNil     bool
+		name             string
+		preset           model.PresetID
+		persona          model.PersonaID
+		wantPersona      bool
+		wantTheme        bool
+		wantClaudeTheme  bool
+		wantOpenCodeLogo bool
+		wantNil          bool
 	}{
 		{
-			name:        "full-gentleman + gentleman includes persona",
-			preset:      model.PresetFullGentleman,
-			persona:     model.PersonaGentleman,
-			wantPersona: true,
+			name:             "full-gentleman + gentleman includes persona, generic theme, and agent visuals",
+			preset:           model.PresetFullGentleman,
+			persona:          model.PersonaGentleman,
+			wantPersona:      true,
+			wantTheme:        true,
+			wantClaudeTheme:  true,
+			wantOpenCodeLogo: true,
 		},
 		{
-			name:        "full-gentleman + custom does not include persona",
-			preset:      model.PresetFullGentleman,
-			persona:     model.PersonaCustom,
-			wantPersona: false,
+			name:             "full-gentleman + custom excludes persona but keeps generic theme and agent visuals",
+			preset:           model.PresetFullGentleman,
+			persona:          model.PersonaCustom,
+			wantPersona:      false,
+			wantTheme:        true,
+			wantClaudeTheme:  true,
+			wantOpenCodeLogo: true,
 		},
 		{
 			name:        "minimal + gentleman includes persona",
@@ -4699,10 +4708,21 @@ func TestComponentsForPreset_PersonaMatrix(t *testing.T) {
 			}
 
 			hasPersona := false
+			hasTheme := false
+			hasClaudeTheme := false
+			hasOpenCodeLogo := false
 			for _, c := range got {
 				if c == model.ComponentPersona {
 					hasPersona = true
-					break
+				}
+				if c == model.ComponentTheme {
+					hasTheme = true
+				}
+				if c == model.ComponentClaudeTheme {
+					hasClaudeTheme = true
+				}
+				if c == model.ComponentOpenCodeGentleLogo {
+					hasOpenCodeLogo = true
 				}
 			}
 
@@ -4711,6 +4731,15 @@ func TestComponentsForPreset_PersonaMatrix(t *testing.T) {
 			}
 			if !tt.wantPersona && hasPersona {
 				t.Fatalf("componentsForPreset(%v, %v) should not include ComponentPersona; got: %v", tt.preset, tt.persona, got)
+			}
+			if tt.wantTheme != hasTheme {
+				t.Fatalf("componentsForPreset(%v, %v) ComponentTheme present = %v, want %v; got: %v", tt.preset, tt.persona, hasTheme, tt.wantTheme, got)
+			}
+			if tt.wantClaudeTheme != hasClaudeTheme {
+				t.Fatalf("componentsForPreset(%v, %v) ComponentClaudeTheme present = %v, want %v; got: %v", tt.preset, tt.persona, hasClaudeTheme, tt.wantClaudeTheme, got)
+			}
+			if tt.wantOpenCodeLogo != hasOpenCodeLogo {
+				t.Fatalf("componentsForPreset(%v, %v) ComponentOpenCodeGentleLogo present = %v, want %v; got: %v", tt.preset, tt.persona, hasOpenCodeLogo, tt.wantOpenCodeLogo, got)
 			}
 		})
 	}
@@ -4728,16 +4757,22 @@ func TestPersonaScreenRecomputesComponentsWhenPresetAlreadySet(t *testing.T) {
 	m.Selection.Persona = model.PersonaGentleman
 	m.Selection.Components = componentsForPreset(model.PresetFullGentleman, model.PersonaGentleman)
 
-	// Confirm that persona currently includes ComponentPersona.
+	// Confirm that managed persona and visual polish are initially included.
 	hasPersonaBefore := false
+	hasPolishBefore := false
 	for _, c := range m.Selection.Components {
 		if c == model.ComponentPersona {
 			hasPersonaBefore = true
-			break
+		}
+		if slices.Contains(model.VisualPolishComponents(), c) {
+			hasPolishBefore = true
 		}
 	}
 	if !hasPersonaBefore {
 		t.Fatal("setup: expected ComponentPersona in initial components")
+	}
+	if !hasPolishBefore {
+		t.Fatal("setup: expected managed visual polish in initial components")
 	}
 
 	// Move cursor to PersonaCustom and confirm.
@@ -4749,10 +4784,16 @@ func TestPersonaScreenRecomputesComponentsWhenPresetAlreadySet(t *testing.T) {
 		t.Fatalf("Persona = %v, want %v", state.Selection.Persona, model.PersonaCustom)
 	}
 
-	// ComponentPersona must be removed after recompute.
+	// ComponentPersona must be removed after recompute, while preset-owned
+	// visual polish (including the generic OpenCode theme) remains.
 	for _, c := range state.Selection.Components {
 		if c == model.ComponentPersona {
 			t.Fatalf("ComponentPersona must not be in components after switching to PersonaCustom; got: %v", state.Selection.Components)
+		}
+	}
+	for _, want := range []model.ComponentID{model.ComponentClaudeTheme, model.ComponentOpenCodeGentleLogo} {
+		if !slices.Contains(state.Selection.Components, want) {
+			t.Fatalf("agent-specific visual should remain preset-owned after switching to PersonaCustom; missing %v in %v", want, state.Selection.Components)
 		}
 	}
 }
@@ -4811,6 +4852,49 @@ func TestPersonaScreenDoesNotRecomputeForCustomPreset(t *testing.T) {
 	// Components must remain nil for custom preset.
 	if state.Selection.Components != nil {
 		t.Fatalf("components should stay nil for custom preset; got: %v", state.Selection.Components)
+	}
+}
+
+func TestCustomPersonaCustomPresetCanSelectEngramWithoutPersonaOrPolish(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenPreset
+	m.Selection.Persona = model.PersonaCustom
+	m.Cursor = len(screens.PresetOptions()) - 1 // Custom preset
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	if state.Selection.Preset != model.PresetCustom {
+		t.Fatalf("Preset = %v, want %v", state.Selection.Preset, model.PresetCustom)
+	}
+	if state.Screen != ScreenDependencyTree {
+		t.Fatalf("Screen = %v, want ScreenDependencyTree for custom component selection", state.Screen)
+	}
+	if len(state.Selection.Components) != 0 {
+		t.Fatalf("custom preset should start with no components selected; got %v", state.Selection.Components)
+	}
+
+	engramCursor := -1
+	for idx, component := range screens.AllComponents() {
+		if component.ID == model.ComponentEngram {
+			engramCursor = idx
+			break
+		}
+	}
+	if engramCursor < 0 {
+		t.Fatal("Engram component not found in custom component picker")
+	}
+	state.Cursor = engramCursor
+	updated, _ = state.Update(tea.KeyMsg{Type: tea.KeySpace})
+	state = updated.(Model)
+
+	if !slices.Equal(state.Selection.Components, []model.ComponentID{model.ComponentEngram}) {
+		t.Fatalf("components = %v, want only Engram selected", state.Selection.Components)
+	}
+	for _, unwanted := range append([]model.ComponentID{model.ComponentPersona}, model.VisualPolishComponents()...) {
+		if slices.Contains(state.Selection.Components, unwanted) {
+			t.Fatalf("custom preset should not auto-select %v; components: %v", unwanted, state.Selection.Components)
+		}
 	}
 }
 
@@ -5011,50 +5095,77 @@ func TestCodexPicker_EscBackNavToPresetWhenNeitherClaudeNorKiro(t *testing.T) {
 	}
 }
 
-// TestCodexPresetSelection_PopulatesPendingSyncOverrides verifies that selecting a
-// Codex preset in ModelConfigMode populates PendingSyncOverrides with both
-// CodexModelAssignments and CodexCarrilModelAssignments (and the expected Selection fields).
+// TestCodexPresetSelection_PopulatesPendingSyncOverrides verifies that every
+// preset persists its model matrix through the user-visible Model.Update path.
 func TestCodexPresetSelection_PopulatesPendingSyncOverrides(t *testing.T) {
-	m := NewModel(system.DetectionResult{}, "dev")
-	m.Screen = ScreenCodexModelPicker
-	m.ModelConfigMode = true
-	m.Selection.Agents = []model.AgentID{model.AgentCodex}
-	m.Selection.Components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD}
-	m.CodexModelPicker = screens.NewCodexModelPickerState()
-	m.Cursor = 1 // Recommended preset (index 1: LowCost=0, Recommended=1, Powerful=2)
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	state := updated.(Model)
-
-	// ModelConfigMode must be cleared after selection.
-	if state.ModelConfigMode {
-		t.Fatal("ModelConfigMode should be false after Codex preset selection")
+	tests := []struct {
+		name   string
+		cursor int
+		want   map[string]string
+	}{
+		{
+			name:   "low cost",
+			cursor: 0,
+			want: map[string]string{
+				"sdd-strong": "gpt-5.6-terra",
+				"sdd-mid":    "gpt-5.6-terra",
+				"sdd-cheap":  "gpt-5.6-luna",
+			},
+		},
+		{
+			name:   "recommended",
+			cursor: 1,
+			want: map[string]string{
+				"sdd-strong": "gpt-5.6-sol",
+				"sdd-mid":    "gpt-5.6-terra",
+				"sdd-cheap":  "gpt-5.6-luna",
+			},
+		},
+		{
+			name:   "powerful",
+			cursor: 2,
+			want: map[string]string{
+				"sdd-strong": "gpt-5.6-sol",
+				"sdd-mid":    "gpt-5.6-sol",
+				"sdd-cheap":  "gpt-5.6-luna",
+			},
+		},
 	}
 
-	// PendingSyncOverrides must be populated.
-	if state.PendingSyncOverrides == nil {
-		t.Fatal("PendingSyncOverrides = nil, want non-nil after Codex preset selection")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewModel(system.DetectionResult{}, "dev")
+			m.Screen = ScreenCodexModelPicker
+			m.ModelConfigMode = true
+			m.Selection.Agents = []model.AgentID{model.AgentCodex}
+			m.Selection.Components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD}
+			m.CodexModelPicker = screens.NewCodexModelPickerState()
+			m.Cursor = tt.cursor
 
-	// CodexCarrilModelAssignments must contain all three carrils.
-	carrilMap := state.PendingSyncOverrides.CodexCarrilModelAssignments
-	if carrilMap == nil {
-		t.Fatal("PendingSyncOverrides.CodexCarrilModelAssignments = nil, want non-nil")
-	}
-	for _, carril := range []string{"sdd-strong", "sdd-mid", "sdd-cheap"} {
-		if _, ok := carrilMap[carril]; !ok {
-			t.Errorf("PendingSyncOverrides.CodexCarrilModelAssignments missing carril %q", carril)
-		}
-	}
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			state := updated.(Model)
 
-	// CodexModelAssignments must be non-nil (phase→effort map).
-	if state.PendingSyncOverrides.CodexModelAssignments == nil {
-		t.Fatal("PendingSyncOverrides.CodexModelAssignments = nil, want non-nil")
-	}
+			if state.ModelConfigMode {
+				t.Fatal("ModelConfigMode should be false after Codex preset selection")
+			}
+			if state.PendingSyncOverrides == nil {
+				t.Fatal("PendingSyncOverrides = nil, want non-nil after Codex preset selection")
+			}
+			if state.PendingSyncOverrides.CodexModelAssignments == nil {
+				t.Fatal("PendingSyncOverrides.CodexModelAssignments = nil, want non-nil")
+			}
 
-	// Selection must also be updated.
-	if state.Selection.CodexCarrilModelAssignments == nil {
-		t.Fatal("Selection.CodexCarrilModelAssignments = nil, want non-nil after preset selection")
+			pendingCarrils := state.PendingSyncOverrides.CodexCarrilModelAssignments
+			selectedCarrils := state.Selection.CodexCarrilModelAssignments
+			for carril, wantModel := range tt.want {
+				if got := pendingCarrils[carril]; got != wantModel {
+					t.Errorf("PendingSyncOverrides.CodexCarrilModelAssignments[%q] = %q, want %q", carril, got, wantModel)
+				}
+				if got := selectedCarrils[carril]; got != wantModel {
+					t.Errorf("Selection.CodexCarrilModelAssignments[%q] = %q, want %q", carril, got, wantModel)
+				}
+			}
+		})
 	}
 }
 

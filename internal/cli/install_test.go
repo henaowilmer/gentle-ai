@@ -104,6 +104,37 @@ func TestNormalizeInstallFlagsChannelBeta(t *testing.T) {
 	}
 }
 
+func TestNormalizeInstallFlagsFullPresetCustomPersonaKeepsPresetPolish(t *testing.T) {
+	input, err := NormalizeInstallFlags(InstallFlags{
+		Preset:  string(model.PresetFullGentleman),
+		Persona: string(model.PersonaCustom),
+	}, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("NormalizeInstallFlags() error = %v", err)
+	}
+
+	for _, got := range input.Selection.Components {
+		if got == model.ComponentPersona {
+			t.Fatalf("components should not include persona for custom persona; got %#v", input.Selection.Components)
+		}
+	}
+
+	// Default agents include OpenCode, so the generic OpenCode theme stays
+	// scoped in alongside the agent-specific visual polish.
+	for _, want := range []model.ComponentID{model.ComponentTheme, model.ComponentClaudeTheme, model.ComponentOpenCodeGentleLogo} {
+		found := false
+		for _, got := range input.Selection.Components {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("components should include preset polish %q; got %#v", want, input.Selection.Components)
+		}
+	}
+}
+
 func TestNormalizeInstallFlagsCustomAcceptsOptionalGentlemanInstallables(t *testing.T) {
 	input, err := NormalizeInstallFlags(InstallFlags{
 		Preset:     string(model.PresetCustom),

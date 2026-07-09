@@ -79,6 +79,21 @@ var (
 		return engram.DownloadLatestBinary(profile, false)
 	}
 
+	// verifyEngramVersion resolves the installed engram binary version, threaded
+	// into InjectOptions.Version (Decision 1 gate) and used to compute the
+	// per-slug --protocol forwarding verdict. Package-level var for
+	// testability — tests replace this to avoid depending on a real
+	// installed engram binary. Overridden to a safe fake for the whole
+	// package's test run (see TestMain in protocol_probe_test.go).
+	verifyEngramVersion        = engram.VerifyVersion
+	verifyEngramVersionCommand = engram.VerifyVersionCommand
+
+	// probeEngramProtocolFlag detects whether the installed engram binary
+	// supports the --protocol verbosity flag (design.md Decision 4).
+	// Package-level var for testability — same rationale as verifyEngramVersion.
+	probeEngramProtocolFlag        = engram.ProbeProtocolFlag
+	probeEngramProtocolFlagCommand = engram.ProbeProtocolFlagCommand
+
 	// AppVersion is the gentle-ai version that will be written into backup manifests.
 	// It is set by app.go before any CLI operation so that every backup created during
 	// an install or sync records which version of gentle-ai made it.
@@ -164,7 +179,14 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		return result, fmt.Errorf("execute install pipeline: %w", result.Execution.Err)
 	}
 
-	result.Verify = runPostApplyVerification(homeDir, runtime.workspaceDir, input.Scope, input.Selection, resolved)
+	result.Verify = runPostApplyVerification(postApplyVerificationInput{
+		HomeDir:      homeDir,
+		WorkspaceDir: runtime.workspaceDir,
+		Scope:        input.Scope,
+		Selection:    input.Selection,
+		Resolved:     resolved,
+		State:        runtime.state,
+	})
 	result.Verify = withPostInstallNotes(result.Verify, resolved)
 	if !result.Verify.Ready {
 		return result, fmt.Errorf("post-apply verification failed:\n%s", verify.RenderReport(result.Verify))
@@ -420,6 +442,15 @@ type installRuntime struct {
 
 type runtimeState struct {
 	manifest backup.Manifest
+
+	// engramVersionResolved, engramVersion, and engramVersionErr cache the
+	// single `engram version` invocation performed by componentApplyStep.Run
+	// for ComponentEngram (Decision 1 gate), so the post-apply health check
+	// (engramHealthChecks) can reuse the result instead of shelling out to
+	// `engram version` a second time (JD-016).
+	engramVersionResolved bool
+	engramVersion         string
+	engramVersionErr      error
 }
 
 func newInstallRuntime(homeDir string, scope InstallScope, channel InstallChannel, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (*installRuntime, error) {
@@ -498,6 +529,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 			selection:    r.selection,
 			profile:      r.profile,
 			channel:      r.channel,
+			state:        r.state,
 		})
 	}
 
@@ -679,6 +711,7 @@ type componentApplyStep struct {
 	selection    model.Selection
 	profile      system.PlatformProfile
 	channel      InstallChannel
+	state        *runtimeState
 }
 
 type communityToolInstallStep struct {
@@ -699,6 +732,31 @@ func (s communityToolInstallStep) Run() error {
 
 func (s componentApplyStep) ID() string {
 	return s.id
+}
+
+// computeSlugSlimVerdicts implements the Per-slug forwarding semantics
+// (design.md Decision 4): a slug only forwards --protocol=slim when every
+// adapter sharing it independently verifies slim (safest-wins AND
+// semantics). isSlim is injected so tests can pin the AND logic with a
+// synthetic slim+full pair sharing a slug (JD-017), independent of the real
+// IsVerifiedSlimAdapter matrix (which today only ever verifies Claude Code).
+func computeSlugSlimVerdicts(agentIDs []model.AgentID, isSlim func(model.AgentID) bool) map[string]bool {
+	verdicts := make(map[string]bool, len(agentIDs))
+	seen := make(map[string]bool, len(agentIDs))
+	for _, agent := range agentIDs {
+		slug, ok := engram.SetupAgentSlug(agent)
+		if !ok {
+			continue
+		}
+		verdict := isSlim(agent)
+		if !seen[slug] {
+			verdicts[slug] = verdict
+			seen[slug] = true
+		} else {
+			verdicts[slug] = verdicts[slug] && verdict
+		}
+	}
+	return verdicts
 }
 
 // resolveAdapters creates adapters for each agent ID, skipping unsupported ones.
@@ -771,6 +829,20 @@ func engramBinaryDirsOnPath(pathEntries []string, goos string) []string {
 	return dirs
 }
 
+func resolveEngramVersion(command string) (string, error) {
+	if strings.TrimSpace(command) == "" || command == "engram" {
+		return verifyEngramVersion()
+	}
+	return verifyEngramVersionCommand(command)
+}
+
+func resolveEngramProtocolFlag(ctx context.Context, command string) (string, error) {
+	if strings.TrimSpace(command) == "" || command == "engram" {
+		return probeEngramProtocolFlag(ctx)
+	}
+	return probeEngramProtocolFlagCommand(ctx, command)
+}
+
 func splitPathForOS(value, goos string) []string {
 	separator := string(os.PathListSeparator)
 	if goos == "windows" {
@@ -820,6 +892,7 @@ func (s componentApplyStep) Run() error {
 					// Non-fatal: warn but continue — the binary was downloaded successfully.
 					fmt.Fprintf(os.Stderr, "WARNING: could not add %s to PATH: %v\n", binDir, err)
 				}
+				engramCommand = binaryPath
 			}
 		} else if shouldRefreshWindowsEngram(s.profile, installedPath, pathEnvEntries(s.profile)) {
 			binaryPath, err := engramDownloadFn(s.profile)
@@ -838,12 +911,69 @@ func (s componentApplyStep) Run() error {
 		}
 		setupMode := engram.ParseSetupMode(os.Getenv(engram.SetupModeEnvVar))
 		setupStrict := engram.ParseSetupStrict(os.Getenv(engram.SetupStrictEnvVar))
+
+		// Resolve the installed engram version once (Decision 1 gate). Errors are
+		// intentionally ignored for gating purposes: an empty version string
+		// safely falls back to the full protocol section and the full setup
+		// verdict for every adapter. The result (including the error) is cached
+		// on s.state so the post-apply health check reuses it instead of
+		// shelling out to `engram version` a second time (JD-016).
+		engramVersion, versionErr := resolveEngramVersion(engramCommand)
+		if s.state != nil {
+			s.state.engramVersionResolved = true
+			s.state.engramVersion = engramVersion
+			s.state.engramVersionErr = versionErr
+		}
+
+		// Probe --protocol support once before the adapter loop (Decision 4),
+		// but only when at least one selected adapter will actually attempt
+		// `engram setup` under setupMode (JD-013): under
+		// GENTLE_AI_ENGRAM_SETUP_MODE=off, ShouldAttemptSetup is false for
+		// every adapter, no setup invocation ever happens, and the probe's
+		// result would never be used — so skip the (up to 5s) probe
+		// entirely rather than run it unconditionally.
+		willAttemptSetup := false
+		for _, adapter := range adapters {
+			if engram.ShouldAttemptSetup(setupMode, adapter.Agent()) {
+				willAttemptSetup = true
+				break
+			}
+		}
+		protocolFlagSupported := false
+		if willAttemptSetup {
+			if stdout, err := resolveEngramProtocolFlag(context.Background(), engramCommand); err == nil {
+				protocolFlagSupported = strings.Contains(stdout, "--protocol")
+			}
+		}
+
+		// Compute the safest-wins verdict per setup slug (Per-slug
+		// forwarding semantics, design.md): a slug only forwards
+		// --protocol=slim when every adapter sharing it independently
+		// verifies slim. Extracted into computeSlugSlimVerdicts (JD-017) so
+		// the AND semantics can be pinned with a synthetic divergent-slug
+		// case independent of the RunInstall integration path.
+		agentIDs := make([]model.AgentID, 0, len(adapters))
+		for _, adapter := range adapters {
+			agentIDs = append(agentIDs, adapter.Agent())
+		}
+		slugSlimVerdict := computeSlugSlimVerdicts(agentIDs, func(agent model.AgentID) bool {
+			return engram.IsVerifiedSlimAdapter(agent, engramVersion)
+		})
+
 		attemptedSlugs := make(map[string]struct{}, len(adapters))
 		for _, adapter := range adapters {
 			if shouldAttemptEngramSetup(s.profile, setupMode, adapter.Agent()) {
 				slug, _ := engram.SetupAgentSlug(adapter.Agent())
 				if _, seen := attemptedSlugs[slug]; !seen {
-					if err := runCommand(engramCommand, "setup", slug); err != nil {
+					setupArgs := []string{"setup", slug}
+					if protocolFlagSupported {
+						mode := "full"
+						if slugSlimVerdict[slug] {
+							mode = "slim"
+						}
+						setupArgs = append(setupArgs, "--protocol="+mode)
+					}
+					if err := runCommand(engramCommand, setupArgs...); err != nil {
 						if setupStrict {
 							return fmt.Errorf("engram setup for %q: %w", adapter.Agent(), err)
 						}
@@ -854,6 +984,7 @@ func (s componentApplyStep) Run() error {
 			engramOpts := engram.InjectOptions{
 				CodexCarrilModelAssignments: s.selection.CodexCarrilModelAssignments,
 				CodexModelAssignments:       s.selection.CodexModelAssignments,
+				Version:                     engramVersion,
 			}
 			var err error
 			if adapter.Agent() == model.AgentOpenClaw {
@@ -1510,14 +1641,23 @@ func openCodeSDDPluginPaths(targetDir string) []string {
 	}
 }
 
-func runPostApplyVerification(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan) verify.Report {
+type postApplyVerificationInput struct {
+	HomeDir      string
+	WorkspaceDir string
+	Scope        InstallScope
+	Selection    model.Selection
+	Resolved     planner.ResolvedPlan
+	State        *runtimeState
+}
+
+func runPostApplyVerification(input postApplyVerificationInput) verify.Report {
 	checks := make([]verify.Check, 0)
-	adapters := resolveAdapters(resolved.Agents)
+	adapters := resolveAdapters(input.Resolved.Agents)
 
 	seenPath := make(map[string]struct{})
 	var uniqueFilePaths []string
-	for _, component := range resolved.OrderedComponents {
-		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
+	for _, component := range input.Resolved.OrderedComponents {
+		for _, path := range componentPathsWithWorkspaceScoped(input.HomeDir, input.WorkspaceDir, input.Scope, input.Selection, adapters, component) {
 			if path == "" {
 				continue
 			}
@@ -1559,10 +1699,10 @@ func runPostApplyVerification(homeDir, workspaceDir string, scope InstallScope, 
 		})
 	}
 
-	if hasComponent(resolved.OrderedComponents, model.ComponentEngram) {
-		checks = append(checks, engramHealthChecks()...)
+	if hasComponent(input.Resolved.OrderedComponents, model.ComponentEngram) {
+		checks = append(checks, engramHealthChecks(input.State)...)
 	}
-	checks = append(checks, antigravityCollisionCheck(resolved.Agents)...)
+	checks = append(checks, antigravityCollisionCheck(input.Resolved.Agents)...)
 
 	return verify.BuildReport(verify.RunChecks(context.Background(), checks))
 }
@@ -1659,7 +1799,15 @@ func isTermuxShellEnvironment() bool {
 	return false
 }
 
-func engramHealthChecks() []verify.Check {
+// engramHealthChecks builds the post-apply engram soft checks. When state
+// already carries a resolved `engram version` result (componentApplyStep.Run
+// resolves it once for the Decision 1 gate whenever ComponentEngram is
+// applied), the version check reuses that result instead of shelling out to
+// `engram version` a second time (JD-016). The fallback path (state nil or
+// not yet resolved) still routes through the verifyEngramVersion seam var
+// rather than calling engram.VerifyVersion() directly, so it stays fakeable
+// in tests.
+func engramHealthChecks(state *runtimeState) []verify.Check {
 	return []verify.Check{
 		{
 			ID:          "verify:engram:binary",
@@ -1681,7 +1829,10 @@ func engramHealthChecks() []verify.Check {
 					// Binary not on PATH — skip version check gracefully.
 					return nil
 				}
-				_, err := engram.VerifyVersion()
+				if state != nil && state.engramVersionResolved {
+					return state.engramVersionErr
+				}
+				_, err := verifyEngramVersion()
 				return err
 			},
 		},
