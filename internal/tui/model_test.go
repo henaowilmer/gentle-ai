@@ -2042,6 +2042,15 @@ func TestUninstallConfirm_CancelCleanInstallReturnsToModeSelection(t *testing.T)
 	}
 }
 
+func TestCompleteViewShowsPipelineManualActions(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenComplete
+	m.Execution.ManualActions = []string{"Pi CodeGraph child drifted; preserved: /tmp/worker.md"}
+	if out := m.View(); !strings.Contains(out, "Manual actions required") || !strings.Contains(out, "child drifted") {
+		t.Fatalf("completion output missing Pi manual action: %q", out)
+	}
+}
+
 func TestUninstallConfirm_CleanInstallRunsSyncAfterUninstall(t *testing.T) {
 	m := NewModel(system.DetectionResult{}, "dev")
 	m.Screen = ScreenUninstallConfirm
@@ -5126,7 +5135,7 @@ func TestCodexPresetSelection_PopulatesPendingSyncOverrides(t *testing.T) {
 			cursor: 2,
 			want: map[string]string{
 				"sdd-strong": "gpt-5.6-sol",
-				"sdd-mid":    "gpt-5.6-sol",
+				"sdd-mid":    "gpt-5.6-terra",
 				"sdd-cheap":  "gpt-5.6-luna",
 			},
 		},
@@ -7279,5 +7288,27 @@ func TestStrictTDDForward(t *testing.T) {
 				t.Fatalf("screen = %v, want %v", got.Screen, tt.wantScreen)
 			}
 		})
+	}
+}
+
+func TestCodexModelPickerCustomConfirmSignalsOrchestratorClear(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenCodexModelPicker
+	m.ModelConfigMode = true
+	m.CodexModelPicker = screens.NewCodexModelPickerState()
+	m.CodexModelPicker.CustomMode = screens.CodexCustomModePhaseList
+	m.Selection.CodexOrchestratorAssignment = model.CodexPresetOrchestratorAssignment(string(model.CodexPresetRecommended))
+	m.Cursor = 13 // Confirm row after the 13 phases.
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+	if state.Selection.CodexOrchestratorAssignment != nil {
+		t.Fatalf("custom confirmation retained curated orchestrator: %#v", state.Selection.CodexOrchestratorAssignment)
+	}
+	if !state.Selection.ClearCodexOrchestratorAssignment {
+		t.Fatal("custom confirmation did not signal persisted orchestrator clear")
+	}
+	if state.PendingSyncOverrides == nil || !state.PendingSyncOverrides.ClearCodexOrchestratorAssignment {
+		t.Fatal("custom confirmation did not propagate clear signal to sync overrides")
 	}
 }

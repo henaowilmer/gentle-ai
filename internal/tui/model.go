@@ -1092,8 +1092,10 @@ func (m Model) View() string {
 			GGAInstalled:        hasSelectedComponent(m.Selection.Components, model.ComponentGGA),
 			FailedSteps:         extractFailedSteps(m.Execution),
 			RollbackPerformed:   len(m.Execution.Rollback.Steps) > 0,
+			RollbackComplete:    m.Execution.Rollback.Success,
 			MissingDeps:         extractMissingDeps(m.Detection),
 			AvailableUpdates:    extractAvailableUpdates(m.UpdateResults),
+			ManualActions:       m.Execution.ManualActions,
 		})
 	case ScreenBackups:
 		return screens.RenderBackups(m.Backups, m.Cursor, m.BackupScroll, m.PinErr)
@@ -1236,6 +1238,13 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// preset writes the same model matrix the UI displayed.
 				presetCarrilModels := model.CodexCarrilModelsForPreset(string(m.CodexModelPicker.Preset))
 				m.Selection.CodexCarrilModelAssignments = presetCarrilModels
+				if m.CodexModelPicker.CustomConfirmed {
+					m.Selection.CodexOrchestratorAssignment = nil
+					m.Selection.ClearCodexOrchestratorAssignment = true
+				} else {
+					m.Selection.CodexOrchestratorAssignment = model.CodexPresetOrchestratorAssignment(string(m.CodexModelPicker.Preset))
+					m.Selection.ClearCodexOrchestratorAssignment = false
+				}
 
 				// When the user confirmed Custom per-phase assignments, also
 				// persist the per-phase model map so the inject layer can render
@@ -1264,10 +1273,12 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 						phaseOverride = map[string]string{} // explicit clear signal for the preset path
 					}
 					m.PendingSyncOverrides = &model.SyncOverrides{
-						TargetAgents:                []model.AgentID{model.AgentCodex},
-						CodexModelAssignments:       assignments,
-						CodexCarrilModelAssignments: presetCarrilModels,
-						CodexPhaseModelAssignments:  phaseOverride,
+						TargetAgents:                     []model.AgentID{model.AgentCodex},
+						CodexModelAssignments:            assignments,
+						CodexOrchestratorAssignment:      m.Selection.CodexOrchestratorAssignment,
+						ClearCodexOrchestratorAssignment: m.Selection.ClearCodexOrchestratorAssignment,
+						CodexCarrilModelAssignments:      presetCarrilModels,
+						CodexPhaseModelAssignments:       phaseOverride,
 					}
 					m = m.withResetSyncState()
 					m.setScreen(ScreenSync)

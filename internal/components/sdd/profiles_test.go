@@ -976,7 +976,9 @@ func keysOf(m map[string]any) []string {
 
 func expectedTaskPermissions(suffix string) map[string]any {
 	permissions := map[string]any{
-		"*": "deny",
+		"*":       "deny",
+		"general": "allow",
+		"explore": "allow",
 	}
 	for _, phase := range profilePhaseOrder {
 		permissions[phase+suffix] = "allow"
@@ -986,6 +988,7 @@ func expectedTaskPermissions(suffix string) map[string]any {
 	for _, reviewAgent := range reviewAgentNames {
 		permissions[reviewAgent] = "allow"
 	}
+	permissions[reviewRefuterAgentName] = "allow"
 	// JD agents are global (not profile-scoped) — always unsuffixed.
 	for _, jd := range opencode.JDPhases() {
 		permissions[jd] = "allow"

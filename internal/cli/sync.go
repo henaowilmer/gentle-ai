@@ -445,6 +445,7 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 			changedFiles: &r.changedFiles,
 		})
 	}
+	apply = append(apply, piCodeGraphSyncStep{id: "sync:community-tool:pi-codegraph", homeDir: r.homeDir, workspaceDir: r.workspaceDir, changedFiles: &r.changedFiles})
 
 	return pipeline.StagePlan{Prepare: prepare, Apply: apply}
 }
@@ -471,6 +472,9 @@ func syncBackupTargets(homeDir, workspaceDir string, selection model.Selection, 
 		for _, path := range communitytool.CodeGraphGuidancePaths(homeDir) {
 			paths[path] = struct{}{}
 		}
+	}
+	for _, path := range communitytool.PiCodeGraphPaths(homeDir, workspaceDir) {
+		paths[path] = struct{}{}
 	}
 
 	targets := make([]string, 0, len(paths))
@@ -584,6 +588,23 @@ type codeGraphGuidanceSyncStep struct {
 	changedFiles *[]string
 }
 
+type piCodeGraphSyncStep struct {
+	id, homeDir, workspaceDir string
+	changedFiles              *[]string
+}
+
+func (s piCodeGraphSyncStep) ID() string { return s.id }
+func (s piCodeGraphSyncStep) Run() error {
+	result, configured, err := communitytool.RefreshPiCodeGraphIfConfigured(s.homeDir, s.workspaceDir)
+	if err != nil {
+		return fmt.Errorf("sync Pi CodeGraph: %w", err)
+	}
+	if configured && result.Changed && s.changedFiles != nil {
+		*s.changedFiles = append(*s.changedFiles, result.Files...)
+	}
+	return nil
+}
+
 func (s codeGraphGuidanceSyncStep) ID() string {
 	return s.id
 }
@@ -617,6 +638,7 @@ func (s componentSyncStep) Run() error {
 		// Sync: inject MCP config + system prompt protocol only.
 		// NO binary install. NO engram setup.
 		engramOpts := engram.InjectOptions{
+			CodexOrchestratorAssignment: s.selection.CodexOrchestratorAssignment,
 			CodexCarrilModelAssignments: s.selection.CodexCarrilModelAssignments,
 			CodexModelAssignments:       s.selection.CodexModelAssignments,
 		}
@@ -996,6 +1018,10 @@ func RunSync(args []string) (SyncResult, error) {
 		}
 		selection.ModelAssignments = m
 	}
+	if selection.CodexOrchestratorAssignment == nil && persistedState.CodexOrchestratorAssignment != nil {
+		selection.CodexOrchestratorAssignment = codexOrchestratorFromState(persistedState.CodexOrchestratorAssignment)
+	}
+
 	// Restore Codex effort and carril model assignments from state so that
 	// `gentle-ai sync` preserves the user's per-phase effort and per-carril
 	// model choices instead of falling back to canonical defaults every time.

@@ -45,22 +45,24 @@ type InstallResult struct {
 	Execution    pipeline.ExecutionResult
 	Verify       verify.Report
 	Dependencies system.DependencyReport
+	PiCodeGraph  *communitytool.PiCodeGraphResult
 	DryRun       bool
 }
 
 var (
-	osUserHomeDir        = os.UserHomeDir
-	osLookupEnv          = os.LookupEnv
-	osSetenv             = os.Setenv
-	osUnsetenv           = os.Unsetenv
-	osStat               = os.Stat
-	runCommand           = executeCommand
-	cmdLookPath          = exec.LookPath
-	streamCommandOutput  = true
-	goEnv                = defaultGoEnv
-	detectDependencies   = system.DetectDependencies
-	installCommunityTool = communitytool.Install
-	pathEnvEntries       = func(profile system.PlatformProfile) []string {
+	osUserHomeDir                = os.UserHomeDir
+	osLookupEnv                  = os.LookupEnv
+	osSetenv                     = os.Setenv
+	osUnsetenv                   = os.Unsetenv
+	osStat                       = os.Stat
+	runCommand                   = executeCommand
+	cmdLookPath                  = exec.LookPath
+	streamCommandOutput          = true
+	goEnv                        = defaultGoEnv
+	detectDependencies           = system.DetectDependencies
+	installCommunityTool         = communitytool.Install
+	installCommunityToolWithHome = communitytool.InstallWithHome
+	pathEnvEntries               = func(profile system.PlatformProfile) []string {
 		return splitPathForOS(os.Getenv("PATH"), profile.OS)
 	}
 	addUserPath         = system.AddToUserPath
@@ -178,6 +180,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	if result.Execution.Err != nil {
 		return result, fmt.Errorf("execute install pipeline: %w", result.Execution.Err)
 	}
+	result.PiCodeGraph = runtime.state.piCodeGraph
 
 	result.Verify = runPostApplyVerification(postApplyVerificationInput{
 		HomeDir:      homeDir,
@@ -210,6 +213,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		ClaudePhaseAssignments:      claudePhaseState,
 		KiroModelAssignments:        kiroAliasesToStrings(input.Selection.KiroModelAssignments),
 		CodexModelAssignments:       codexEffortsToStrings(input.Selection.CodexModelAssignments),
+		CodexOrchestratorAssignment: codexOrchestratorToState(input.Selection.CodexOrchestratorAssignment),
 		CodexCarrilModelAssignments: input.Selection.CodexCarrilModelAssignments,
 		CodexPhaseModelAssignments:  input.Selection.CodexPhaseModelAssignments,
 		ModelAssignments:            modelAssignmentsToState(input.Selection.ModelAssignments),
@@ -250,6 +254,9 @@ func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState,
 	}
 	if newState.KiroModelAssignments != nil {
 		merged.KiroModelAssignments = newState.KiroModelAssignments
+	}
+	if newState.CodexOrchestratorAssignment != nil {
+		merged.CodexOrchestratorAssignment = newState.CodexOrchestratorAssignment
 	}
 	if newState.CodexModelAssignments != nil {
 		merged.CodexModelAssignments = newState.CodexModelAssignments
@@ -441,7 +448,8 @@ type installRuntime struct {
 }
 
 type runtimeState struct {
-	manifest backup.Manifest
+	manifest    backup.Manifest
+	piCodeGraph *communitytool.PiCodeGraphResult
 
 	// engramVersionResolved, engramVersion, and engramVersionErr cache the
 	// single `engram version` invocation performed by componentApplyStep.Run
@@ -515,7 +523,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 	}
 
 	for _, tool := range r.selection.CommunityTools {
-		apply = append(apply, communityToolInstallStep{id: "community-tool:" + string(tool), tool: tool, workspaceDir: r.workspaceDir})
+		apply = append(apply, communityToolInstallStep{id: "community-tool:" + string(tool), tool: tool, workspaceDir: r.workspaceDir, homeDir: r.homeDir})
 	}
 
 	for _, component := range r.resolved.OrderedComponents {
@@ -532,8 +540,39 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 			state:        r.state,
 		})
 	}
+	if containsAgent(r.resolved.Agents, model.AgentPi) {
+		selected := r.selection.HasCommunityTool(model.CommunityToolCodeGraph)
+		stepID := "community-tool:pi-codegraph-reconcile"
+		if !selected {
+			stepID = "community-tool:pi-codegraph-deselect"
+		}
+		apply = append(apply, piCodeGraphReconcileStep{id: stepID, homeDir: r.homeDir, workspaceDir: r.workspaceDir, selected: selected, state: r.state})
+	}
 
 	return pipeline.StagePlan{Prepare: prepare, Apply: apply}
+}
+
+type piCodeGraphReconcileStep struct {
+	id, homeDir, workspaceDir string
+	selected                  bool
+	state                     *runtimeState
+}
+
+func (s piCodeGraphReconcileStep) ID() string { return s.id }
+func (s piCodeGraphReconcileStep) Run() error {
+	result, err := communitytool.ReconcilePiCodeGraph(communitytool.PiCodeGraphOptions{HomeDir: s.homeDir, WorkspaceDir: s.workspaceDir, Selected: s.selected})
+	if err == nil && s.state != nil {
+		s.state.piCodeGraph = &result
+	}
+	return err
+}
+
+// Rollback removes only the manifest-owned Pi CodeGraph artifacts created by
+// this late pipeline step. This covers overlays discovered after package
+// installation, which cannot be part of the pre-install static snapshot.
+func (s piCodeGraphReconcileStep) Rollback() error {
+	_, err := communitytool.UninstallPiCodeGraph(s.homeDir)
+	return err
 }
 
 type prepareBackupStep struct {
@@ -718,12 +757,13 @@ type communityToolInstallStep struct {
 	id           string
 	tool         model.CommunityToolID
 	workspaceDir string
+	homeDir      string
 }
 
 func (s communityToolInstallStep) ID() string { return s.id }
 
 func (s communityToolInstallStep) Run() error {
-	_, err := installCommunityTool(s.tool, s.workspaceDir, communitytool.RunnerFunc(runCommand))
+	_, err := installCommunityToolWithHome(s.tool, s.workspaceDir, s.homeDir, communitytool.RunnerFunc(runCommand), communitytool.DetectorFunc(cmdLookPath))
 	if err != nil {
 		return fmt.Errorf("install community tool %q: %w", s.tool, err)
 	}
@@ -982,6 +1022,7 @@ func (s componentApplyStep) Run() error {
 				}
 			}
 			engramOpts := engram.InjectOptions{
+				CodexOrchestratorAssignment: s.selection.CodexOrchestratorAssignment,
 				CodexCarrilModelAssignments: s.selection.CodexCarrilModelAssignments,
 				CodexModelAssignments:       s.selection.CodexModelAssignments,
 				Version:                     engramVersion,
@@ -1192,6 +1233,30 @@ func shouldAttemptEngramSetup(profile system.PlatformProfile, mode engram.SetupM
 	return engram.ShouldAttemptSetup(mode, agent)
 }
 
+// ExecuteTUIInstall runs the same install runtime as the CLI and carries
+// non-fatal Pi CodeGraph manual actions into the TUI completion result.
+func ExecuteTUIInstall(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, onProgress pipeline.ProgressFunc) pipeline.ExecutionResult {
+	runtime, err := newInstallRuntime(homeDir, ScopeGlobal, ChannelStable, selection, resolved, profile)
+	if err != nil {
+		return pipeline.ExecutionResult{Err: err}
+	}
+	orchestrator := pipeline.NewOrchestrator(pipeline.DefaultRollbackPolicy(), pipeline.WithFailurePolicy(pipeline.ContinueOnError), pipeline.WithProgressFunc(onProgress))
+	result := orchestrator.Execute(runtime.stagePlan())
+	if runtime.state.piCodeGraph != nil {
+		result.ManualActions = append(result.ManualActions, runtime.state.piCodeGraph.ManualActions...)
+	}
+	return result
+}
+
+// RenderInstallManualActions renders non-fatal completion actions after the
+// normal verification report so CLI users receive the same drift guidance.
+func RenderInstallManualActions(result InstallResult) string {
+	if result.PiCodeGraph == nil || len(result.PiCodeGraph.ManualActions) == 0 {
+		return ""
+	}
+	return "\nManual actions required:\n- " + strings.Join(result.PiCodeGraph.ManualActions, "\n- ") + "\n"
+}
+
 // ResolveInstallProfile returns the platform profile from detection, defaulting to darwin/brew.
 func ResolveInstallProfile(detection system.DetectionResult) system.PlatformProfile {
 	if detection.System.Profile.OS != "" {
@@ -1302,6 +1367,16 @@ func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection m
 
 	for _, component := range resolved.OrderedComponents {
 		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
+			paths[path] = struct{}{}
+		}
+	}
+	if containsAgent(resolved.Agents, model.AgentPi) {
+		for _, path := range communitytool.PiCodeGraphPaths(homeDir, workspaceDir) {
+			paths[path] = struct{}{}
+		}
+	}
+	if selection.HasCommunityTool(model.CommunityToolCodeGraph) {
+		for _, path := range communitytool.CodeGraphGuidancePaths(homeDir) {
 			paths[path] = struct{}{}
 		}
 	}
@@ -2047,4 +2122,18 @@ func modelAssignmentsToState(m map[string]model.ModelAssignment) map[string]stat
 		out[k] = state.ModelAssignmentState{ProviderID: v.ProviderID, ModelID: v.ModelID, Effort: v.Effort}
 	}
 	return out
+}
+
+func codexOrchestratorToState(a *model.CodexOrchestratorAssignment) *state.CodexOrchestratorAssignmentState {
+	if a == nil {
+		return nil
+	}
+	return &state.CodexOrchestratorAssignmentState{Model: a.Model, Effort: string(a.Effort)}
+}
+
+func codexOrchestratorFromState(a *state.CodexOrchestratorAssignmentState) *model.CodexOrchestratorAssignment {
+	if a == nil {
+		return nil
+	}
+	return &model.CodexOrchestratorAssignment{Model: a.Model, Effort: model.CodexEffort(a.Effort)}
 }

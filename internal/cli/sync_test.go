@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
+	"github.com/gentleman-programming/gentle-ai/internal/agents/codex"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/pipeline"
@@ -472,6 +473,54 @@ func TestComponentSyncStepSkipsEngramBinaryInstall(t *testing.T) {
 	}
 }
 
+func TestComponentSyncStepCodexRuntimeGate(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		wantErr bool
+	}{
+		{name: "old runtime leaves profiles untouched", version: "codex-cli 0.143.9", wantErr: true},
+		{name: "exact runtime writes profiles", version: "codex-cli 0.144.0"},
+		{name: "new runtime writes profiles", version: "codex-cli 0.145.1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restore := codex.SetRuntimeVersionCommandForTest(tt.version, nil)
+			t.Cleanup(restore)
+			home := t.TempDir()
+			codexDir := filepath.Join(home, ".codex")
+			if err := os.MkdirAll(codexDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			profiles := []string{"sdd-strong.config.toml", "sdd-mid.config.toml", "sdd-cheap.config.toml"}
+			for _, name := range profiles {
+				if err := os.WriteFile(filepath.Join(codexDir, name), []byte("user-content\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			step := componentSyncStep{component: model.ComponentEngram, homeDir: home, agents: []model.AgentID{model.AgentCodex}}
+			err := step.Run()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("componentSyncStep.Run() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			for _, name := range profiles {
+				content, readErr := os.ReadFile(filepath.Join(codexDir, name))
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if tt.wantErr && string(content) != "user-content\n" {
+					t.Errorf("old runtime modified %s: %q", name, content)
+				}
+				if !tt.wantErr && !strings.Contains(string(content), "gpt-5.6-") {
+					t.Errorf("valid runtime did not write GPT-5.6 profile %s: %q", name, content)
+				}
+			}
+		})
+	}
+}
+
 func TestComponentSyncStepRunsPersonaInjectForSync(t *testing.T) {
 	// The sync step regenerates the marker-bound persona block (markdown only).
 	// It must NOT touch the OpenCode agent definition in opencode.json (those
@@ -624,7 +673,7 @@ func TestCodeGraphGuidanceSyncStepRefreshesOldMarkerWhenConfigured(t *testing.T)
 	if strings.Contains(text, "stale CodeGraph lifecycle guidance") {
 		t.Fatalf("stale guidance was not refreshed:\n%s", text)
 	}
-	if !strings.Contains(text, "immediately run `codegraph init <project-root>`") || !strings.Contains(text, "custom notes") {
+	if !strings.Contains(text, "immediately run `gentle-ai codegraph init --cwd <project-root>`") || !strings.Contains(text, "custom notes") {
 		t.Fatalf("latest guidance/user content missing after sync refresh:\n%s", text)
 	}
 	if !reflect.DeepEqual(changed, []string{agentsPath}) {
@@ -673,7 +722,7 @@ func TestCodeGraphGuidanceSyncStepRemovesLegacySkipBlockWhenConfigured(t *testin
 			t.Fatalf("legacy CodeGraph guidance %q was not removed during sync:\n%s", stale, text)
 		}
 	}
-	if !strings.Contains(text, "immediately run `codegraph init <project-root>`") || !strings.Contains(text, "custom notes") {
+	if !strings.Contains(text, "immediately run `gentle-ai codegraph init --cwd <project-root>`") || !strings.Contains(text, "custom notes") {
 		t.Fatalf("latest guidance/user content missing after sync cleanup:\n%s", text)
 	}
 	if !reflect.DeepEqual(changed, []string{agentsPath}) {
@@ -718,7 +767,7 @@ func TestCodeGraphGuidanceSyncStepRepairsCodexConfigOnlyGuidance(t *testing.T) {
 		t.Fatalf("ReadFile(%q) error = %v", agentsPath, err)
 	}
 	text := string(body)
-	for _, want := range []string{"<!-- gentle-ai:codegraph-guidance -->", "immediately run `codegraph init <project-root>`"} {
+	for _, want := range []string{"<!-- gentle-ai:codegraph-guidance -->", "immediately run `gentle-ai codegraph init --cwd <project-root>`"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Codex AGENTS.md missing managed CodeGraph guidance %q:\n%s", want, text)
 		}
@@ -3128,6 +3177,7 @@ func setupCodexSyncHome(t *testing.T, carrilModels map[string]string, effortAssi
 
 func setupCodexSyncHomeWithPhaseModels(t *testing.T, carrilModels map[string]string, effortAssignments map[string]string, phaseModels map[string]string) string {
 	t.Helper()
+	t.Cleanup(codex.SetRuntimeVersionCommandForTest("codex-cli 0.144.0", nil))
 	home := t.TempDir()
 	s := state.InstallState{
 		InstalledAgents:             []string{"codex"},

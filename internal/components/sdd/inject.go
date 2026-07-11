@@ -272,7 +272,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 			// Write the SDD orchestrator as a standalone Jinja include module.
 			// The static KIMI.md template references it via {% include "sdd-orchestrator.md" %}.
 			configDir := adapter.GlobalConfigDir(homeDir)
-			content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
+			content := renderSDDOrchestratorAsset(adapter.Agent())
 			modulePath := filepath.Join(configDir, "sdd-orchestrator.md")
 			writeResult, err := filemerge.WriteFileAtomic(modulePath, []byte(content), 0o644)
 			if err != nil {
@@ -667,7 +667,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				continue
 			}
 			// Copy all files (not just .md) to support Kimi's YAML-based agents
-			contentStr := assets.MustRead(embeddedDir + "/" + entry.Name())
+			contentStr := renderBoundedReviewAsset(embeddedDir + "/" + entry.Name())
 
 			// Resolve {{KIRO_MODEL}} placeholder for adapters that support it (e.g. Kiro).
 			// Non-Kiro adapters (Cursor, etc.) don't implement kiroModelResolver and are unaffected.
@@ -846,6 +846,7 @@ func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string,
 	if !ok {
 		return overlayBytes, nil
 	}
+	expandOpenCodeBoundedReviewAgents(agentsMap)
 
 	// Inline the orchestrator prompt (always inlined, not a file reference),
 	// unless an external strategy requested preserving the existing prompt.
@@ -877,10 +878,10 @@ func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string,
 		if existingPrompt != "" {
 			orchestratorMap["prompt"] = migratePreservedOpenCodeOrchestratorPrompt(existingPrompt)
 		} else {
-			orchestratorMap["prompt"] = assets.MustRead(sddOrchestratorAsset(model.AgentOpenCode))
+			orchestratorMap["prompt"] = renderSDDOrchestratorAsset(model.AgentOpenCode)
 		}
 	} else {
-		orchestratorMap["prompt"] = assets.MustRead(sddOrchestratorAsset(model.AgentOpenCode))
+		orchestratorMap["prompt"] = renderSDDOrchestratorAsset(model.AgentOpenCode)
 	}
 
 	// Append the trigger-rules section to the orchestrator prompt when provided.
@@ -927,6 +928,37 @@ func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string,
 	return append(result, '\n'), nil
 }
 
+func expandOpenCodeBoundedReviewAgents(agentsMap map[string]any) {
+	contract := boundedReviewContract()
+	for _, name := range []string{"review-risk", "review-readability", "review-reliability", "review-resilience"} {
+		agent, ok := agentsMap[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		prompt, _ := agent["prompt"].(string)
+		if marker := strings.Index(prompt, "Review execution contract:"); marker >= 0 {
+			prompt = strings.TrimSpace(prompt[:marker])
+		}
+		agent["prompt"] = prompt + "\n\n" + contract
+		agent["tools"] = map[string]any{"read": true, "write": false, "edit": false, "bash": false, "task": false}
+	}
+
+	for _, name := range []string{"jd-judge-a", "jd-judge-b"} {
+		agent, ok := agentsMap[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		prompt, _ := agent["prompt"].(string)
+		agent["prompt"] = strings.TrimSpace(prompt) + " Judgment Day replaces ordinary 4R, uses at most two scoped fix/re-judgment rounds, and never launches review-refuter. Return one read-only judgment result and terminate."
+		agent["tools"] = map[string]any{"read": true, "write": false, "edit": false, "bash": false, "task": false}
+	}
+
+	if refuter, ok := agentsMap[reviewRefuterAgentName].(map[string]any); ok {
+		refuter["prompt"] = "You are the detached read-only refuter for exactly ONE transaction-wide inferential batch. Receive every inferential severe neutral claim and proof reference, return one corroborated | refuted | inconclusive result per finding, add no findings, modify nothing, return one complete result, and terminate. Missing or malformed entries are inconclusive."
+		refuter["tools"] = map[string]any{"read": true, "write": false, "edit": false, "bash": false, "task": false}
+	}
+}
+
 func migratePreservedOpenCodeOrchestratorPrompt(prompt string) string {
 	if prompt == "" {
 		return prompt
@@ -947,7 +979,9 @@ func migratePreservedOpenCodeOrchestratorPrompt(prompt string) string {
 		"",
 	)
 	migrated := removeLegacyOpenCodePlainChatPreflightLines(replacer.Replace(prompt))
-	return ensurePreservedOpenCodeDelegationHardGates(ensurePreservedOpenCodeOrchestratorPreflight(migrated))
+	migrated = ensurePreservedOpenCodeOrchestratorPreflight(migrated)
+	migrated = ensurePreservedOpenCodeDelegationHardGates(migrated)
+	return ensurePreservedOpenCodeReviewExecutionContract(migrated)
 }
 
 func removeLegacyOpenCodePlainChatPreflightLines(prompt string) string {
@@ -1018,11 +1052,17 @@ func removeLegacyOpenCodePlainChatPreflightLines(prompt string) string {
 func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
 	prompt = strings.NewReplacer(
 		"run a fresh-context review unless the diff is trivial docs/text",
+		"run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial (tier 1)",
 		"run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial docs/text",
+		"run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial (tier 1)",
 		"stop and run a fresh audit before continuing",
-		"stop and run the concrete audit/review lens(es) selected by Review Lens Selection before continuing",
+		"prove code, configuration, generated-artifact, and provenance targets remain immutable, then validate the existing receipt",
 		"use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents",
-		"use fresh context with the selected concrete review lens(es) for adversarial review of diffs, conflicts, PR readiness, and incidents",
+		"run fresh adversarial lenses only inside one explicit review/start(target); PR readiness and incidents validate the receipt",
+		"before commit, push, or PR after code changes, run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial (tier 1)",
+		"before commit, push, PR, or release, validate the same content-bound receipt with native review-validate; never create a review budget at the gate",
+		"after wrong `cwd`, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run the concrete audit/review lens(es) selected by Review Lens Selection before continuing",
+		"after a workflow incident, prove code, configuration, generated-artifact, and provenance targets remain immutable, then validate the existing receipt",
 	).Replace(prompt)
 
 	delegation := `
@@ -1038,14 +1078,18 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 
 1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task. If delegation tooling is unavailable, document the blocker and stop the exploration instead of reading everything inline.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer. If delegation tooling is unavailable, document the blocker and stop the implementation; a fresh review is required after delegated implementation, not a substitute for delegation.
-3. **PR rule**: before commit, push, or PR after code changes, run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial docs/text.
-4. **Incident rule**: after wrong ` + "`cwd`" + `, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run the concrete audit/review lens(es) selected by Review Lens Selection before continuing.
+3. **Lifecycle receipt rule**: before commit, push, PR, or release, validate the same content-bound receipt with native ` + "`review-validate`" + `; follow missing/scope-changed/invalidated/escalated action and never launch a lens, Judgment Day, or new budget at the gate.
+4. **Incident rule**: after a workflow incident, prove code, configuration, generated-artifact, and provenance targets remain immutable, then validate the existing receipt. Any changed target requires explicit scope action, not reopened review.
 5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate the remaining work instead of silently continuing monolithically. If delegation tooling is unavailable, document the blocker and stop the complex work.
-6. **Fresh review rule**: use fresh context with the selected concrete review lens(es) for adversarial review of diffs, conflicts, PR readiness, and incidents; use continuity/forked context only for implementation work that needs inherited state.
+6. **Fresh review rule**: fresh adversarial lenses run only inside one explicit ` + "`review/start(target)`" + `. PR readiness and incidents validate the receipt and never create another budget.
 
 #### Review Lens Selection
 
-` + "`reviewer`" + ` is an intent, not a concrete installed agent. When a fresh review/audit is required, select concrete lenses by risk profile:
+` + "`reviewer`" + ` is an intent, not a concrete installed agent. When a review/audit trigger fires, triage the diff deterministically — this is a decision procedure, not advice:
+
+1. **Trivial diff** (ONLY documentation, comments, formatting, or typo fixes in strings — zero executable code and zero configuration changes): run no lens. Any diff touching executable code or configuration is at least standard tier.
+2. **Standard diff**: run exactly ONE lens — the row in the table below that matches the dominant risk. If multiple rows match, pick the single highest-impact row; do not add lenses.
+3. **Hot path** (the diff touches auth/update/security/payments paths) **or >400 changed lines**: run the full 4R set — ` + "`review-risk`" + `, ` + "`review-resilience`" + `, ` + "`review-readability`" + `, ` + "`review-reliability`" + `.
 
 | Risk signal | Review lens |
 | --- | --- |
@@ -1053,9 +1097,8 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 | Behavior, state, tests, determinism, or regressions | ` + "`review-reliability`" + ` |
 | Shell/process integration, partial failures, recovery, or degraded dependencies | ` + "`review-resilience`" + ` |
 | Security, permissions, data exposure/loss, architecture, or dependencies | ` + "`review-risk`" + ` |
-| Large PR, hot path, or >400 changed lines | full 4R: ` + "`review-risk`" + `, ` + "`review-resilience`" + `, ` + "`review-readability`" + `, ` + "`review-reliability`" + ` |
 
-If multiple rows match, run the narrow set that covers the risk. Example: shell integration that mutates live state should use ` + "`review-reliability`" + ` plus ` + "`review-resilience`" + `, not ` + "`review-readability`" + ` by default.
+Full 4R is reserved for tier 3; a standard diff never fans out to multiple lenses.
 <!-- /gentle-ai:delegation-hard-gates-migration -->
 `
 
@@ -1064,18 +1107,26 @@ If multiple rows match, run the narrow set that covers the risk. Example: shell 
 		strings.Contains(prompt, "TOTALMENTE obligatorio") &&
 		strings.Contains(prompt, "4-file rule") &&
 		strings.Contains(prompt, "Multi-file write rule") &&
-		strings.Contains(prompt, "PR rule") &&
+		strings.Contains(prompt, "Lifecycle receipt rule") &&
 		strings.Contains(prompt, "Incident rule") &&
 		strings.Contains(prompt, "Long-session rule") &&
 		strings.Contains(prompt, "Fresh review rule") &&
 		strings.Contains(prompt, "Semantic guard") &&
 		strings.Contains(prompt, "execution, not delegation") &&
 		strings.Contains(prompt, "fresh review is required after delegated implementation, not a substitute for delegation") &&
-		strings.Contains(prompt, "run the concrete review lens(es) selected by Review Lens Selection") &&
-		strings.Contains(prompt, "run the concrete audit/review lens(es) selected by Review Lens Selection") &&
-		strings.Contains(prompt, "use fresh context with the selected concrete review lens(es)") &&
+		strings.Contains(prompt, "validate the same content-bound receipt") &&
+		strings.Contains(prompt, "generated-artifact, and provenance targets remain immutable") &&
+		strings.Contains(prompt, "fresh adversarial lenses run only inside one explicit") &&
 		strings.Contains(prompt, "#### Review Lens Selection") &&
 		strings.Contains(prompt, "`reviewer` is an intent, not a concrete installed agent") &&
+		// 4R v2 deterministic-triage markers: their absence means the prompt
+		// carries the v1 advisory lens table (or a pre-objective-boundary v2
+		// block) and must be re-migrated.
+		strings.Contains(prompt, "triage the diff deterministically") &&
+		strings.Contains(prompt, "**Trivial diff**") &&
+		strings.Contains(prompt, "zero executable code and zero configuration changes") &&
+		strings.Contains(prompt, "run exactly ONE lens") &&
+		strings.Contains(prompt, "Full 4R is reserved for tier 3") &&
 		strings.Contains(prompt, "`review-readability`") &&
 		strings.Contains(prompt, "`review-reliability`") &&
 		strings.Contains(prompt, "`review-resilience`") &&
@@ -1093,6 +1144,67 @@ If multiple rows match, run the narrow set that covers the risk. Example: shell 
 	}
 
 	return strings.TrimRight(prompt, "\n") + delegation
+}
+
+func ensurePreservedOpenCodeReviewExecutionContract(prompt string) string {
+	const (
+		startMarker = "<!-- gentle-ai:review-execution-contract-migration -->"
+		endMarker   = "<!-- /gentle-ai:review-execution-contract-migration -->"
+		heading     = "#### Review Execution Contract"
+		nextHeading = "#### Cost and Context Balance"
+	)
+
+	source := renderSDDOrchestratorAsset(model.AgentOpenCode)
+	start := strings.Index(source, heading)
+	end := strings.Index(source, nextHeading)
+	if start < 0 || end <= start {
+		return prompt
+	}
+	canonical := strings.TrimSpace(source[start:end])
+	block := startMarker + "\n" + canonical + "\n" + endMarker
+
+	if markerStart := strings.Index(prompt, startMarker); markerStart >= 0 {
+		if relativeEnd := strings.Index(prompt[markerStart:], endMarker); relativeEnd >= 0 {
+			markerEnd := markerStart + relativeEnd + len(endMarker)
+			return replacePreservedPromptSection(prompt, markerStart, markerEnd, block)
+		}
+	}
+
+	if headingStart := strings.Index(prompt, heading); headingStart >= 0 {
+		headingEnd := len(prompt)
+		remainder := prompt[headingStart+len(heading):]
+		for _, candidate := range []string{"\n#### ", "\n### ", "\n## ", "\n# "} {
+			if relativeEnd := strings.Index(remainder, candidate); relativeEnd >= 0 {
+				candidateEnd := headingStart + len(heading) + relativeEnd + 1
+				if candidateEnd < headingEnd {
+					headingEnd = candidateEnd
+				}
+			}
+		}
+		return replacePreservedPromptSection(prompt, headingStart, headingEnd, block)
+	}
+
+	return strings.TrimRight(prompt, "\n") + "\n\n" + block + "\n"
+}
+
+func replacePreservedPromptSection(prompt string, start, end int, replacement string) string {
+	prefix := strings.TrimRight(prompt[:start], "\n")
+	suffix := strings.TrimLeft(prompt[end:], "\n")
+
+	var b strings.Builder
+	if prefix != "" {
+		b.WriteString(prefix)
+		b.WriteString("\n\n")
+	}
+	b.WriteString(replacement)
+	if suffix != "" {
+		b.WriteString("\n\n")
+		b.WriteString(suffix)
+	}
+	if strings.HasSuffix(prompt, "\n") && !strings.HasSuffix(b.String(), "\n") {
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func ensurePreservedOpenCodeOrchestratorPreflight(prompt string) string {
@@ -1834,7 +1946,7 @@ func injectFileAppend(homeDir string, adapter agents.Adapter, opts InjectOptions
 	}
 
 	// Use agent-specific SDD orchestrator content when available; fall back to generic.
-	content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
+	content := renderSDDOrchestratorAsset(adapter.Agent())
 
 	// Codex-only: substitute {{CODEX_PHASE_EFFORTS}} with a rendered per-phase
 	// effort table. Only fires when the adapter implements codexModelResolver.
@@ -2053,7 +2165,7 @@ func stripBareOrchestratorSection(content string) string {
 
 func injectMarkdownSections(homeDir string, adapter agents.Adapter, legacyAssignments map[string]model.ClaudeModelAlias, phaseAssignments map[string]model.ClaudePhaseAssignment) (InjectionResult, error) {
 	promptPath := adapter.SystemPromptFile(homeDir)
-	content := assets.MustRead(sddOrchestratorAsset(adapter.Agent()))
+	content := renderSDDOrchestratorAsset(adapter.Agent())
 
 	existing, err := readFileOrEmpty(promptPath)
 	if err != nil {
