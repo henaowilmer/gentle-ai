@@ -17,6 +17,8 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/opencode"
 )
 
+const legacyMandatoryWording = "TOTALMENTE " + "obligatorio"
+
 type InjectionResult struct {
 	Changed bool
 	Files   []string
@@ -405,7 +407,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 					continue
 				}
 
-				content := assets.MustRead(commandsAssetDir + "/" + entry.Name())
+				content := renderBoundedReviewAsset(commandsAssetDir + "/" + entry.Name())
 				path := filepath.Join(commandsDir, entry.Name())
 				writeResult, err := filemerge.WriteFileAtomic(path, []byte(content), 0o644)
 				if err != nil {
@@ -701,6 +703,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 			}
 
 			if isMarkdownSubAgentPromptFile(entry.Name()) {
+				contentStr = injectCodeGraphToolGrantIntoPrompt(contentStr, adapter.Agent(), opts.CodeGraphGuidanceMarkdown)
 				contentStr = injectCodeGraphGuidanceIntoPrompt(contentStr, opts.CodeGraphGuidanceMarkdown)
 			}
 			outPath := filepath.Join(agentsDir, entry.Name())
@@ -1050,6 +1053,7 @@ func removeLegacyOpenCodePlainChatPreflightLines(prompt string) string {
 }
 
 func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
+	prompt = migrateLegacyMandatoryWordingInDelegationHardGates(prompt)
 	prompt = strings.NewReplacer(
 		"run a fresh-context review unless the diff is trivial docs/text",
 		"run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial (tier 1)",
@@ -1070,7 +1074,7 @@ func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
 <!-- gentle-ai:delegation-hard-gates-migration -->
 ### Mandatory Delegation Triggers (Non-Skippable)
 
-These gates are non-skippable hard gates, not recommendations. They are TOTALMENTE obligatorio: do not skip them, do not weaken them, and do not replace delegation-required gates with inline execution. Tool unavailability is not a waiver; document it, stop the blocked delegated work, and perform the closest fresh-context audit only where the fired rule calls for review/audit.
+These gates are non-skippable hard gates, not recommendations. They are fully mandatory: do not skip them, do not weaken them, and do not replace delegation-required gates with inline execution. Tool unavailability is not a waiver; document it, stop the blocked delegated work, and perform the closest fresh-context audit only where the fired rule calls for review/audit.
 
 Semantic guard: **delegate** means using OpenCode's native Task tool to invoke a configured sub-agent. Running local scripts, Python, or Bash inline is execution, not delegation.
 
@@ -1078,7 +1082,7 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 
 1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task. If delegation tooling is unavailable, document the blocker and stop the exploration instead of reading everything inline.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer. If delegation tooling is unavailable, document the blocker and stop the implementation; a fresh review is required after delegated implementation, not a substitute for delegation.
-3. **Lifecycle receipt rule**: before commit, push, PR, or release, validate the same content-bound receipt with native ` + "`review-validate`" + `; follow missing/scope-changed/invalidated/escalated action and never launch a lens, Judgment Day, or new budget at the gate.
+3. **Lifecycle receipt rule**: before commit, push, PR, or release, run one native ` + "`review-validate --cwd <repo> --lineage <id> --gate <gate> --receipt <path> --bundle <path> --policy <path> --ledger <path> --evidence <path>`" + ` command for the same content-bound receipt; follow missing/scope-changed/invalidated/escalated action, never hand-author request JSON, and never launch a lens, Judgment Day, or new budget at the gate.
 4. **Incident rule**: after a workflow incident, prove code, configuration, generated-artifact, and provenance targets remain immutable, then validate the existing receipt. Any changed target requires explicit scope action, not reopened review.
 5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate the remaining work instead of silently continuing monolithically. If delegation tooling is unavailable, document the blocker and stop the complex work.
 6. **Fresh review rule**: fresh adversarial lenses run only inside one explicit ` + "`review/start(target)`" + `. PR readiness and incidents validate the receipt and never create another budget.
@@ -1104,7 +1108,7 @@ Full 4R is reserved for tier 3; a standard diff never fans out to multiple lense
 
 	if strings.Contains(prompt, "Mandatory Delegation Triggers") &&
 		strings.Contains(prompt, "non-skippable hard gates") &&
-		strings.Contains(prompt, "TOTALMENTE obligatorio") &&
+		strings.Contains(prompt, "fully mandatory") &&
 		strings.Contains(prompt, "4-file rule") &&
 		strings.Contains(prompt, "Multi-file write rule") &&
 		strings.Contains(prompt, "Lifecycle receipt rule") &&
@@ -1144,6 +1148,41 @@ Full 4R is reserved for tier 3; a standard diff never fans out to multiple lense
 	}
 
 	return strings.TrimRight(prompt, "\n") + delegation
+}
+
+func migrateLegacyMandatoryWordingInDelegationHardGates(prompt string) string {
+	const (
+		startMarker = "<!-- gentle-ai:delegation-hard-gates-migration -->"
+		endMarker   = "<!-- /gentle-ai:delegation-hard-gates-migration -->"
+		heading     = "### Mandatory Delegation Triggers (Non-Skippable)"
+	)
+
+	start := strings.Index(prompt, startMarker)
+	end := -1
+	if start >= 0 {
+		if relativeEnd := strings.Index(prompt[start:], endMarker); relativeEnd >= 0 {
+			end = start + relativeEnd + len(endMarker)
+		}
+	}
+	if end < 0 {
+		start = strings.Index(prompt, heading)
+		if start < 0 {
+			return prompt
+		}
+		end = len(prompt)
+		remainder := prompt[start+len(heading):]
+		for _, nextHeading := range []string{"\n### ", "\n## ", "\n# "} {
+			if relativeEnd := strings.Index(remainder, nextHeading); relativeEnd >= 0 {
+				candidateEnd := start + len(heading) + relativeEnd
+				if candidateEnd < end {
+					end = candidateEnd
+				}
+			}
+		}
+	}
+
+	managed := strings.ReplaceAll(prompt[start:end], legacyMandatoryWording, "fully mandatory")
+	return prompt[:start] + managed + prompt[end:]
 }
 
 func ensurePreservedOpenCodeReviewExecutionContract(prompt string) string {

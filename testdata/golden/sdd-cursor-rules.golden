@@ -32,8 +32,8 @@ Each subagent runs in its own context window and returns a **structured result**
 
 - The active persona controls direct user/orchestrator conversation only. Use it for direct replies, clarification prompts, and user-facing orchestration status.
 - Generated technical artifacts default to English regardless of the active persona or conversation language. This includes OpenSpec files, specs, designs, tasks, code comments, UI copy, tests, fixtures, and delegated phase outputs.
-- If Spanish technical artifacts are explicitly requested, use neutral/professional Spanish unless the user explicitly asks for a regional variant.
-- Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; Spanish comments default to neutral/professional Spanish unless the user or target context clearly calls for regional tone.
+- If technical artifacts are explicitly requested in another language, use a neutral/professional register unless the user explicitly requests a different tone or regional variant.
+- Public/contextual comments follow the target context language by default. Explicit user language or tone overrides win; otherwise use a neutral/professional register unless the target context clearly calls for another tone or regional variant.
 - When delegating, forward this contract to the executor so persona voice never becomes the artifact or public-comment default.
 
 ### Delegation Rules
@@ -66,7 +66,7 @@ These are parent-orchestrator stop rules. Once any trigger fires, the orchestrat
 
 1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer and run the selected concrete review lens(es) before completion.
-3. **Lifecycle receipt rule**: before commit, push, PR, or release, validate the same content-bound receipt with native `review-validate`; follow missing/scope-changed/invalidated/escalated action and never launch a lens, Judgment Day, or new budget at the gate.
+3. **Lifecycle receipt rule**: before commit, push, PR, or release, run one native `review-validate --cwd <repo> --lineage <id> --gate <gate> --receipt <path> --bundle <path> --policy <path> --ledger <path> --evidence <path>` command for the same content-bound receipt; follow missing/scope-changed/invalidated/escalated action, never hand-author request JSON, and never launch a lens, Judgment Day, or new budget at the gate.
 4. **Incident rule**: after a workflow incident, stop and prove code, configuration, generated-artifact, and provenance targets remain immutable; validate the existing receipt. Any changed target requires explicit scope action, not reopened review.
 5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate instead of silently continuing monolithically.
 6. **Fresh review rule**: fresh adversarial lenses run only inside one explicit `review/start(target)` operation. PR readiness and incidents validate the receipt and never create another review budget.
@@ -100,9 +100,9 @@ Review is explicit `review/start(target)`. The operation receives one complete i
 
 The parent orchestrator selects zero, one, or four initial lenses from deterministic risk classification. Each selected lens runs exactly one exhaustive sweep. Full 4R means four initial lens sweeps, not extra sweeps or three refuter tasks.
 
-## Frozen Findings Ledger
+## Orchestration Claims and Native Frozen Ledger
 
-Findings freeze after the initial selected-lens review. Each lens emits neutral structured claims and proof references rather than persuasive narrative:
+Findings freeze after the initial selected-lens review. Each lens first emits an in-memory orchestration claim with neutral evidence rather than persuasive narrative:
 
 | Field | Values |
 |---|---|
@@ -115,7 +115,11 @@ Findings freeze after the initial selected-lens review. Each lens emits neutral 
 | `proof_refs` | Concrete command, output hash, or `file:line` references |
 | `status` | `open | corroborated | refuted | inconclusive | fixed | verified | info` |
 
-Persist an explicit empty ledger when no findings exist. WARNING/SUGGESTION rows are `info`; they never drive correction or block approval.
+The orchestration claim is not the native freeze schema. Before `freeze-findings`, the parent projects each claim to the exact native `Finding` fields `id`, `lens`, `location`, `severity`, `claim`, and `proof_refs`. It MUST NOT serialize `evidence_class` or `status` into the strict native ledger: `evidence_class` is supplied later to `classify-evidence`, while status is derived from authoritative classifications and outcomes. Unknown native finding fields remain rejected.
+
+The native canonical envelope is exact compact JSON with schema `gentle-ai.review-ledger/v1` and an explicit `findings` array containing only those native fields. Finding IDs must already be whitespace-canonical. The canonical empty ledger bytes are exactly `{"schema":"gentle-ai.review-ledger/v1","findings":[]}` with no trailing newline or alternate whitespace. Native `freeze-findings --ledger <path>` reads and validates those bytes before append, derives their SHA-256 identity, rejects a supplied `ledger_hash` mismatch, and requires the envelope findings to exactly match the transaction findings input. Missing or wrong schema, missing findings, malformed or non-canonical JSON, unknown fields, whitespace-padded IDs, and semantic findings mismatch fail before mutation.
+
+Persist an explicit empty ledger when no findings exist. Empty and non-empty ledgers follow the same native lifecycle. WARNING/SUGGESTION rows are `info`; they never drive correction or block approval.
 
 ## Evidence Routing
 
@@ -160,6 +164,44 @@ The sole authoritative append-only CAS state is `<git-common-dir>/gentle-ai/revi
 
 Writers use a non-blocking cross-platform OS lock with token/PID/host/timestamp observability and crash release. Exact retries repair a linked event or return an already-committed exact HEAD without changing budget; stale predecessors or different content remain rejected. Use `review-resume` after machine-output failure rather than rerunning review work.
 
+<!-- authority-first-terminal-procedure:start -->
+### Authority-First Terminal Procedure
+
+Hashes cannot reconstruct policy, ledger, or verification-evidence bytes. Preserve the exact canonical policy and ledger preimages before review starts, and retain them with the exact independent verification-evidence preimage until native validation finishes. Materializing an ephemeral private native input is not mirror persistence.
+
+#### Authoritative Review
+
+| Order | Operation | Required authoritative result | Terminal mirrors |
+|---|---|---|---|
+| 01 | `preserve-preimages` | Hold exact policy and canonical native ledger bytes; hold selected-lens results in memory. | blocked |
+| 02 | `review-start` | Append `review/start`, then run `review-resume` and verify the start revision, lineage, target identity, genesis, and ordered chain identity. | blocked |
+| 03 | `record-lens-result` | Execute each selected lens exactly once and append/read back every required canonical result in selected order. | blocked |
+| 04 | `freeze-findings` | Materialize ledger bytes only as an ephemeral private input; append/read back the validated canonical ledger and its computed identity. | blocked |
+| 05 | `classify-evidence` | Append/read back exact evidence classes and authoritative outcomes for the frozen findings. | blocked |
+
+#### Independent Final Verification
+
+| Order | Operation | Required authoritative result | Terminal mirrors |
+|---|---|---|---|
+| 06 | `review-resume-preterminal` | Verify lineage, target identity, ordered chain identity, findings, evidence classes, counters, and bound canonical ledger identity. | blocked |
+| 07 | `begin-final-verification` | Append/read back final-verification start without requiring a receipt, bundle, gate context, or other terminal-only artifact. | blocked |
+| 08 | `independent-final-verification` | Verify requirements and runtime using only the preterminal transaction plus preserved policy and ledger; retain the exact canonical evidence bytes. | blocked |
+| 09 | `complete-final-verification` | Hash the retained evidence preimage, append completion, and preserve the same bytes for the gate. | blocked |
+| 10 | `review-resume-terminal` | Reload CAS and verify terminal state, revision, genesis, ordered chain identity, counters, and policy/ledger/evidence bindings. | blocked |
+
+#### Terminal Materialization and Gate
+
+| Order | Operation | Required authoritative result | Terminal mirrors |
+|---|---|---|---|
+| 11 | `review-bundle-export` | Export the validated terminal chain and capture its emitted store revision, genesis revision, chain identity, and bundle digest. The bundle remains non-authoritative transport. | blocked |
+| 12 | `extract-terminal-receipt` | Structurally extract and materialize the bundle's natively produced `terminal_receipt`; extraction is allowed but does not authorize a gate. | blocked |
+| 13 | `construct-gate-request` | Build `GateRequest` from emitted identities, target identity, and preserved policy/ledger/evidence artifacts or content; hash-check every preimage against terminal bindings. | blocked |
+| 14 | `review-validate` | Validate the materialized receipt and request. Native validation derives the repository store and reloads authoritative CAS; it never trusts the bundle or mirrors as authority. | blocked |
+| 15 | `reconcile-terminal-mirrors` | Only after `review-validate` returns allow, finalize or reconcile OpenSpec/Engram transaction, ledger, evidence, receipt, bundle, and gate-context mirrors from validated native state. | allowed |
+
+No mirror mutation may precede its confirmed authority boundary; no terminal mirror may finalize before terminal readback and successful native validation. A failed append leaves mirrors at the last confirmed authoritative state. If machine output or post-append readback fails after an append committed, recover with `review-resume`, never `review-start` or a new budget. Empty and non-empty ledgers use the same procedure. Approved or escalated lineages are immutable, and an existing malformed lineage remains invalid and requires an explicit replacement lineage rather than history rewriting.
+<!-- authority-first-terminal-procedure:end -->
+
 Engram mode upserts the equivalent exact topics:
 
 - `sdd/{change-name}/review/transaction`
@@ -171,7 +213,17 @@ Engram mode upserts the equivalent exact topics:
 
 Ad-hoc review uses `review/{target-slug}/{transaction|policy|ledger|receipt|chain-bundle|gate-context}`. If no artifact store exists, keep all artifacts inline for the current session and never claim durable receipt reuse.
 
-Post-implementation/post-apply starts ordinary review only when no valid receipt exists. Pre-commit, pre-push, pre-PR, and SDD archive call the native receipt validator for the same content-bound receipt; they never create a budget or silently launch Judgment Day. Gate context binds expected HEAD, genesis, ordered chain identity, and bundle digest. The validator derives the authoritative store root, validates the complete semantic chain, derives the current repository target, and hashes policy, ledger, fix delta, verify evidence, and release artifacts from persisted inputs; caller-authored store paths, transactions, trees, or hash assertions are never authoritative. Missing, `scope-changed`, `invalidated`, and `escalated` results emit machine-readable denial and return non-success.
+Post-implementation/post-apply starts ordinary review only when no valid receipt exists. Pre-commit, pre-push, pre-PR, and SDD archive run one native command for the same content-bound receipt; they never hand-author request JSON, create a budget, or silently launch Judgment Day:
+
+```bash
+gentle-ai review-validate --cwd <repo> --lineage <id> --gate <post-apply|pre-commit|pre-push|pre-pr|release> --receipt <receipt.json> --bundle <chain-bundle.json> --policy <policy> --ledger <ledger.json> --evidence <verification> [gate-specific artifact flags]
+```
+
+Post-apply and pre-commit may add repeatable `--intended-untracked` inputs. Corrected lineages add `--fix-delta <snapshot-json>` whose strict `fix-diff` snapshot bytes reproduce the terminal correction identity; no-fix lineages omit it. Pre-PR derives the publication base from the push remote's advertised default-branch HEAD; `--base-ref` is only an optional expectation and cannot select the boundary. When that base advanced, add `--pre-pr-ci-attestation <signed-json>`. Release adds `--release-configuration`, `--release-generated`, `--release-provenance`, `--release-publication-boundary`, and `--release-evidence-freshness` artifacts. `--request-out` may persist the canonically derived request for audit. Explicit `--request` remains a mutually exclusive compatibility mode, not the prescribed lifecycle path.
+
+Gate context binds expected HEAD, genesis, ordered chain identity, and bundle digest. The validator derives the authoritative store root, verifies the named bundle is the exact authoritative chain, reads every persisted artifact preimage once, derives the current repository target, and binds policy, frozen ledger, fix delta, verify evidence, and release artifacts from those retained bytes; caller-authored store paths, transactions, trees, digests, path sets, favorable states, or chain assertions are never authoritative. For corrected lineages, `--request-out` retains the canonical fix-diff snapshot bytes so explicit replay remains byte-equivalent without changing legacy request semantics. Immediately before any allow the validator re-derives the repository target and configured publication refs. Evaluated `scope-changed`, `invalidated`, and `escalated` results emit machine-readable denial JSON and return non-success; setup and parsing failures remain ordinary CLI errors.
+
+At PRE-PR, a configured push remote's advertised default-branch HEAD is the publication boundary; remote selection follows Git push precedence (`branch.<name>.pushRemote`, `remote.pushDefault`, `branch.<name>.remote`, then `origin`). A stale or unrelated caller-selected local ref is never sufficient proof. Existing explicit requests without a configured publication remote retain offline unchanged-base validation, but cannot authorize an advanced base. An advanced base can reuse the immutable receipt only when native Git derivation proves the original reviewed merge-base tree, unchanged delivered patch and path identities, disjoint old-base-to-new-base paths, and a conflict-free merged result. Moving refs are resolved once to immutable commits and rechecked before authorization. The exact merged-result tree requires successful CI attested by Ed25519: the issuer and public key come from the already receipt-bound policy preimage, either as JSON `pre_pr_ci_trust` fields or `pre_pr_ci_issuer` and `pre_pr_ci_ed25519_public_key` Markdown declarations. `--pre-pr-ci-attestation` only names an artifact containing schema `gentle-ai.pre-pr-ci-attestation/v1`, issuer, merged tree, `success` status, and signature. The signature preimage is `schema NUL issuer NUL merged_tree NUL status NUL`. A success boolean, unsigned artifact, caller-selected key, missing trust root, overlap, conflict, ref movement, changed delivery, or any unprovable condition falls back to the existing fail-closed gate result. Successful reuse emits `base_advanced_compatible` context and never rewrites the receipt.
 
 For clean-clone/workstation recovery, persist the full ordered content-addressed chain bundle. Explicit `review-bundle-import` MUST validate bundle digest, every event hash/predecessor/semantic transition, lineage/generation/mode, initial/final snapshot identities, terminal fix-diff semantics, and expected gate chain identity before CAS installation into the repository-derived destination. Recovery is delivered-content equivalence, not snapshot-structure equivalence: the current derived candidate and delivered path digest MUST match `final_candidate_tree` and the receipt/lineage path scope; the authoritative intended-untracked proof MUST reproduce from that candidate; and policy, ledger, evidence, fix delta, receipt, and chain bindings MUST match exactly. The terminal fix-diff kind, base, ledger IDs, and identity remain preserved for audit, but the recovery snapshot need not share its kind, base, or identity. `review-validate` never auto-imports. Tampered content, wrong path scope/artifacts, truncated or tampered chains, different lineages, arbitrary alternate stores, or unbound bundles remain untrusted and fail closed.
 
