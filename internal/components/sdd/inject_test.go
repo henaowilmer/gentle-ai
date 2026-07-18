@@ -21,6 +21,7 @@ import (
 	windsurfagent "github.com/gentleman-programming/gentle-ai/internal/agents/windsurf"
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
+	opencodemodel "github.com/gentleman-programming/gentle-ai/internal/opencode"
 	// agents/cursor, agents/gemini, agents/vscode used via agents.NewAdapter()
 )
 
@@ -537,6 +538,11 @@ func TestInjectOpenCodeIsIdempotent(t *testing.T) {
 	if !first.Changed {
 		t.Fatalf("Inject() first changed = false")
 	}
+	settingsPath := opencodeAdapter().SettingsPath(home)
+	firstSettings, err := os.ReadFile(settingsPath)
+	if err != nil || !bytes.Contains(firstSettings, []byte(`"default_agent": "gentle-orchestrator"`)) {
+		t.Fatalf("first settings missing managed default: %s, err = %v", firstSettings, err)
+	}
 
 	second, err := Inject(home, opencodeAdapter(), "")
 	if err != nil {
@@ -646,7 +652,11 @@ func TestInjectOpenCodePreservesExistingOrchestratorPromptWhenRequested(t *testi
 		"**Trivial diff**",
 		"zero executable code and zero configuration changes",
 		"run exactly ONE lens",
+		"Large pure human documentation",
+		"run only `review-readability`",
 		"Full 4R is reserved for tier 3",
+		"after a fix rerun only the originating lens(es)",
+		"Native ordinary review keeps its targeted validator",
 		"`review-readability`",
 		"`review-reliability`",
 		"`review-resilience`",
@@ -885,6 +895,17 @@ func TestInjectOpenCodeUpgradesV1DelegationLensTable(t *testing.T) {
 	}
 	if strings.Count(text, "#### Review Lens Selection") != 1 {
 		t.Fatalf("opencode.json must contain exactly one Review Lens Selection section; got %d", strings.Count(text, "#### Review Lens Selection"))
+	}
+}
+
+func TestEnsurePreservedOpenCodeDelegationHardGatesMigratesCanonicalReviewCommand(t *testing.T) {
+	legacy := "before commit, push, or PR after code changes, run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial (tier 1)"
+	got := ensurePreservedOpenCodeDelegationHardGates(legacy)
+	if !strings.Contains(got, "`gentle-ai review validate --gate <gate> --cwd <repo>`") {
+		t.Fatalf("migrated delegation gates missing canonical review command:\n%s", got)
+	}
+	if strings.Contains(got, "native review validate --gate") {
+		t.Fatalf("migrated delegation gates retained non-existent command:\n%s", got)
 	}
 }
 
@@ -2776,10 +2797,23 @@ func TestInjectOpenClawRejectsAmbiguousWorkspacePath(t *testing.T) {
 func TestInjectOpenCodeMultiModeWithModelAssignments(t *testing.T) {
 	mockNoPackageManager(t)
 	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	seed := `{"$schema":"https://opencode.ai/config.json","username":"review-user","agent":{"custom":{"model":"custom/provider-model","description":"preserve me"}}}`
+	if err := os.WriteFile(settingsPath, []byte(seed), 0o644); err != nil {
+		t.Fatalf("WriteFile(opencode.json) error = %v", err)
+	}
 
 	assignments := map[string]model.ModelAssignment{
-		"sdd-init":  {ProviderID: "anthropic", ModelID: "claude-sonnet-4-20250514"},
-		"sdd-apply": {ProviderID: "openai", ModelID: "gpt-4o"},
+		"sdd-init":           {ProviderID: "anthropic", ModelID: "claude-sonnet-4-20250514"},
+		"sdd-apply":          {ProviderID: "openai", ModelID: "gpt-4o"},
+		"review-risk":        {ProviderID: "anthropic", ModelID: "claude-sonnet-4"},
+		"review-readability": {ProviderID: "openai", ModelID: "gpt-5-mini"},
+		"review-reliability": {ProviderID: "openai", ModelID: "gpt-5"},
+		"review-resilience":  {ProviderID: "anthropic", ModelID: "claude-sonnet-4"},
+		"review-refuter":     {ProviderID: "openai", ModelID: "gpt-5", Effort: "high"},
 	}
 
 	result, err := Inject(home, opencodeAdapter(), "multi", InjectOptions{OpenCodeModelAssignments: assignments})
@@ -2790,7 +2824,6 @@ func TestInjectOpenCodeMultiModeWithModelAssignments(t *testing.T) {
 		t.Fatal("Inject(multi, assignments) changed = false")
 	}
 
-	settingsPath := filepath.Join(home, ".config", "opencode", "opencode.json")
 	content, err := os.ReadFile(settingsPath)
 	if err != nil {
 		t.Fatalf("ReadFile(opencode.json) error = %v", err)
@@ -2804,6 +2837,13 @@ func TestInjectOpenCodeMultiModeWithModelAssignments(t *testing.T) {
 	agentMap, ok := root["agent"].(map[string]any)
 	if !ok {
 		t.Fatal("opencode.json missing agent map")
+	}
+	if root["$schema"] != "https://opencode.ai/config.json" || root["username"] != "review-user" {
+		t.Fatalf("unrelated config was not preserved: %v", root)
+	}
+	custom := agentMap["custom"].(map[string]any)
+	if custom["model"] != "custom/provider-model" || custom["description"] != "preserve me" {
+		t.Fatalf("unrelated custom agent changed: %v", custom)
 	}
 
 	// Verify sdd-init has the assigned model.
@@ -2822,6 +2862,21 @@ func TestInjectOpenCodeMultiModeWithModelAssignments(t *testing.T) {
 	}
 	if m, _ := applyAgent["model"].(string); m != "openai/gpt-4o" {
 		t.Fatalf("sdd-apply model = %q, want %q", m, "openai/gpt-4o")
+	}
+	for agent, want := range map[string]string{
+		"review-risk":        "anthropic/claude-sonnet-4",
+		"review-readability": "openai/gpt-5-mini",
+		"review-reliability": "openai/gpt-5",
+		"review-resilience":  "anthropic/claude-sonnet-4",
+		"review-refuter":     "openai/gpt-5",
+	} {
+		definition := agentMap[agent].(map[string]any)
+		if got := definition["model"]; got != want {
+			t.Fatalf("%s model = %q, want %q", agent, got, want)
+		}
+	}
+	if got := agentMap["review-refuter"].(map[string]any)["variant"]; got != "high" {
+		t.Fatalf("review-refuter variant = %q, want high", got)
 	}
 
 	// Unassigned phases should NOT have a model field — the overlay no longer
@@ -4908,8 +4963,8 @@ func TestInjectWritesNativeReviewAgentFiles(t *testing.T) {
 				t.Fatalf("Inject(%s) changed = false", tt.name)
 			}
 
-			for _, agent := range reviewAgentNames {
-				assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), agent+".md"), "No findings.")
+			for _, agent := range opencodemodel.ReviewLensPhases() {
+				assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), agent+".md"), `"findings":[]`)
 				for _, ext := range tt.extraExts {
 					want := tt.extraContains[ext]
 					if ext == ".yaml" {
@@ -4918,13 +4973,13 @@ func TestInjectWritesNativeReviewAgentFiles(t *testing.T) {
 					assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), agent+ext), want)
 				}
 			}
-			assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), reviewRefuterAgentName+".md"), "complete merged list of BLOCKER/CRITICAL candidates")
+			assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), opencodemodel.ReviewRefuterAgent+".md"), "complete merged list of BLOCKER/CRITICAL candidates")
 			for _, ext := range tt.extraExts {
 				want := tt.extraContains[ext]
 				if ext == ".yaml" {
-					want += reviewRefuterAgentName + ".md"
+					want += opencodemodel.ReviewRefuterAgent + ".md"
 				}
-				assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), reviewRefuterAgentName+ext), want)
+				assertNativeAgentFile(t, filepath.Join(tt.agentsDir(home), opencodemodel.ReviewRefuterAgent+ext), want)
 			}
 		})
 	}
@@ -5615,7 +5670,7 @@ func TestInjectOpenCodeWithProfile_StaleJDCleanupAcceptsJSONCSettings(t *testing
 	}
 }
 
-func TestInjectOpenCodeWithProfile_StaleJDCleanupDoesNotRejectMalformedSettings(t *testing.T) {
+func TestInjectOpenCodeRejectsMalformedSettingsBeforeWrites(t *testing.T) {
 	home := t.TempDir()
 	mockNoPackageManager(t)
 
@@ -5631,20 +5686,16 @@ func TestInjectOpenCodeWithProfile_StaleJDCleanupDoesNotRejectMalformedSettings(
 		Name:              "cheap",
 		OrchestratorModel: model.ModelAssignment{ProviderID: "anthropic", ModelID: "claude-haiku-3-5"},
 	}
-	if _, err := Inject(home, opencodeAdapter(), model.SDDModeMulti, InjectOptions{Profiles: []model.Profile{profileWithoutJD}}); err != nil {
-		t.Fatalf("Inject() should preserve merge behavior for malformed opencode settings: %v", err)
+	before, _ := os.ReadFile(settingsPath)
+	if _, err := Inject(home, opencodeAdapter(), model.SDDModeMulti, InjectOptions{Profiles: []model.Profile{profileWithoutJD}}); err == nil {
+		t.Fatal("Inject() accepted malformed opencode settings")
 	}
-
-	content, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("ReadFile(opencode.json): %v", err)
+	after, _ := os.ReadFile(settingsPath)
+	if !bytes.Equal(before, after) {
+		t.Fatalf("malformed settings changed: %q", after)
 	}
-	var root map[string]any
-	if err := json.Unmarshal(content, &root); err != nil {
-		t.Fatalf("opencode.json should be recovered as valid JSON: %v", err)
-	}
-	if _, ok := root["agent"].(map[string]any)["sdd-orchestrator-cheap"]; !ok {
-		t.Fatal("profile orchestrator missing after malformed settings recovery")
+	if _, err := os.Stat(filepath.Join(home, ".config", "opencode", "commands")); !os.IsNotExist(err) {
+		t.Fatalf("commands were written before settings validation: %v", err)
 	}
 }
 

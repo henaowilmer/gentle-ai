@@ -21,6 +21,13 @@ import (
 // invocations exactly — see the exact-argv assertions in
 // run_integration_test.go).
 func TestMain(m *testing.M) {
+	if code, ok := reviewGitProcessHelperExitCode(); ok {
+		os.Exit(code)
+	}
+	if err := os.Unsetenv("GENTLE_AI_CHANNEL"); err != nil {
+		panic(err)
+	}
+
 	verifyEngramVersion = func() (string, error) {
 		return "", errors.New("engram version not available in tests")
 	}

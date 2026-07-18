@@ -16,6 +16,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/components/communitytool"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
+	"github.com/gentleman-programming/gentle-ai/internal/components/opencodedefault"
 	"github.com/gentleman-programming/gentle-ai/internal/components/sdd"
 	"github.com/gentleman-programming/gentle-ai/internal/components/theme"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
@@ -627,7 +628,11 @@ func (s *Service) componentOperations(adapter agents.Adapter, componentID model.
 			ops = append(ops, rewriteSkillRegistryHook(path))
 		}
 		if path := adapter.SettingsPath(homeDir); path != "" && adapter.Agent() == model.AgentOpenCode {
-			targets = append(targets, path)
+			defaultPlan, err := opencodedefault.PrepareUninstall(path)
+			if err != nil {
+				return nil, nil, err
+			}
+			targets = append(targets, path, opencodedefault.OwnershipPath(path))
 			paths := make([]jsonPath, 0, len(configuredAgents))
 			for _, agentKey := range configuredAgents {
 				paths = append(paths, jsonPath{"agent", agentKey})
@@ -650,7 +655,7 @@ func (s *Service) componentOperations(adapter agents.Adapter, componentID model.
 				}
 			}
 
-			ops = append(ops, rewriteJSONFile(path, paths...))
+			ops = append(ops, rewriteOpenCodeSDDSettings(path, defaultPlan, paths...))
 
 			pluginDir := filepath.Join(homeDir, ".config", "opencode", "plugins")
 			for _, pluginPath := range []string{
@@ -965,6 +970,24 @@ func rewriteJSONFile(path string, jsonPaths ...jsonPath) operation {
 			return true, false, nil
 		},
 	}
+}
+
+func rewriteOpenCodeSDDSettings(path string, plan *opencodedefault.UninstallPlan, jsonPaths ...jsonPath) operation {
+	return operation{typeID: opRewriteFile, path: path, apply: func(path string) (bool, bool, error) {
+		raw, err := readManagedFile(path)
+		exists := err == nil
+		if err != nil && !os.IsNotExist(err) {
+			return false, false, err
+		}
+		updated := raw
+		if exists {
+			updated, _, err = removeJSONPaths(raw, jsonPaths...)
+			if err != nil {
+				return false, false, err
+			}
+		}
+		return plan.Apply(updated, exists)
+	}}
 }
 
 func rewriteSkillRegistryHook(path string) operation {

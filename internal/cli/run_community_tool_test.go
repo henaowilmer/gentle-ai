@@ -77,7 +77,7 @@ func TestInstallRuntimeStagePlanDeselectionCleansOwnedPiIntegration(t *testing.T
 						"type": "object",
 						"properties": map[string]any{
 							"query":       map[string]any{"type": "string"},
-							"maxFiles":    map[string]any{"type": "number"},
+							"maxFiles":    map[string]any{"type": "integer"},
 							"projectPath": map[string]any{"type": "string"},
 						},
 						"required": []any{"query"},
@@ -208,7 +208,7 @@ func TestRenderInstallManualActionsIncludesPiCodeGraphDrift(t *testing.T) {
 	}
 }
 
-func TestCodeGraphGuidanceMarkdownForSDDOnlyWhenSelectedOrConfigured(t *testing.T) {
+func TestCodeGraphGuidanceMarkdownForSDDOnlyWhenSelected(t *testing.T) {
 	tests := []struct {
 		name      string
 		setupHome func(t *testing.T, home string)
@@ -231,7 +231,7 @@ func TestCodeGraphGuidanceMarkdownForSDDOnlyWhenSelectedOrConfigured(t *testing.
 			want:     true,
 		},
 		{
-			name: "configured guidance marker",
+			name: "managed guidance without selection",
 			setupHome: func(t *testing.T, home string) {
 				mustWriteFile(t, filepath.Join(home, ".claude", "CLAUDE.md"), []byte(strings.Join([]string{
 					"existing Claude guidance",
@@ -241,10 +241,9 @@ func TestCodeGraphGuidanceMarkdownForSDDOnlyWhenSelectedOrConfigured(t *testing.
 				}, "\n")))
 			},
 			lookPath: func(string) (string, error) { return "/bin/codegraph", nil },
-			want:     true,
 		},
 		{
-			name: "configured MCP marker",
+			name: "MCP wiring without selection",
 			setupHome: func(t *testing.T, home string) {
 				mustWriteFile(t, filepath.Join(home, ".codex", "config.toml"), []byte(strings.Join([]string{
 					`[mcp_servers.codegraph]`,
@@ -252,10 +251,9 @@ func TestCodeGraphGuidanceMarkdownForSDDOnlyWhenSelectedOrConfigured(t *testing.
 				}, "\n")))
 			},
 			lookPath: func(string) (string, error) { return "/bin/codegraph", nil },
-			want:     true,
 		},
 		{
-			name: "legacy marker with CLI available",
+			name: "legacy marker without selection",
 			setupHome: func(t *testing.T, home string) {
 				mustWriteFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), []byte(`{}`))
 				mustWriteFile(t, filepath.Join(home, ".config", "opencode", "AGENTS.md"), []byte(strings.Join([]string{
@@ -266,7 +264,6 @@ func TestCodeGraphGuidanceMarkdownForSDDOnlyWhenSelectedOrConfigured(t *testing.
 				}, "\n")))
 			},
 			lookPath: func(string) (string, error) { return "/bin/codegraph", nil },
-			want:     true,
 		},
 	}
 
@@ -318,7 +315,7 @@ func TestComponentApplyStepInjectsCodeGraphGuidanceWhenCodeGraphSelected(t *test
 	assertOpenCodeSharedPromptCodeGraphGuidance(t, home, true)
 }
 
-func TestComponentApplyStepInjectsCodeGraphGuidanceWhenCodeGraphConfigured(t *testing.T) {
+func TestComponentApplyStepOmitsCodeGraphGuidanceWithoutSelection(t *testing.T) {
 	home := t.TempDir()
 	withCodeGraphLookPath(t, func(string) (string, error) { return "/bin/codegraph", nil })
 	mustWriteFile(t, filepath.Join(home, ".codex", "config.toml"), []byte(strings.Join([]string{
@@ -345,7 +342,7 @@ func TestComponentApplyStepInjectsCodeGraphGuidanceWhenCodeGraphConfigured(t *te
 		t.Fatalf("componentApplyStep.Run() error = %v", err)
 	}
 
-	assertOpenCodeSharedPromptCodeGraphGuidance(t, home, true)
+	assertOpenCodeSharedPromptCodeGraphGuidance(t, home, false)
 }
 
 func TestComponentApplyStepOmitsCodeGraphGuidanceWhenOnlyCLIAvailable(t *testing.T) {
@@ -368,7 +365,7 @@ func TestComponentApplyStepOmitsCodeGraphGuidanceWhenOnlyCLIAvailable(t *testing
 	assertOpenCodeSharedPromptCodeGraphGuidance(t, home, false)
 }
 
-func TestComponentSyncStepInjectsCodeGraphGuidanceFromLegacyMarker(t *testing.T) {
+func TestComponentSyncStepOmitsCodeGraphGuidanceFromLegacyMarkerWithoutSelection(t *testing.T) {
 	home := t.TempDir()
 	withCodeGraphLookPath(t, func(string) (string, error) { return "/bin/codegraph", nil })
 	mustWriteFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), []byte(`{}`))
@@ -393,7 +390,7 @@ func TestComponentSyncStepInjectsCodeGraphGuidanceFromLegacyMarker(t *testing.T)
 		t.Fatalf("componentSyncStep.Run() error = %v", err)
 	}
 
-	assertOpenCodeSharedPromptCodeGraphGuidance(t, home, true)
+	assertOpenCodeSharedPromptCodeGraphGuidance(t, home, false)
 }
 
 func TestCommunityToolInstallStepUsesInjectableInstaller(t *testing.T) {
@@ -475,7 +472,7 @@ func TestInstallPipelineDoesNotDuplicatePiPendingWhenSelected(t *testing.T) {
 		installCommunityToolWithHome = previousInstall
 		reconcilePiCodeGraph = previousReconcile
 	})
-	pending := communitytool.PiCodeGraphResult{ManualActions: []string{"Pi CodeGraph integration is pending: Pi 0.80.6 has no supported machine-verifiable adapter health signal. CodeGraph capability was not reported as configured."}}
+	pending := communitytool.PiCodeGraphResult{ManualActions: []string{"Pi CodeGraph integration remains pending: CodeGraph configuration was installed and preserved, and direct MCP capability was verified. Pi adapter activation health cannot be machine-verified on the detected Pi version."}}
 	installCommunityToolWithHome = func(_ model.CommunityToolID, _ string, _ string, _ communitytool.Runner, _ communitytool.Detector) (communitytool.Result, error) {
 		return communitytool.Result{Tool: model.CommunityToolCodeGraph, PiCodeGraph: &pending}, nil
 	}
@@ -501,21 +498,17 @@ func TestInstallPipelineDoesNotDuplicatePiPendingWhenSelected(t *testing.T) {
 	}
 }
 
-func TestPiCodeGraphRuntimeOutputClassification(t *testing.T) {
+func TestPiCodeGraphMCPRuntimeClassification(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("fake Pi runtime uses a POSIX script")
+		t.Skip("fake CodeGraph runtime uses a POSIX script")
 	}
 	tests := []struct {
 		name    string
-		output  string
+		tools   string
 		pending bool
 	}{
-		{name: "session only", output: `{"type":"session","version":3}` + "\n", pending: true},
-		{name: "not ready", output: "codegraph: not ready\n"},
-		{name: "not running", output: "codegraph: not running\n"},
-		{name: "unloaded", output: "codegraph: unloaded\n"},
-		{name: "inactive", output: "codegraph: inactive\n"},
-		{name: "broken", output: "codegraph: broken\n"},
+		{name: "valid MCP capability", tools: `[{"name":"codegraph_explore","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"maxFiles":{"type":"integer"},"projectPath":{"type":"string"}},"required":["query"]}}]`, pending: true},
+		{name: "malformed MCP response", tools: `not-json`},
 	}
 
 	for _, tc := range tests {
@@ -523,7 +516,7 @@ func TestPiCodeGraphRuntimeOutputClassification(t *testing.T) {
 			home := t.TempDir()
 			writePiInstallFixture(t, home)
 			mustWriteFile(t, filepath.Join(home, ".pi", "agent", "npm", "node_modules", "pi-mcp-adapter", "index.ts"), []byte("export default {}\n"))
-			installFakePiRuntime(t, tc.output)
+			installFakeCodeGraphMCP(t, tc.tools)
 
 			result, err := communitytool.ReconcilePiCodeGraph(communitytool.PiCodeGraphOptions{HomeDir: home, Selected: true})
 			result, err = communitytool.PreservePiCodeGraphPending(result, err)
@@ -540,9 +533,12 @@ func TestPiCodeGraphRuntimeOutputClassification(t *testing.T) {
 	}
 }
 
-func TestSyncPlanAlwaysIncludesPiCodeGraphReconciliationAfterComponents(t *testing.T) {
+func TestSyncPlanIncludesPiCodeGraphReconciliationAfterComponentsWhenSelected(t *testing.T) {
 	home := t.TempDir()
-	runtime, err := newSyncRuntime(home, model.Selection{Agents: []model.AgentID{model.AgentPi}})
+	runtime, err := newSyncRuntime(home, model.Selection{
+		Agents:         []model.AgentID{model.AgentPi},
+		CommunityTools: []model.CommunityToolID{model.CommunityToolCodeGraph},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,12 +580,18 @@ func writePiInstallFixture(t *testing.T, home string) {
 	mustWriteFile(t, filepath.Join(home, ".pi", "agent", "subagents", "worker.md"), []byte("---\ntools: bash\n---\nwork\n"))
 }
 
-func installFakePiRuntime(t *testing.T, output string) {
+func installFakeCodeGraphMCP(t *testing.T, tools string) {
 	t.Helper()
 	binDir := t.TempDir()
-	piPath := filepath.Join(binDir, "pi")
-	quoted := strings.ReplaceAll(output, "'", "'\"'\"'")
-	if err := os.WriteFile(piPath, []byte("#!/bin/sh\nprintf '%s' '"+quoted+"'\n"), 0o755); err != nil {
+	codeGraphPath := filepath.Join(binDir, "codegraph")
+	script := "#!/bin/sh\n" +
+		"[ \"$1\" = serve ] && [ \"$2\" = --mcp ] || exit 64\n" +
+		"IFS= read -r initialize || exit 65\n" +
+		"printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-codegraph\",\"version\":\"1\"}}}'\n" +
+		"IFS= read -r initialized || exit 66\n" +
+		"IFS= read -r tools_list || exit 67\n" +
+		"printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":" + tools + "}}'\n"
+	if err := os.WriteFile(codeGraphPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -13,13 +13,28 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
+	"syscall"
 )
 
 const RecordSchema = "gentle-ai.review-record/v1"
 
 var ErrConcurrentUpdate = errors.New("review transaction changed concurrently")
 var ErrInvalidSuccessor = errors.New("review transaction successor is invalid")
+
+var reviewRuntimeGOOS = func() string { return runtime.GOOS }
+var syncReviewDirectory = func(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
+}
 
 type Record struct {
 	Schema           string      `json:"schema"`
@@ -32,6 +47,7 @@ type Store struct {
 	Dir       string
 	lineageID string
 	repo      string
+	readOnly  bool
 }
 
 type ValidatedChain struct {
@@ -48,13 +64,62 @@ func AuthoritativeStore(ctx context.Context, repo, lineageID string) (Store, err
 	if err := validateLineageID(lineageID); err != nil {
 		return Store{}, err
 	}
+	authorityRoot, root, err := authoritativeStoreRoot(ctx, repo)
+	if err != nil {
+		return Store{}, err
+	}
+	dir := filepath.Join(authorityRoot, lineageID)
+	relative, err := filepath.Rel(authorityRoot, dir)
+	if err != nil || relative != lineageID || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return Store{}, errors.New("lineage_id escapes the repository review store")
+	}
+	_, statErr := os.Stat(filepath.Join(dir, "HEAD"))
+	return Store{Dir: dir, lineageID: lineageID, repo: root, readOnly: statErr == nil}, nil
+}
+
+// DiscoverAuthoritativeStores returns every canonical lineage rooted in the
+// repository Git common directory. Callers still validate each chain before
+// treating it as review authority.
+func DiscoverAuthoritativeStores(ctx context.Context, repo string) ([]Store, error) {
+	authorityRoot, root, err := authoritativeStoreRoot(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(authorityRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []Store{}, nil
+		}
+		return nil, err
+	}
+	stores := make([]Store, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || validateLineageID(entry.Name()) != nil {
+			continue
+		}
+		stores = append(stores, Store{
+			Dir: filepath.Join(authorityRoot, entry.Name()), lineageID: entry.Name(), repo: root, readOnly: true,
+		})
+	}
+	return stores, nil
+}
+
+func authoritativeStoreRoot(ctx context.Context, repo string) (string, string, error) {
+	base, root, err := reviewAuthorityRoot(ctx, repo)
+	if err != nil {
+		return "", "", err
+	}
+	return filepath.Join(base, "v1"), root, nil
+}
+
+func reviewAuthorityRoot(ctx context.Context, repo string) (string, string, error) {
 	root, err := (SnapshotBuilder{Repo: repo}).repositoryRoot(ctx)
 	if err != nil {
-		return Store{}, fmt.Errorf("resolve authoritative review repository: %w", err)
+		return "", "", fmt.Errorf("resolve authoritative review repository: %w", err)
 	}
 	output, err := runGit(ctx, root, nil, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
-		return Store{}, fmt.Errorf("resolve repository Git common directory: %w", err)
+		return "", "", fmt.Errorf("resolve repository Git common directory: %w", err)
 	}
 	commonDir := strings.TrimSpace(string(output))
 	if !filepath.IsAbs(commonDir) {
@@ -62,15 +127,10 @@ func AuthoritativeStore(ctx context.Context, repo, lineageID string) (Store, err
 	}
 	commonDir, err = filepath.Abs(commonDir)
 	if err != nil {
-		return Store{}, err
+		return "", "", err
 	}
-	authorityRoot := filepath.Join(filepath.Clean(commonDir), "gentle-ai", "review-transactions", "v1")
-	dir := filepath.Join(authorityRoot, lineageID)
-	relative, err := filepath.Rel(authorityRoot, dir)
-	if err != nil || relative != lineageID || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return Store{}, errors.New("lineage_id escapes the repository review store")
-	}
-	return Store{Dir: dir, lineageID: lineageID, repo: root}, nil
+	authorityRoot := filepath.Join(filepath.Clean(commonDir), "gentle-ai", "review-transactions")
+	return authorityRoot, root, nil
 }
 
 func validateLineageID(lineageID string) error {
@@ -81,6 +141,17 @@ func validateLineageID(lineageID string) error {
 }
 
 func (store Store) Append(expectedRevision string, record Record) (string, error) {
+	return store.append(expectedRevision, record)
+}
+
+func (store Store) append(expectedRevision string, record Record) (string, error) {
+	if store.readOnly {
+		operation := strings.TrimSpace(record.Operation)
+		if operation == "" {
+			operation = "review/append"
+		}
+		return "", NewLegacyReadOnlyError(operation, store.lineageID)
+	}
 	if strings.TrimSpace(store.Dir) == "" {
 		return "", errors.New("review store directory is required")
 	}
@@ -136,6 +207,21 @@ func (store Store) Append(expectedRevision string, record Record) (string, error
 		if !validInitialStoreRecord(record) {
 			return "", fmt.Errorf("%w: first event must be review/start in reviewing state", ErrInvalidSuccessor)
 		}
+		if record.Transaction.Mode == ModeOrdinaryBounded && !record.Transaction.hasCorrectionBudget() {
+			return "", fmt.Errorf("%w: new ordinary_bounded review/start requires correction budget fields", ErrInvalidSuccessor)
+		}
+		if store.repo != "" {
+			builder := SnapshotBuilder{Repo: store.repo}
+			if err := builder.ValidateEvidence(context.Background(), record.Transaction.Snapshot); err != nil {
+				return "", fmt.Errorf("%w: initial snapshot is not repository-derived: %v", ErrInvalidSuccessor, err)
+			}
+			if record.Transaction.hasCorrectionBudget() {
+				risk, changedLines, err := builder.ClassifySnapshotRisk(context.Background(), record.Transaction.Snapshot)
+				if err != nil || changedLines != *record.Transaction.OriginalChangedLines || risk != record.Transaction.RiskLevel {
+					return "", fmt.Errorf("%w: original risk inputs do not match repository tree evidence", ErrInvalidSuccessor)
+				}
+			}
+		}
 	} else {
 		chain, err := store.loadChain(current)
 		if err != nil {
@@ -143,8 +229,15 @@ func (store Store) Append(expectedRevision string, record Record) (string, error
 		}
 		previous := chain.Records[len(chain.Records)-1]
 		if previous.Transaction.State == StateFixing && record.Transaction.State == StateFixValidating && store.repo != "" {
-			if err := (SnapshotBuilder{Repo: store.repo}).ValidateEvidence(context.Background(), record.Transaction.Snapshot); err != nil {
+			builder := SnapshotBuilder{Repo: store.repo}
+			if err := builder.ValidateEvidence(context.Background(), record.Transaction.Snapshot); err != nil {
 				return "", fmt.Errorf("%w: correction snapshot is not repository-derived: %v", ErrInvalidSuccessor, err)
+			}
+			if record.Transaction.hasCorrectionBudget() {
+				actualChangedLines, err := builder.ChangedLines(context.Background(), record.Transaction.Snapshot)
+				if err != nil || record.Transaction.ActualCorrectionLines == nil || actualChangedLines != *record.Transaction.ActualCorrectionLines {
+					return "", fmt.Errorf("%w: actual correction lines do not match repository tree evidence", ErrInvalidSuccessor)
+				}
 			}
 		}
 		if err := validateSuccessor(previous.Transaction, record.Transaction, record.Operation); err != nil {
@@ -159,6 +252,12 @@ func (store Store) Append(expectedRevision string, record Record) (string, error
 		return "", err
 	}
 	return revision, nil
+}
+
+// InvalidatePristine is retained as a compatibility entry point, but ordinary
+// legacy-v1 authority is immutable once created.
+func (store Store) InvalidatePristine(expectedRevision, reason string, snapshot Snapshot) (string, error) {
+	return "", NewLegacyReadOnlyError("review/invalidate", store.lineageID)
 }
 
 func (store Store) Load() (Record, string, error) {
@@ -221,8 +320,13 @@ func (store Store) loadChain(headRevision string) (ValidatedChain, error) {
 		if records[index].PreviousRevision != revisions[index-1] {
 			return ValidatedChain{}, errors.New("review chain predecessor revision is discontinuous")
 		}
-		if err := validateSuccessor(records[index-1].Transaction, records[index].Transaction, records[index].Operation); err != nil {
+		if err := validatePersistedV1Successor(records[index-1].Transaction, records[index].Transaction, records[index].Operation, index); err != nil {
 			return ValidatedChain{}, fmt.Errorf("review chain successor %s: %w", revisions[index], err)
+		}
+	}
+	if store.repo != "" {
+		if err := validateRepositoryBudgetEvidence(context.Background(), store.repo, records); err != nil {
+			return ValidatedChain{}, err
 		}
 	}
 
@@ -232,6 +336,29 @@ func (store Store) loadChain(headRevision string) (ValidatedChain, error) {
 	}
 	chain.Identity = chainIdentity(revisions)
 	return chain, nil
+}
+
+func validateRepositoryBudgetEvidence(ctx context.Context, repo string, records []Record) error {
+	if len(records) == 0 || !records[0].Transaction.hasCorrectionBudget() {
+		return nil
+	}
+	builder := SnapshotBuilder{Repo: repo}
+	genesis := records[0].Transaction
+	risk, changedLines, err := builder.ClassifySnapshotRisk(ctx, genesis.Snapshot)
+	if err != nil || changedLines != *genesis.OriginalChangedLines || risk != genesis.RiskLevel {
+		return errors.New("original risk inputs do not match repository tree evidence")
+	}
+	for index := 1; index < len(records); index++ {
+		previous, next := records[index-1].Transaction, records[index].Transaction
+		if previous.State != StateFixing || next.State != StateFixValidating {
+			continue
+		}
+		actual, countErr := builder.ChangedLines(ctx, next.Snapshot)
+		if countErr != nil || next.ActualCorrectionLines == nil || actual != *next.ActualCorrectionLines {
+			return errors.New("actual correction lines do not match repository tree evidence")
+		}
+	}
+	return nil
 }
 
 func (store Store) loadRevision(revision string) (Record, string, error) {
@@ -267,6 +394,13 @@ func (store Store) loadRevision(revision string) (Record, string, error) {
 }
 
 func validateSuccessor(previous, next Transaction, operation string) error {
+	if operation == "review/invalidate" {
+		expected := previous
+		if err := expected.Invalidate(next.InvalidationReason); err != nil || !transactionsEqual(expected, next) {
+			return fmt.Errorf("%w: invalidation must retain a pristine reviewing authority", ErrInvalidSuccessor)
+		}
+		return nil
+	}
 	if previous.LineageID != next.LineageID || previous.Generation != next.Generation || previous.Mode != next.Mode {
 		return fmt.Errorf("%w: lineage, generation, and mode are immutable", ErrInvalidSuccessor)
 	}
@@ -281,6 +415,9 @@ func validateSuccessor(previous, next Transaction, operation string) error {
 	}
 	if previous.RiskLevel != next.RiskLevel {
 		return fmt.Errorf("%w: native risk classification is immutable", ErrInvalidSuccessor)
+	}
+	if !equalOptionalInt(previous.OriginalChangedLines, next.OriginalChangedLines) || !equalOptionalInt(previous.CorrectionBudget, next.CorrectionBudget) {
+		return fmt.Errorf("%w: original changed lines and correction budget are immutable", ErrInvalidSuccessor)
 	}
 	lensStateChanged := !reflect.DeepEqual(previous.LensResults, next.LensResults) ||
 		previous.Counters.RiskExecutions != next.Counters.RiskExecutions ||
@@ -322,6 +459,34 @@ func validateSuccessor(previous, next Transaction, operation string) error {
 		if err := pathsAreSubset(next.Snapshot.Paths, genesisPaths); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidSuccessor, err)
 		}
+		expected := previous
+		var err error
+		if next.ActualCorrectionLines == nil {
+			err = expected.CompleteFix(next.Snapshot, next.FixDeltaHash, next.FixFindingIDs)
+		} else {
+			err = expected.CompleteFix(next.Snapshot, next.FixDeltaHash, next.FixFindingIDs, *next.ActualCorrectionLines)
+		}
+		if err != nil || !transactionsEqual(expected, next) {
+			return fmt.Errorf("%w: fix completion must replay the exact budgeted transition", ErrInvalidSuccessor)
+		}
+	}
+	fixStart := previous.State == StateFixRequired && (next.State == StateFixing || previous.hasCorrectionBudget() && next.State == StateEscalated)
+	if fixStart {
+		expected := previous
+		var err error
+		if next.ProposedCorrectionLines == nil {
+			err = expected.BeginFix(next.FailedEvidenceRevision)
+		} else {
+			err = expected.BeginFix(next.FailedEvidenceRevision, *next.ProposedCorrectionLines)
+		}
+		if operation != "review/begin-fix" || err != nil || !transactionsEqual(expected, next) {
+			return fmt.Errorf("%w: fix start must replay the exact budgeted transition", ErrInvalidSuccessor)
+		}
+	} else if !equalOptionalInt(previous.ProposedCorrectionLines, next.ProposedCorrectionLines) {
+		return fmt.Errorf("%w: proposed correction lines changed outside fix start", ErrInvalidSuccessor)
+	}
+	if !fixCompletion && !equalOptionalInt(previous.ActualCorrectionLines, next.ActualCorrectionLines) {
+		return fmt.Errorf("%w: actual correction lines changed outside fix completion", ErrInvalidSuccessor)
 	}
 	releaseBinding := previous.Release == nil && next.Release != nil
 	if previous.Release != nil && !reflect.DeepEqual(previous.Release, next.Release) {
@@ -390,6 +555,60 @@ func validateSuccessor(previous, next Transaction, operation string) error {
 	return nil
 }
 
+// validatePersistedV1Successor accepts only the two v1 encodings documented
+// in the historical lifecycle. It validates decoded semantics without
+// rewriting the content-addressed event payload.
+func validatePersistedV1Successor(previous, next Transaction, operation string, index int) error {
+	if err := validateSuccessor(previous, next, operation); err == nil {
+		return nil
+	}
+	if index < 1 {
+		return fmt.Errorf("%w: historical aliases cannot be genesis records", ErrInvalidSuccessor)
+	}
+	if operation == "review/validate-targeted-fix" &&
+		previous.Mode == ModeOrdinary4R && previous.State == StateFixValidating &&
+		(next.State == StateReadyFinalVerification || next.State == StateEscalated) &&
+		next.OriginalCriteria == nil && next.CorrectionRegression == nil {
+		return validateSuccessor(previous, next, "review/validate-fix-delta")
+	}
+	if operation == "review/freeze-findings" &&
+		(previous.Mode == ModeOrdinary4R || previous.Mode == ModeJudgmentDay) &&
+		(previous.State == StateReviewing || previous.State == StateJudgesConfirmed) &&
+		next.State == StateFindingsFrozen {
+		return validateHistoricalFreezeFindings(previous, next)
+	}
+	return fmt.Errorf("%w: unsupported historical v1 operation alias", ErrInvalidSuccessor)
+}
+
+// validateHistoricalFreezeFindings reproduces v1.49 findings-freeze semantics:
+// the event retained an external ledger hash and derived only the findings hash.
+func validateHistoricalFreezeFindings(previous, next Transaction) error {
+	if !validSHA256(next.LedgerHash) {
+		return fmt.Errorf("%w: historical findings freeze requires a ledger hash", ErrInvalidSuccessor)
+	}
+	expected := previous
+	expected.Findings = nil
+	if next.Findings != nil {
+		// v1.49 hashed an explicit empty findings array differently from null.
+		// Preserve that published representation while deriving the hash.
+		expected.Findings = make([]Finding, len(next.Findings))
+		copy(expected.Findings, next.Findings)
+	}
+	expected.Outcomes = cloneOutcomes(previous.Outcomes)
+	for _, finding := range expected.Findings {
+		if !isSevereSeverity(finding.Severity) {
+			expected.Outcomes[finding.ID] = OutcomeInfo
+		}
+	}
+	expected.LedgerHash = next.LedgerHash
+	expected.LedgerFindingsHash = findingsHash(expected.Findings)
+	expected.State = StateFindingsFrozen
+	if !transactionsEqual(expected, next) {
+		return fmt.Errorf("%w: historical findings freeze changed unrelated transaction state", ErrInvalidSuccessor)
+	}
+	return nil
+}
+
 // transactionsEqual compares persisted transaction state. JSON omits empty
 // optional arrays, so a local empty slice and its nil decoded form represent
 // the same immutable release-binding state.
@@ -451,6 +670,10 @@ func followUpSliceIsPrefix(previous, next []FollowUp) bool {
 	return reflect.DeepEqual(previous, next[:len(previous)])
 }
 
+func equalOptionalInt(left, right *int) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
 func validateSuccessorCounters(previous, next Transaction) error {
 	expected := previous.Counters
 	switch {
@@ -486,6 +709,7 @@ func validateSuccessorCounters(previous, next Transaction) error {
 
 func snapshotsEqual(previous, next Snapshot) bool {
 	return previous.Kind == next.Kind &&
+		previous.Projection == next.Projection &&
 		previous.BaseTree == next.BaseTree &&
 		previous.CandidateTree == next.CandidateTree &&
 		previous.PathsDigest == next.PathsDigest &&
@@ -660,5 +884,16 @@ func writeAtomic(path string, payload []byte, mode os.FileMode) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tempPath, path)
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if err := syncReviewDirectory(filepath.Dir(path)); err != nil {
+		// NTFS and some filesystems do not support syncing directory handles.
+		unsupported := errors.Is(err, syscall.EINVAL) || errors.Is(err, errors.ErrUnsupported) ||
+			reviewRuntimeGOOS() == "windows" && errors.Is(err, os.ErrPermission)
+		if !unsupported {
+			return fmt.Errorf("sync parent directory for %q: %w", path, err)
+		}
+	}
+	return nil
 }

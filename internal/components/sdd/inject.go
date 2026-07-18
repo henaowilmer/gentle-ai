@@ -12,6 +12,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/catalog"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
+	"github.com/gentleman-programming/gentle-ai/internal/components/opencodedefault"
 	"github.com/gentleman-programming/gentle-ai/internal/components/skills"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/opencode"
@@ -226,6 +227,14 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 	}
 	if err := validateOpenClawWorkspacePath(homeDir, adapter); err != nil {
 		return InjectionResult{}, err
+	}
+	var defaultPlan *opencodedefault.InstallPlan
+	if adapter.Agent() == model.AgentOpenCode {
+		var err error
+		defaultPlan, err = opencodedefault.PrepareInstall(adapter.SettingsPath(homeDir))
+		if err != nil {
+			return InjectionResult{}, err
+		}
 	}
 
 	var opts InjectOptions
@@ -540,6 +549,14 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 				}
 				changed = changed || profileResult.writeResult.Changed
 				mergedSettingsBytes = profileResult.merged
+			}
+			if defaultPlan != nil {
+				defaultChanged, defaultErr := defaultPlan.Apply()
+				if defaultErr != nil {
+					return InjectionResult{}, defaultErr
+				}
+				changed = changed || defaultChanged
+				files = append(files, opencodedefault.OwnershipPath(settingsPath))
 			}
 		}
 	}
@@ -932,17 +949,13 @@ func inlineOpenCodeSDDPrompts(overlayBytes []byte, homeDir, settingsPath string,
 }
 
 func expandOpenCodeBoundedReviewAgents(agentsMap map[string]any) {
-	contract := boundedReviewContract()
-	for _, name := range []string{"review-risk", "review-readability", "review-reliability", "review-resilience"} {
+	for _, name := range opencode.ReviewLensPhases() {
 		agent, ok := agentsMap[name].(map[string]any)
 		if !ok {
 			continue
 		}
-		prompt, _ := agent["prompt"].(string)
-		if marker := strings.Index(prompt, "Review execution contract:"); marker >= 0 {
-			prompt = strings.TrimSpace(prompt[:marker])
-		}
-		agent["prompt"] = prompt + "\n\n" + contract
+		prompt, _ := reviewerPrompt(name)
+		agent["prompt"] = prompt
 		agent["tools"] = map[string]any{"read": true, "write": false, "edit": false, "bash": false, "task": false}
 	}
 
@@ -951,12 +964,11 @@ func expandOpenCodeBoundedReviewAgents(agentsMap map[string]any) {
 		if !ok {
 			continue
 		}
-		prompt, _ := agent["prompt"].(string)
-		agent["prompt"] = strings.TrimSpace(prompt) + " Judgment Day replaces ordinary 4R, uses at most two scoped fix/re-judgment rounds, and never launches review-refuter. Return one read-only judgment result and terminate."
+		agent["prompt"] = judgmentDayReviewerContract()
 		agent["tools"] = map[string]any{"read": true, "write": false, "edit": false, "bash": false, "task": false}
 	}
 
-	if refuter, ok := agentsMap[reviewRefuterAgentName].(map[string]any); ok {
+	if refuter, ok := agentsMap[opencode.ReviewRefuterAgent].(map[string]any); ok {
 		refuter["prompt"] = "You are the detached read-only refuter for exactly ONE transaction-wide inferential batch. Receive every inferential severe neutral claim and proof reference, return one corroborated | refuted | inconclusive result per finding, add no findings, modify nothing, return one complete result, and terminate. Missing or malformed entries are inconclusive."
 		refuter["tools"] = map[string]any{"read": true, "write": false, "edit": false, "bash": false, "task": false}
 	}
@@ -1064,7 +1076,7 @@ func ensurePreservedOpenCodeDelegationHardGates(prompt string) string {
 		"use fresh context for adversarial review of diffs, conflicts, PR readiness, and incidents",
 		"run fresh adversarial lenses only inside one explicit review/start(target); PR readiness and incidents validate the receipt",
 		"before commit, push, or PR after code changes, run the concrete review lens(es) selected by Review Lens Selection unless the diff is trivial (tier 1)",
-		"before commit, push, PR, or release, validate the same content-bound receipt with native review-validate; never create a review budget at the gate",
+		"before commit, push, PR, or release, validate the same content-bound receipt with native `gentle-ai review validate --gate <gate> --cwd <repo>`; never create a review budget at the gate",
 		"after wrong `cwd`, accidental repo/worktree mutation, merge recovery, confusing test command, or environment workaround, stop and run the concrete audit/review lens(es) selected by Review Lens Selection before continuing",
 		"after a workflow incident, prove code, configuration, generated-artifact, and provenance targets remain immutable, then validate the existing receipt",
 	).Replace(prompt)
@@ -1082,7 +1094,7 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 
 1. **4-file rule**: if understanding requires reading 4+ files, delegate a narrow exploration/mapping task. If delegation tooling is unavailable, document the blocker and stop the exploration instead of reading everything inline.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer. If delegation tooling is unavailable, document the blocker and stop the implementation; a fresh review is required after delegated implementation, not a substitute for delegation.
-3. **Lifecycle receipt rule**: before commit, push, PR, or release, run one native ` + "`review-validate --cwd <repo> --lineage <id> --gate <gate> --receipt <path> --bundle <path> --policy <path> --ledger <path> --evidence <path>`" + ` command for the same content-bound receipt; follow missing/scope-changed/invalidated/escalated action, never hand-author request JSON, and never launch a lens, Judgment Day, or new budget at the gate.
+3. **Lifecycle receipt rule**: before commit, push, PR, or release, run one native ` + "`gentle-ai review validate --gate <gate> --cwd <repo>`" + ` command for the same content-bound receipt; let the facade discover authority and artifacts, follow missing/scope-changed/invalidated/escalated action, and never launch a lens, Judgment Day, or new budget at the gate.
 4. **Incident rule**: after a workflow incident, prove code, configuration, generated-artifact, and provenance targets remain immutable, then validate the existing receipt. Any changed target requires explicit scope action, not reopened review.
 5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation and growing complexity, pause and delegate the remaining work instead of silently continuing monolithically. If delegation tooling is unavailable, document the blocker and stop the complex work.
 6. **Fresh review rule**: fresh adversarial lenses run only inside one explicit ` + "`review/start(target)`" + `. PR readiness and incidents validate the receipt and never create another budget.
@@ -1093,7 +1105,8 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 
 1. **Trivial diff** (ONLY documentation, comments, formatting, or typo fixes in strings — zero executable code and zero configuration changes): run no lens. Any diff touching executable code or configuration is at least standard tier.
 2. **Standard diff**: run exactly ONE lens — the row in the table below that matches the dominant risk. If multiple rows match, pick the single highest-impact row; do not add lenses.
-3. **Hot path** (the diff touches auth/update/security/payments paths) **or >400 changed lines**: run the full 4R set — ` + "`review-risk`" + `, ` + "`review-resilience`" + `, ` + "`review-readability`" + `, ` + "`review-reliability`" + `.
+3. **Hot path** (the diff touches auth/update/security/payments paths) **or >400 changed lines outside pure human documentation**: run the full 4R set — ` + "`review-risk`" + `, ` + "`review-resilience`" + `, ` + "`review-readability`" + `, ` + "`review-reliability`" + `.
+4. **Large pure human documentation** (>400 authored lines with no code, configuration, prompts, agent rules, workflows, runtime instruction docs, mixed content, or active content): run only ` + "`review-readability`" + `.
 
 | Risk signal | Review lens |
 | --- | --- |
@@ -1103,6 +1116,8 @@ Do not pass these rules to child agents as permission to spawn more agents; chil
 | Security, permissions, data exposure/loss, architecture, or dependencies | ` + "`review-risk`" + ` |
 
 Full 4R is reserved for tier 3; a standard diff never fans out to multiple lenses.
+
+For ad-hoc 4R outside a native ordinary transaction, after a fix rerun only the originating lens(es) that produced open verified BLOCKER/CRITICAL findings. Never rerun clean lenses or lenses with only WARNING/SUGGESTION findings. Native ordinary review keeps its targeted validator and never reruns initial lenses.
 <!-- /gentle-ai:delegation-hard-gates-migration -->
 `
 

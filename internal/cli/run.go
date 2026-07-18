@@ -22,6 +22,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/components/engram"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/mcp"
+	"github.com/gentleman-programming/gentle-ai/internal/components/opencodedefault"
 	"github.com/gentleman-programming/gentle-ai/internal/components/opencodeplugin"
 	"github.com/gentleman-programming/gentle-ai/internal/components/permissions"
 	"github.com/gentleman-programming/gentle-ai/internal/components/persona"
@@ -209,6 +210,8 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	claudePhaseState := claudePhaseAssignmentsToState(input.Selection.ClaudePhaseAssignments)
 	newState := state.InstallState{
 		InstalledAgents:             agentIDs,
+		CommunityTools:              communityToolIDsToStrings(input.Selection.CommunityTools),
+		CommunityToolsConfigured:    true,
 		ClaudeModelAssignments:      claudeLegacyAssignmentsForState(input.Selection.ClaudeModelAssignments, claudePhaseState),
 		ClaudePhaseAssignments:      claudePhaseState,
 		KiroModelAssignments:        kiroAliasesToStrings(input.Selection.KiroModelAssignments),
@@ -219,20 +222,22 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		ModelAssignments:            modelAssignmentsToState(input.Selection.ModelAssignments),
 		Persona:                     string(input.Selection.Persona),
 	}
+	newState.SetSelection(input.Selection)
 	if len(flags.Agents) > 0 {
-		merged, ok := mergeExplicitAgentInstallState(homeDir, newState, agentIDs)
+		merged, ok := mergeExplicitAgentInstallState(homeDir, newState, agentIDs, flags)
 		if !ok {
 			return result, nil
 		}
 		newState = merged
 	}
-	// Non-fatal: a state write failure must not break an otherwise successful install.
-	_ = state.Write(homeDir, newState)
+	if err := state.Write(homeDir, newState); err != nil {
+		return result, fmt.Errorf("persist install state: %w", err)
+	}
 
 	return result, nil
 }
 
-func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState, agentIDs []string) (state.InstallState, bool) {
+func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState, agentIDs []string, flags InstallFlags) (state.InstallState, bool) {
 	existing, readErr := state.Read(homeDir)
 	if readErr != nil {
 		if errors.Is(readErr, os.ErrNotExist) {
@@ -267,7 +272,21 @@ func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState,
 	if newState.CodexPhaseModelAssignments != nil {
 		merged.CodexPhaseModelAssignments = newState.CodexPhaseModelAssignments
 	}
-	if merged.Persona == "" && newState.Persona != "" {
+	if merged.SelectionConfigured {
+		if len(flags.Components) > 0 {
+			merged.Components = newState.Components
+		}
+		if len(flags.Skills) > 0 {
+			merged.Skills = newState.Skills
+		}
+		if flags.Preset != "" {
+			merged.Preset = newState.Preset
+		}
+		if flags.SDDMode != "" {
+			merged.SDDMode = newState.SDDMode
+		}
+	}
+	if flags.Persona != "" || merged.Persona == "" {
 		merged.Persona = newState.Persona
 	}
 	return merged, true
@@ -1383,7 +1402,7 @@ func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection m
 		}
 	}
 	if selection.HasCommunityTool(model.CommunityToolCodeGraph) {
-		for _, path := range communitytool.CodeGraphGuidancePaths(homeDir) {
+		for _, path := range communitytool.CodeGraphManagedPaths(homeDir) {
 			paths[path] = struct{}{}
 		}
 	}
@@ -1456,7 +1475,7 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 			}
 			if adapter.Agent() == model.AgentOpenCode {
 				if p := adapter.SettingsPath(targetDir); p != "" {
-					paths = append(paths, p)
+					paths = append(paths, p, opencodedefault.OwnershipPath(p))
 				}
 				paths = append(paths, openCodeSDDPluginPaths(targetDir)...)
 				// Shared prompt files in the selected OpenCode config scope — back these up
@@ -1632,15 +1651,18 @@ func shouldInjectCodeGraphGuidanceForSDD(homeDir string, selected []model.Commun
 			return true
 		}
 	}
-	detector := communitytool.DetectorFunc(cmdLookPath)
-	if communitytool.HasConfiguredCodeGraph(homeDir, detector) {
-		return true
+	return false
+}
+
+func communityToolIDsToStrings(tools []model.CommunityToolID) []string {
+	if tools == nil {
+		return nil
 	}
-	if !communitytool.HasLegacyCodeGraphGuidance(homeDir) {
-		return false
+	result := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		result = append(result, string(tool))
 	}
-	_, err := cmdLookPath("codegraph")
-	return err == nil
+	return result
 }
 
 type openClawWorkspaceConfig struct {

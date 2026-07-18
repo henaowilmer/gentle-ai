@@ -45,13 +45,14 @@ func TestOrchestratorsRequireNonSkippableGeneralDelegationTriggers(t *testing.T)
 
 		lifecycleLine := markdownLineContaining(triggerSection, "**Lifecycle receipt rule**")
 		if !lineContainsAll(
-			"before commit, push, PR, or release",
+			"before commit",
+			"stage every reviewed path",
+			"without changing content or mode",
+			"gentle-ai review validate --gate pre-commit --cwd <repo>",
+			"before push, PR, or release",
 			"content-bound receipt",
-			"review-validate --cwd <repo>",
-			"--lineage <id>",
-			"--gate <gate>",
-			"--bundle <path>",
-			"never hand-author request JSON",
+			"gentle-ai review validate --gate <gate> --cwd <repo>",
+			"facade discover authority and artifacts",
 			"launch a lens",
 			"Judgment Day",
 			"new budget at the gate",
@@ -331,6 +332,31 @@ func TestAllEmbeddedAssetsAreReadable(t *testing.T) {
 				t.Fatalf("Read(%q) content is suspiciously short (%d bytes) — possible stub", path, len(content))
 			}
 		})
+	}
+}
+
+func TestSDDVerifyAuthorityPreflightDenialEnvelopeContract(t *testing.T) {
+	const denialFields = `authority_only_failure: true
+missing_review_authority: true
+substantive_failure: false
+command_failed: false
+observed_authority_revision: sha256:{observed-authority-revision}`
+
+	for _, path := range []string{
+		"skills/sdd-verify/SKILL.md",
+		"skills/sdd-verify/references/report-format.md",
+	} {
+		content := MustRead(path)
+		for _, want := range []string{
+			denialFields,
+			"test_exit_code: 125",
+			"build_exit_code: 125",
+			"must not be executed",
+		} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("%s missing authority-preflight denial contract %q", path, want)
+			}
+		}
 	}
 }
 
@@ -1583,6 +1609,15 @@ func TestSDDOrchestratorsRouteFreshReviewsToConcreteReviewLenses(t *testing.T) {
 					t.Fatalf("%s Review Lens Selection %s: %q", path, check.contract, line)
 				}
 			}
+			for _, want := range []string{
+				"rerun only the originating lens(es) that produced open verified BLOCKER/CRITICAL findings",
+				"never rerun clean lenses or lenses with only WARNING/SUGGESTION findings",
+				"Native ordinary review keeps its targeted validator and never reruns initial lenses",
+			} {
+				if !strings.Contains(content, want) {
+					t.Fatalf("%s missing ad-hoc severe recheck contract %q", path, want)
+				}
+			}
 
 			if problems := boundedReviewRoutingProblems(content); len(problems) > 0 {
 				t.Fatalf("%s bounded review guidance violates receipt or explicit review-start routing: %s", path, strings.Join(problems, "; "))
@@ -1608,15 +1643,17 @@ func boundedReviewRoutingProblems(content string) []string {
 		{
 			label: "Lifecycle receipt rule",
 			matcher: lineContainsAll(
-				"before commit, push, PR, or release",
+				"before commit",
+				"before push, PR, or release",
 				"content-bound receipt",
-				"review-validate --cwd <repo>",
-				"--lineage <id>",
-				"--gate <gate>",
-				"never hand-author request JSON",
+				"gentle-ai review validate --gate pre-commit --cwd <repo>",
+				"gentle-ai review validate --gate <gate> --cwd <repo>",
+				"facade discover authority and artifacts",
 				"never launch a lens",
 				"Judgment Day",
 				"new budget at the gate",
+				"stage every reviewed path",
+				"without changing content or mode",
 			),
 			contract: "must validate the content-bound receipt without launching a lens, Judgment Day, or a new budget",
 		},
