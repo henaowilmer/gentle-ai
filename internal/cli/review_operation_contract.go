@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -28,6 +27,58 @@ const (
 	ReviewIntegrationOperationBindSDD  = "review.bind_sdd"
 )
 
+type reviewIntegrationOperationMetadata struct {
+	Command          string
+	Operation        string
+	Label            string
+	ValueFlags       []string
+	BoolFlags        []string
+	IntFlags         []string
+	MutatesAuthority bool
+	JoinOnTimeout    bool
+	TimeoutRetryable bool
+	ReadOnlyFlag     string
+}
+
+// reviewIntegrationOperationRegistry is the single policy source for
+// negotiated routing, safe flag extraction, aggregate-timeout mutation truth,
+// capability publication, and operation-specific diagnostics.
+var reviewIntegrationOperationRegistry = []reviewIntegrationOperationMetadata{
+	{Command: "bind-sdd", Operation: ReviewIntegrationOperationBindSDD, Label: "Review BIND-SDD", ValueFlags: []string{"cwd", "change", "lineage", "expected-binding-revision"}, MutatesAuthority: true, JoinOnTimeout: true, TimeoutRetryable: true},
+	{Command: "capabilities", Operation: "review.capabilities", Label: "Review CAPABILITIES"},
+	{Command: "finalize", Operation: ReviewIntegrationOperationFinalize, Label: "Review FINALIZE", ValueFlags: []string{"cwd", "lineage", "validation", "refuter", "evidence", "trace", "result"}, BoolFlags: []string{"failed"}, IntFlags: []string{"correction-lines"}, MutatesAuthority: true},
+	{Command: "repair", Operation: "review.repair", Label: "Review REPAIR", ValueFlags: []string{"cwd", "class", "lineage", "expected-revision", "cause", "disposition", "repository-binding", "actor", "reason", "maintainer-authorization"}, BoolFlags: []string{"preflight"}, MutatesAuthority: true, JoinOnTimeout: true, ReadOnlyFlag: "preflight"},
+	{Command: "start", Operation: "review.start", Label: "Review START", ValueFlags: []string{"cwd", "lineage", "policy", "focus", "base-ref", "projection", "trace"}, BoolFlags: []string{"committed-only", "workspace-overlay"}, MutatesAuthority: true},
+	{Command: "status", Operation: "review.status", Label: "Review STATUS", ValueFlags: []string{"cwd", "lineage", "projection", "base-ref", "base-tree", "gate", "recovery-successor-lineage", "recovery-reason", "recovery-actor", "recovery-authorization", "repair-actor", "repair-reason", "repair-authorization"}, BoolFlags: []string{"workspace-overlay", "action-eligibility", "next-transition"}},
+	{Command: "validate", Operation: ReviewIntegrationOperationValidate, Label: "Review VALIDATE", ValueFlags: []string{"cwd", "lineage", "gate", "base-ref", "pre-pr-ci-attestation", "policy", "release-configuration", "release-generated", "release-provenance", "release-publication-boundary", "release-evidence-freshness"}},
+}
+
+func reviewIntegrationOperationByCommand(command string) (reviewIntegrationOperationMetadata, bool) {
+	for _, metadata := range reviewIntegrationOperationRegistry {
+		if metadata.Command == command {
+			return metadata, true
+		}
+	}
+	return reviewIntegrationOperationMetadata{}, false
+}
+
+func reviewIntegrationOperationByName(operation string) (reviewIntegrationOperationMetadata, bool) {
+	for _, metadata := range reviewIntegrationOperationRegistry {
+		if metadata.Operation == operation {
+			return metadata, true
+		}
+	}
+	return reviewIntegrationOperationMetadata{}, false
+}
+
+func reviewIntegrationOperationNames() []string {
+	operations := make([]string, 0, len(reviewIntegrationOperationRegistry))
+	for _, metadata := range reviewIntegrationOperationRegistry {
+		operations = append(operations, metadata.Operation)
+	}
+	return operations
+}
+
 type ReviewMutationOutcome string
 
 const (
@@ -37,21 +88,49 @@ const (
 )
 
 type ReviewIntegrationFailure struct {
-	Schema                 string                          `json:"schema"`
-	Contract               string                          `json:"contract"`
-	Operation              string                          `json:"operation"`
-	Phase                  string                          `json:"phase"`
-	Code                   string                          `json:"code"`
-	Message                string                          `json:"message"`
-	MutationOutcome        ReviewMutationOutcome           `json:"mutation_outcome"`
-	AuthorityApplicability string                          `json:"authority_applicability"`
-	RetrySafe              bool                            `json:"retry_safe"`
-	Replayability          reviewtransaction.Replayability `json:"replayability"`
-	LineageID              string                          `json:"lineage_id,omitempty"`
-	RequestDigest          string                          `json:"request_digest,omitempty"`
-	RequiredInputs         []string                        `json:"required_inputs"`
-	NextAction             string                          `json:"next_action"`
-	Context                *reviewtransaction.GateContext  `json:"context,omitempty"`
+	Schema                 string                           `json:"schema"`
+	Contract               string                           `json:"contract"`
+	Operation              string                           `json:"operation"`
+	Phase                  string                           `json:"phase"`
+	Code                   string                           `json:"code"`
+	Message                string                           `json:"message"`
+	MutationOutcome        ReviewMutationOutcome            `json:"mutation_outcome"`
+	AuthorityApplicability string                           `json:"authority_applicability"`
+	RetrySafe              bool                             `json:"retry_safe"`
+	Replayability          reviewtransaction.Replayability  `json:"replayability"`
+	LineageID              string                           `json:"lineage_id,omitempty"`
+	RequestDigest          string                           `json:"request_digest,omitempty"`
+	ProgressIdentity       string                           `json:"progress_identity,omitempty"`
+	RequiredInputs         []string                         `json:"required_inputs"`
+	NextAction             string                           `json:"next_action"`
+	CauseCategory          string                           `json:"cause_category,omitempty"`
+	Context                *ReviewIntegrationFailureContext `json:"context,omitempty"`
+}
+
+type ReviewIntegrationFailureContext struct {
+	ScopeChange     *ReviewIntegrationScopeChange             `json:"scope_change,omitempty"`
+	BindingRevision *ReviewIntegrationBindingRevisionConflict `json:"binding_revision,omitempty"`
+}
+
+type ReviewIntegrationBindingRevisionConflict struct {
+	Expected string `json:"expected"`
+	Current  string `json:"current"`
+}
+
+type ReviewIntegrationScopeChange struct {
+	Expected               ReviewIntegrationScopeTarget `json:"expected"`
+	Actual                 ReviewIntegrationScopeTarget `json:"actual"`
+	DifferingPathCount     int                          `json:"differing_path_count"`
+	DifferingPathsDigest   string                       `json:"differing_paths_digest"`
+	PredecessorLineageID   string                       `json:"predecessor_lineage_id"`
+	PredecessorRevision    string                       `json:"predecessor_revision"`
+	RecoveryOperation      string                       `json:"recovery_operation"`
+	RecoveryRequiredInputs []string                     `json:"recovery_required_inputs"`
+}
+
+type ReviewIntegrationScopeTarget struct {
+	CandidateTree string `json:"candidate_tree"`
+	PathsDigest   string `json:"paths_digest"`
 }
 
 type ReviewIntegrationFailureError struct {
@@ -85,17 +164,11 @@ func reviewIntegrationFailureRoute(args []string) (string, bool, *ReviewIntegrat
 	if len(args) == 0 {
 		return "", false, nil
 	}
-	operation := map[string]string{
-		"capabilities": "review.capabilities",
-		"start":        "review.start",
-		"status":       "review.status",
-		"finalize":     "review.finalize",
-		"validate":     "review.validate",
-		"bind-sdd":     "review.bind_sdd",
-	}[args[0]]
-	if operation == "" {
+	metadata, known := reviewIntegrationOperationByCommand(args[0])
+	if !known {
 		return "", false, nil
 	}
+	operation := metadata.Operation
 	provided, contract, missing := reviewIntegrationContractArgument(args[1:])
 	if args[0] != "capabilities" && !provided {
 		return operation, false, nil
@@ -159,9 +232,51 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		Replayability: reviewtransaction.ReplayabilityStatusRequired, RequiredInputs: []string{}, NextAction: "review.status",
 	}
 	failure.LineageID = safeReviewIntegrationLineage(operation, args)
+	var bindingConflict *sddstatus.BindingRevisionConflictError
+	if errors.As(runErr, &bindingConflict) {
+		failure.Phase = "pre_native"
+		failure.Code = "binding_revision_conflict"
+		failure.Message = "The expected SDD review binding revision does not match the current native binding."
+		failure.MutationOutcome = ReviewMutationNotStarted
+		failure.AuthorityApplicability = "current_target"
+		failure.RetrySafe = true
+		failure.Replayability = reviewtransaction.ReplayabilityNotReplayable
+		failure.RequiredInputs = []string{"change", "lineage_id", "expected_binding_revision"}
+		failure.NextAction = ReviewIntegrationOperationBindSDD
+		failure.Context = &ReviewIntegrationFailureContext{BindingRevision: &ReviewIntegrationBindingRevisionConflict{
+			Expected: bindingConflict.Expected, Current: bindingConflict.Current,
+		}}
+		return failure
+	}
+	var replayMismatch *reviewtransaction.FinalizeAttemptReplayMismatchError
+	if errors.As(runErr, &replayMismatch) {
+		failure.Phase = "reconciliation"
+		failure.Code = "finalize_request_mismatch"
+		failure.Message = "The FINALIZE request differs from the durable incomplete attempt."
+		failure.MutationOutcome = ReviewMutationUnknown
+		failure.AuthorityApplicability = "current_target"
+		failure.RetrySafe = false
+		failure.Replayability = reviewtransaction.ReplayabilityStatusRequired
+		failure.LineageID = replayMismatch.LineageID
+		failure.RequiredInputs = []string{"lineage_id"}
+		failure.NextAction = "review.status"
+		return failure
+	}
 	var publication *ReviewFacadeReceiptPublicationError
 	if errors.As(runErr, &publication) {
 		failure.Phase = "native_committed"
+		if publication.Replayability == string(reviewtransaction.ReplayabilityManualActionRequired) {
+			failure.Code = "receipt_publication_conflict"
+			failure.Message = "Receipt publication conflicts with an existing immutable artifact."
+			failure.MutationOutcome = ReviewMutationCommitted
+			failure.AuthorityApplicability = "current_target"
+			failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
+			failure.LineageID = publication.LineageID
+			failure.RequestDigest = publication.RequestDigest
+			failure.RequiredInputs = []string{}
+			failure.NextAction = "explicit-maintainer-action"
+			return failure
+		}
 		failure.Code = "receipt_publication_pending"
 		failure.Message = "Receipt publication did not complete after terminal authority was committed."
 		failure.MutationOutcome = ReviewMutationCommitted
@@ -171,6 +286,45 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		failure.RequestDigest = publication.RequestDigest
 		failure.RequiredInputs = []string{"lineage_id"}
 		failure.NextAction = "review.finalize"
+		return failure
+	}
+	var bindingPublication *sddstatus.ReviewBindingPublicationError
+	if errors.As(runErr, &bindingPublication) {
+		failure.Phase = "native_committed"
+		failure.Code = "binding_publication_pending"
+		failure.Message = "SDD review binding publication requires an exact replay to confirm directory durability."
+		failure.MutationOutcome = ReviewMutationCommitted
+		failure.AuthorityApplicability = "current_target"
+		failure.RetrySafe = true
+		failure.Replayability = reviewtransaction.ReplayabilityExactReplaySafe
+		failure.RequestDigest = facadeValueHash("bind-sdd-request", args)
+		failure.RequiredInputs = []string{"change", "lineage_id", "expected_binding_revision"}
+		failure.NextAction = ReviewIntegrationOperationBindSDD
+		return failure
+	}
+	var startContext *reviewStartContextError
+	if errors.As(runErr, &startContext) {
+		failure.Code = "candidate_context_unavailable"
+		failure.LineageID = startContext.LineageID
+		failure.RequiredInputs = []string{}
+		if !startContext.AuthoritySelected {
+			failure.Phase = "pre_native"
+			failure.Message = "Frozen candidate context could not be rendered before START authority creation."
+			failure.MutationOutcome = ReviewMutationNotStarted
+			failure.AuthorityApplicability = "not_evaluated"
+			failure.RetrySafe = false
+			failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
+			failure.NextAction = "stop"
+			return failure
+		}
+		failure.Phase = "native_committed"
+		failure.Message = "Frozen candidate context could not be rendered for the selected durable START authority."
+		failure.MutationOutcome = ReviewMutationUnknown
+		failure.AuthorityApplicability = "current_target"
+		failure.RetrySafe = false
+		failure.Replayability = reviewtransaction.ReplayabilityStatusRequired
+		failure.RequiredInputs = []string{"lineage_id"}
+		failure.NextAction = "review.status"
 		return failure
 	}
 	var progress *reviewFacadeOperationProgressError
@@ -185,6 +339,7 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		failure.NextAction = "review.status"
 		var progressedGitTimeout *reviewtransaction.GitCommandTimeoutError
 		var progressedGitFailure *reviewtransaction.GitCommandError
+		var progressedGitControl *reviewtransaction.GitProcessControlError
 		switch {
 		case errors.As(runErr, &progressedGitTimeout):
 			failure.Code = "git_command_timeout"
@@ -192,16 +347,52 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		case errors.As(runErr, &progressedGitFailure):
 			failure.Code = "git_command_failed"
 			failure.Message = "A Git subprocess failed after review authority committed a native transition."
+		case errors.As(runErr, &progressedGitControl):
+			failure.Code = "git_command_failed"
+			failure.Message = "A Git subprocess could not be started or controlled after review authority committed a native transition: " + progressedGitControl.Error()
 		case errors.Is(runErr, context.DeadlineExceeded):
 			failure.Code = "operation_timeout"
 			failure.Message = "The negotiated review operation timed out after review authority committed a native transition."
 		}
 		return failure
 	}
+	var repairProgress *reviewtransaction.ClassifiedAuthorityRepairProgressError
+	if errors.As(runErr, &repairProgress) {
+		progress := repairProgress.Progress
+		failure.LineageID = progress.LineageID
+		failure.RequestDigest = progress.RequestDigest
+		failure.ProgressIdentity = progress.RecordIdentity
+		failure.AuthorityApplicability = "not_evaluated"
+		failure.RetrySafe = false
+		failure.RequiredInputs = []string{"lineage_id"}
+		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runErr, context.Canceled) {
+			failure.Code = "operation_timeout"
+			failure.Message = "The negotiated review repair timed out after durable native repair progress."
+		} else {
+			failure.Code = "repair_progress_pending"
+			failure.Message = "The negotiated review repair stopped after durable native repair progress."
+		}
+		if progress.Status == reviewtransaction.CompactReclaimCommitted {
+			failure.Phase = "native_committed"
+			failure.MutationOutcome = ReviewMutationCommitted
+		} else {
+			failure.Phase = "native_running"
+			failure.MutationOutcome = ReviewMutationUnknown
+		}
+		if repairProgress.ExactReplaySafe {
+			failure.RetrySafe = true
+			failure.Replayability = reviewtransaction.ReplayabilityExactReplaySafe
+			failure.NextAction = "review.repair"
+		} else {
+			failure.Replayability = reviewtransaction.ReplayabilityStatusRequired
+			failure.NextAction = "review.status"
+		}
+		return failure
+	}
 	var gitTimeout *reviewtransaction.GitCommandTimeoutError
 	if errors.As(runErr, &gitTimeout) {
 		if gitTimeout.Aggregate {
-			return reviewOperationTimeoutFailure(failure, operation)
+			return reviewOperationTimeoutFailure(failure, operation, args)
 		}
 		failure.Phase = "pre_native"
 		failure.Code = "git_command_timeout"
@@ -225,8 +416,20 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		failure.NextAction = "stop"
 		return failure
 	}
+	var gitControl *reviewtransaction.GitProcessControlError
+	if errors.As(runErr, &gitControl) {
+		failure.Phase = "pre_native"
+		failure.Code = "git_command_failed"
+		failure.Message = "A Git subprocess could not be started or controlled before review authority mutation: " + gitControl.Error()
+		failure.MutationOutcome = ReviewMutationNotStarted
+		failure.AuthorityApplicability = "not_evaluated"
+		failure.RetrySafe = false
+		failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
+		failure.NextAction = "stop"
+		return failure
+	}
 	if errors.Is(runErr, context.DeadlineExceeded) {
-		return reviewOperationTimeoutFailure(failure, operation)
+		return reviewOperationTimeoutFailure(failure, operation, args)
 	}
 	var preflight *reviewIntegrationPreflightError
 	if errors.As(runErr, &preflight) {
@@ -247,18 +450,22 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 	var lockTimeout *reviewtransaction.AuthorityLockTimeoutError
 	var lockCancelled *reviewtransaction.AuthorityLockCancelledError
 	if errors.As(runErr, &lockTimeout) || errors.As(runErr, &lockCancelled) {
+		label := reviewLockOperationLabel(operation)
 		failure.Phase = "pre_native"
 		failure.Code = "authority_lock_timeout"
-		failure.Message = "Review START could not acquire the authority lock within the bounded wait."
+		failure.Message = label + " could not acquire the authority lock within the bounded wait."
 		if lockCancelled != nil {
 			failure.Code = "authority_lock_cancelled"
-			failure.Message = "Review START authority lock acquisition was cancelled."
+			failure.Message = label + " authority lock acquisition was cancelled."
 		}
 		failure.MutationOutcome = ReviewMutationNotStarted
 		failure.AuthorityApplicability = "not_evaluated"
-		failure.RetrySafe = false
+		failure.RetrySafe = lockTimeout != nil
 		failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
-		failure.NextAction = "stop"
+		failure.NextAction = "retry_with_bounded_backoff"
+		if lockCancelled != nil {
+			failure.NextAction = "stop"
+		}
 		return failure
 	}
 	var denied ReviewGateDeniedError
@@ -272,8 +479,7 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
 		failure.NextAction = reviewGateAction(denied.Result)
 		if denied.Context.Gate != "" && denied.Context.ScopeChange != nil {
-			contextCopy := denied.Context
-			failure.Context = &contextCopy
+			failure.Context = publicReviewScopeChangeContext(denied.Context.ScopeChange)
 		}
 		if denied.Result == reviewtransaction.GateScopeChanged && denied.Context.ScopeChange != nil {
 			failure.RetrySafe = false
@@ -299,11 +505,10 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 			failure.AuthorityApplicability = "not_evaluated"
 		case ReviewReceiptScopeChanged:
 			if discovery.Context != nil {
-				contextCopy := *discovery.Context
-				failure.Context = &contextCopy
+				failure.Context = publicReviewScopeChangeContext(discovery.Context.ScopeChange)
 				failure.AuthorityApplicability = "current_target"
-				if contextCopy.ScopeChange != nil {
-					failure.RequiredInputs = append([]string{}, contextCopy.ScopeChange.RecoveryRequiredInputs...)
+				if failure.Context != nil && failure.Context.ScopeChange != nil {
+					failure.RequiredInputs = append([]string{}, failure.Context.ScopeChange.RecoveryRequiredInputs...)
 				}
 			}
 			failure.NextAction = "explicit-maintainer-action"
@@ -313,6 +518,7 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 			failure.NextAction = "review.status"
 		case ReviewAuthorityCorrupted:
 			failure.AuthorityApplicability = "corrupted"
+			failure.CauseCategory = discovery.Category
 		}
 		return failure
 	}
@@ -328,10 +534,31 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 	return failure
 }
 
-func reviewOperationTimeoutFailure(failure ReviewIntegrationFailure, operation string) ReviewIntegrationFailure {
+func reviewLockOperationLabel(operation string) string {
+	if metadata, ok := reviewIntegrationOperationByName(operation); ok {
+		return metadata.Label
+	}
+	return "Review operation"
+}
+
+func publicReviewScopeChangeContext(scope *reviewtransaction.GateScopeChangeDiagnostics) *ReviewIntegrationFailureContext {
+	if scope == nil {
+		return nil
+	}
+	return &ReviewIntegrationFailureContext{ScopeChange: &ReviewIntegrationScopeChange{
+		Expected:           ReviewIntegrationScopeTarget{CandidateTree: scope.Expected.CandidateTree, PathsDigest: scope.Expected.PathsDigest},
+		Actual:             ReviewIntegrationScopeTarget{CandidateTree: scope.Actual.CandidateTree, PathsDigest: scope.Actual.PathsDigest},
+		DifferingPathCount: scope.DifferingPathCount, DifferingPathsDigest: scope.DifferingPathsDigest,
+		PredecessorLineageID: scope.PredecessorLineageID, PredecessorRevision: scope.PredecessorRevision,
+		RecoveryOperation: scope.RecoveryOperation, RecoveryRequiredInputs: append([]string{}, scope.RecoveryRequiredInputs...),
+	}}
+}
+
+func reviewOperationTimeoutFailure(failure ReviewIntegrationFailure, operation string, args []string) ReviewIntegrationFailure {
 	failure.Code = "operation_timeout"
 	failure.Message = "The negotiated review operation exceeded its aggregate time budget."
-	if operation == ReviewIntegrationOperationBindSDD {
+	metadata, known := reviewIntegrationOperationByName(operation)
+	if known && metadata.TimeoutRetryable {
 		failure.Phase = "pre_native"
 		failure.MutationOutcome = ReviewMutationNotStarted
 		failure.AuthorityApplicability = "not_evaluated"
@@ -341,7 +568,7 @@ func reviewOperationTimeoutFailure(failure ReviewIntegrationFailure, operation s
 		return failure
 	}
 	failure.RetrySafe = false
-	if operation == "review.start" || operation == ReviewIntegrationOperationFinalize {
+	if known && reviewIntegrationOperationMutates(metadata, args) {
 		failure.Phase = "native_running"
 		failure.MutationOutcome = ReviewMutationUnknown
 		failure.AuthorityApplicability = "not_evaluated"
@@ -366,8 +593,21 @@ const (
 )
 
 func safeReviewIntegrationLineage(operation string, args []string) string {
+	values, valid := safeReviewIntegrationArguments(operation, args)
+	if !valid {
+		return ""
+	}
+	value := values["lineage"]
+	if !validReviewIntegrationLineage(value) {
+		return ""
+	}
+	return value
+}
+
+func safeReviewIntegrationArguments(operation string, args []string) (map[string]string, bool) {
 	shape := reviewIntegrationOperationFlagShape(operation)
-	value := ""
+	values := map[string]string{}
+	valid := true
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if arg == "--" {
@@ -384,19 +624,25 @@ func safeReviewIntegrationLineage(operation string, args []string) string {
 		}
 		kind, known := shape[name]
 		if !known {
+			valid = false
 			break
 		}
 		switch kind {
 		case reviewIntegrationBoolFlag:
 			if hasValue {
 				if _, err := strconv.ParseBool(flagValue); err != nil {
+					valid = false
 					index = len(args)
 				}
+			} else {
+				flagValue = "true"
 			}
+			values[name] = flagValue
 			continue
 		case reviewIntegrationValueFlag, reviewIntegrationIntFlag:
 			if !hasValue {
 				if index+1 >= len(args) {
+					valid = false
 					index = len(args)
 					continue
 				}
@@ -405,42 +651,21 @@ func safeReviewIntegrationLineage(operation string, args []string) string {
 			}
 			if kind == reviewIntegrationIntFlag {
 				if _, err := strconv.Atoi(flagValue); err != nil {
+					valid = false
 					index = len(args)
 				}
-				continue
 			}
 		}
-		if name == "lineage" {
-			value = flagValue
-		}
+		values[name] = flagValue
 	}
-	if !validReviewIntegrationLineage(value) {
-		return ""
-	}
-	return value
+	return values, valid
 }
 
 func reviewIntegrationOperationFlagShape(operation string) map[string]reviewIntegrationFlagKind {
-	valueFlags := []string{"contract"}
-	boolFlags := []string{}
-	intFlags := []string{}
-	switch operation {
-	case "review.capabilities":
-	case "review.start":
-		valueFlags = append(valueFlags, "cwd", "lineage", "policy", "focus", "base-ref", "projection", "trace")
-		boolFlags = append(boolFlags, "committed-only")
-	case "review.status":
-		valueFlags = append(valueFlags, "cwd", "lineage", "projection", "base-ref")
-	case ReviewIntegrationOperationFinalize:
-		valueFlags = append(valueFlags, "cwd", "lineage", "validation", "refuter", "evidence", "trace", "result")
-		boolFlags = append(boolFlags, "failed")
-		intFlags = append(intFlags, "correction-lines")
-	case ReviewIntegrationOperationValidate:
-		valueFlags = append(valueFlags, "cwd", "lineage", "gate", "base-ref", "pre-pr-ci-attestation", "policy",
-			"release-configuration", "release-generated", "release-provenance", "release-publication-boundary", "release-evidence-freshness")
-	case ReviewIntegrationOperationBindSDD:
-		valueFlags = append(valueFlags, "cwd", "change", "lineage", "expected-binding-revision")
-	}
+	metadata, _ := reviewIntegrationOperationByName(operation)
+	valueFlags := append([]string{"contract"}, metadata.ValueFlags...)
+	boolFlags := append([]string{}, metadata.BoolFlags...)
+	intFlags := append([]string{}, metadata.IntFlags...)
 	shape := make(map[string]reviewIntegrationFlagKind, len(valueFlags)+len(boolFlags)+len(intFlags)+2)
 	for _, name := range valueFlags {
 		shape[name] = reviewIntegrationValueFlag
@@ -454,6 +679,21 @@ func reviewIntegrationOperationFlagShape(operation string) map[string]reviewInte
 	shape["h"] = reviewIntegrationBoolFlag
 	shape["help"] = reviewIntegrationBoolFlag
 	return shape
+}
+
+func reviewIntegrationOperationMutates(metadata reviewIntegrationOperationMetadata, args []string) bool {
+	if !metadata.MutatesAuthority {
+		return false
+	}
+	if metadata.ReadOnlyFlag == "" {
+		return true
+	}
+	values, valid := safeReviewIntegrationArguments(metadata.Operation, args)
+	if !valid {
+		return true
+	}
+	readOnly, err := strconv.ParseBool(values[metadata.ReadOnlyFlag])
+	return err != nil || !readOnly
 }
 
 func reviewNamedArgument(args []string, name string) (provided bool, value string, missing bool) {
@@ -533,39 +773,80 @@ func (failure ReviewIntegrationFailure) Validate() error {
 		}
 	}
 	if failure.Context != nil {
-		if failure.Operation != ReviewIntegrationOperationValidate || failure.Context.Gate == "" {
-			return errors.New("negotiated review failure context is not a gate denial")
+		if (failure.Context.ScopeChange == nil) == (failure.Context.BindingRevision == nil) {
+			return errors.New("negotiated review failure context must select exactly one diagnostic")
 		}
-		if failure.Context.ScopeChange != nil {
-			scope := failure.Context.ScopeChange
-			if failure.Code != "gate_scope_changed" && failure.Code != "receipt_scope_changed" || failure.Context.Denial == nil || scope.DifferingPaths == nil ||
-				scope.Expected.Paths == nil || scope.Actual.Paths == nil || scope.DifferingPathCount != len(scope.DifferingPaths) ||
-				!sort.StringsAreSorted(scope.DifferingPaths) || !validReviewCapabilitySHA256(scope.DifferingPathsDigest) ||
+		if scope := failure.Context.ScopeChange; scope != nil {
+			if failure.Operation != ReviewIntegrationOperationValidate {
+				return errors.New("negotiated review scope context is not a gate denial")
+			}
+			if failure.Code != "gate_scope_changed" && failure.Code != "receipt_scope_changed" || scope.DifferingPathCount < 0 || scope.DifferingPathCount > 1000000 ||
+				!validReviewGitTree(scope.Expected.CandidateTree) || !validReviewCapabilitySHA256(scope.Expected.PathsDigest) ||
+				!validReviewGitTree(scope.Actual.CandidateTree) || !validReviewCapabilitySHA256(scope.Actual.PathsDigest) || !validReviewCapabilitySHA256(scope.DifferingPathsDigest) ||
 				!validReviewIntegrationLineage(scope.PredecessorLineageID) || !validReviewCapabilitySHA256(scope.PredecessorRevision) ||
-				scope.RecoveryOperation != "review.recover" || !reflect.DeepEqual(failure.RequiredInputs, scope.RecoveryRequiredInputs) {
+				scope.RecoveryOperation != "review.recover" || !reflect.DeepEqual(failure.RequiredInputs, scope.RecoveryRequiredInputs) ||
+				!reflect.DeepEqual(scope.RecoveryRequiredInputs, []string{"predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor"}) {
 				return errors.New("negotiated review scope-change diagnostics are incomplete")
+			}
+		}
+		if conflict := failure.Context.BindingRevision; conflict != nil {
+			if failure.Operation != ReviewIntegrationOperationBindSDD || failure.Code != "binding_revision_conflict" ||
+				!validOptionalReviewSHA256(conflict.Expected) || !validOptionalReviewSHA256(conflict.Current) ||
+				!reflect.DeepEqual(failure.RequiredInputs, []string{"change", "lineage_id", "expected_binding_revision"}) ||
+				failure.NextAction != ReviewIntegrationOperationBindSDD {
+				return errors.New("negotiated review binding-revision diagnostics are incomplete")
 			}
 		}
 	}
 	if failure.LineageID != "" && !validReviewIntegrationLineage(failure.LineageID) ||
 		failure.RequestDigest != "" && !validReviewCapabilitySHA256(failure.RequestDigest) ||
-		failure.RequestDigest != "" && failure.LineageID == "" {
+		failure.RequestDigest != "" && failure.LineageID == "" ||
+		failure.ProgressIdentity != "" && (!validReviewCapabilitySHA256(failure.ProgressIdentity) || failure.RequestDigest == "" || failure.Operation != "review.repair") ||
+		failure.Operation == "review.repair" && failure.RequestDigest != "" && failure.ProgressIdentity == "" {
 		return errors.New("invalid negotiated review failure replay identity")
 	}
-	if failure.MutationOutcome == ReviewMutationUnknown && (failure.RetrySafe || failure.Replayability != reviewtransaction.ReplayabilityStatusRequired || failure.NextAction != "review.status") {
-		return errors.New("unknown negotiated review mutation must require status")
+	if failure.MutationOutcome == ReviewMutationUnknown {
+		exactRepairReplay := failure.Operation == "review.repair" && failure.RetrySafe &&
+			failure.Replayability == reviewtransaction.ReplayabilityExactReplaySafe && failure.NextAction == "review.repair" &&
+			failure.RequestDigest != "" && failure.ProgressIdentity != ""
+		if !exactRepairReplay && (failure.RetrySafe || failure.Replayability != reviewtransaction.ReplayabilityStatusRequired || failure.NextAction != "review.status") {
+			return errors.New("unknown negotiated review mutation must require status or one bound repair replay")
+		}
 	}
-	if failure.Replayability == reviewtransaction.ReplayabilityExactReplaySafe &&
-		(failure.MutationOutcome != ReviewMutationCommitted || failure.LineageID == "" || failure.RequestDigest == "" ||
-			len(failure.RequiredInputs) != 1 || failure.RequiredInputs[0] != "lineage_id" || failure.NextAction != "review.finalize") {
-		return errors.New("exact negotiated review replay is incomplete")
+	if failure.Replayability == reviewtransaction.ReplayabilityExactReplaySafe {
+		mutationAllowsExactReplay := failure.MutationOutcome == ReviewMutationCommitted ||
+			failure.Operation == "review.repair" && failure.MutationOutcome == ReviewMutationUnknown
+		if !mutationAllowsExactReplay || failure.LineageID == "" || failure.RequestDigest == "" {
+			return errors.New("exact negotiated review replay is incomplete")
+		}
+		switch failure.Operation {
+		case ReviewIntegrationOperationFinalize:
+			if !reflect.DeepEqual(failure.RequiredInputs, []string{"lineage_id"}) || failure.NextAction != ReviewIntegrationOperationFinalize {
+				return errors.New("exact negotiated review replay is incomplete")
+			}
+		case ReviewIntegrationOperationBindSDD:
+			if !reflect.DeepEqual(failure.RequiredInputs, []string{"change", "lineage_id", "expected_binding_revision"}) || failure.NextAction != ReviewIntegrationOperationBindSDD {
+				return errors.New("exact negotiated review replay is incomplete")
+			}
+		case "review.repair":
+			if !reflect.DeepEqual(failure.RequiredInputs, []string{"lineage_id"}) || failure.NextAction != "review.repair" ||
+				failure.ProgressIdentity == "" {
+				return errors.New("exact negotiated review repair replay is incomplete")
+			}
+		default:
+			return errors.New("exact negotiated review replay operation is unsupported")
+		}
 	}
 	return nil
 }
 
+func validOptionalReviewSHA256(value string) bool {
+	return value == "" || validReviewCapabilitySHA256(value)
+}
+
 func supportedReviewIntegrationFailureInput(input string) bool {
 	switch input {
-	case "lineage_id", "predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor":
+	case "lineage_id", "change", "expected_binding_revision", "predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor":
 		return true
 	default:
 		return false
@@ -573,12 +854,8 @@ func supportedReviewIntegrationFailureInput(input string) bool {
 }
 
 func validReviewIntegrationFailureOperation(operation string) bool {
-	switch operation {
-	case "review.capabilities", "review.start", "review.status", "review.finalize", "review.validate", "review.bind_sdd":
-		return true
-	default:
-		return false
-	}
+	_, valid := reviewIntegrationOperationByName(operation)
+	return valid
 }
 
 func validReviewIntegrationFailureCode(code string) bool {
@@ -610,11 +887,14 @@ type ReviewIntegrationOperationResult struct {
 // ReviewIntegrationFinalizeResult preserves the existing finalize semantics
 // while excluding the provider-private receipt path from negotiated output.
 type ReviewIntegrationFinalizeResult struct {
-	Operation     string                  `json:"operation"`
-	LineageID     string                  `json:"lineage_id"`
-	State         reviewtransaction.State `json:"state"`
-	Action        string                  `json:"action"`
-	StoreRevision string                  `json:"store_revision"`
+	Operation         string                                       `json:"operation"`
+	LineageID         string                                       `json:"lineage_id"`
+	State             reviewtransaction.State                      `json:"state"`
+	Action            string                                       `json:"action"`
+	StoreRevision     string                                       `json:"store_revision"`
+	Eligibility       *ReviewActionEligibility                     `json:"eligibility,omitempty"`
+	NextTransition    *ReviewNextTransition                        `json:"next_transition,omitempty"`
+	ValidationRequest *reviewtransaction.TargetedValidationRequest `json:"validation_request,omitempty"`
 }
 
 func reviewIntegrationNegotiation(flags *flag.FlagSet, contract string) (bool, error) {
@@ -676,6 +956,29 @@ func (result ReviewIntegrationOperationResult) Validate() error {
 		if finalized.Operation != "review/finalize" || strings.TrimSpace(finalized.LineageID) == "" ||
 			strings.TrimSpace(finalized.Action) == "" || !validReviewCapabilitySHA256(finalized.StoreRevision) || strings.TrimSpace(string(finalized.State)) == "" {
 			return errors.New("negotiated finalize result is incomplete")
+		}
+		if finalized.Eligibility != nil {
+			if err := finalized.Eligibility.ValidateFinalize(); err != nil {
+				return fmt.Errorf("negotiated finalize result action eligibility: %w", err)
+			}
+		}
+		if finalized.NextTransition != nil {
+			if err := finalized.NextTransition.Validate(); err != nil {
+				return fmt.Errorf("negotiated finalize result next transition: %w", err)
+			}
+			transitionRequest := reviewTransitionValidationRequest(finalized.NextTransition)
+			if (transitionRequest == nil) != (finalized.ValidationRequest == nil) ||
+				transitionRequest != nil && !reflect.DeepEqual(*transitionRequest, *finalized.ValidationRequest) {
+				return errors.New("negotiated finalize validation request copies differ")
+			}
+		}
+		if finalized.ValidationRequest != nil {
+			if finalized.State != reviewtransaction.StateCorrectionRequired ||
+				finalized.ValidationRequest.LineageID != finalized.LineageID ||
+				finalized.ValidationRequest.ExpectedRevision != finalized.StoreRevision ||
+				reviewtransaction.ValidateTargetedValidationRequest(*finalized.ValidationRequest) != nil {
+				return errors.New("negotiated finalize result validation request is invalid")
+			}
 		}
 	case ReviewIntegrationOperationValidate:
 		var validated ReviewValidateResult

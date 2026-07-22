@@ -380,9 +380,9 @@ func TestDetectNpmWritableTermuxAlwaysTrue(t *testing.T) {
 // used by effectiveMethod to implement the brew → go-install → binary auto-detect order.
 func TestGoAvailableInPlatformProfile(t *testing.T) {
 	tests := []struct {
-		name         string
-		tools        map[string]ToolStatus
-		wantGoAvail  bool
+		name        string
+		tools       map[string]ToolStatus
+		wantGoAvail bool
 	}{
 		{
 			name:        "go in tools and installed → GoAvailable true",

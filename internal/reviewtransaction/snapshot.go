@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,10 +23,11 @@ type TargetKind string
 type Projection string
 
 const (
-	TargetCurrentChanges TargetKind = "current-changes"
-	TargetBaseDiff       TargetKind = "base-diff"
-	TargetExactRevision  TargetKind = "commit-range"
-	TargetFixDiff        TargetKind = "fix-diff"
+	TargetCurrentChanges       TargetKind = "current-changes"
+	TargetBaseDiff             TargetKind = "base-diff"
+	TargetBaseWorkspaceOverlay TargetKind = "base-workspace-overlay"
+	TargetExactRevision        TargetKind = "commit-range"
+	TargetFixDiff              TargetKind = "fix-diff"
 
 	ProjectionWorkspace Projection = "workspace"
 	ProjectionStaged    Projection = "staged"
@@ -43,6 +45,7 @@ type Target struct {
 type Snapshot struct {
 	Kind                   TargetKind `json:"kind"`
 	Projection             Projection `json:"projection,omitempty"`
+	UnbornHead             bool       `json:"unborn_head,omitempty"`
 	BaseTree               string     `json:"base_tree"`
 	CandidateTree          string     `json:"candidate_tree"`
 	PathsDigest            string     `json:"paths_digest"`
@@ -54,7 +57,8 @@ type Snapshot struct {
 }
 
 type SnapshotBuilder struct {
-	Repo string
+	Repo       string
+	unbornHead bool
 }
 
 var exactObjectPattern = regexp.MustCompile(`^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$`)
@@ -74,7 +78,8 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 	if err != nil {
 		return Snapshot{}, err
 	}
-	if projection == ProjectionStaged && target.Kind != TargetCurrentChanges && target.Kind != TargetBaseDiff && target.Kind != TargetFixDiff {
+	if projection == ProjectionStaged && target.Kind != TargetCurrentChanges && target.Kind != TargetBaseDiff && target.Kind != TargetFixDiff &&
+		(target.Kind != TargetBaseWorkspaceOverlay || !allowStagedIntended) {
 		return Snapshot{}, errors.New("staged projection is only supported for current-changes, base-diff, and fix-diff targets")
 	}
 
@@ -121,6 +126,20 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 		} else if err == nil {
 			candidateTree, untrackedProof, err = builder.buildHeadWithIntended(ctx, intended)
 		}
+	case TargetBaseWorkspaceOverlay:
+		if strings.TrimSpace(target.BaseRef) == "" || strings.Contains(target.BaseRef, "..") {
+			return Snapshot{}, errors.New("base-workspace-overlay requires one base_ref revision")
+		}
+		if projection == ProjectionStaged && !allowStagedIntended || target.IntendedUntracked == nil {
+			return Snapshot{}, errors.New("base-workspace-overlay requires workspace projection and explicit intended_untracked")
+		}
+		intended, err = canonicalPaths(target.IntendedUntracked)
+		if err == nil {
+			baseTree, err = builder.resolveTree(ctx, target.BaseRef)
+		}
+		if err == nil {
+			_, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, allowStagedIntended, projection)
+		}
 	case TargetExactRevision:
 		baseTree, candidateTree, err = builder.resolveExactRevision(ctx, target.Revision)
 		untrackedProof = hashCanonical("gentle-ai.intended-untracked/v1")
@@ -157,6 +176,7 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 	identity := snapshotIdentityForProjection(target.Kind, projection, baseTree, candidateTree, pathsDigest, untrackedProof, intended, ledgerIDs)
 	return Snapshot{
 		Kind: target.Kind, Projection: projection, BaseTree: baseTree, CandidateTree: candidateTree,
+		UnbornHead:  builder.unbornHead,
 		PathsDigest: pathsDigest, IntendedUntracked: intended,
 		IntendedUntrackedProof: untrackedProof, LedgerIDs: ledgerIDs,
 		Paths: paths, Identity: identity,
@@ -299,7 +319,7 @@ func rebuildCurrentSnapshotEvidence(ctx context.Context, repo string, snapshot S
 	}
 	switch snapshot.Kind {
 	case TargetCurrentChanges:
-	case TargetBaseDiff:
+	case TargetBaseDiff, TargetBaseWorkspaceOverlay:
 		target.BaseRef = snapshot.BaseTree
 	default:
 		return errors.New("invalidation supports only live current-changes or base-diff snapshots")
@@ -321,7 +341,12 @@ func (builder SnapshotBuilder) DiffStats(ctx context.Context, snapshot Snapshot)
 	if err != nil {
 		return nil, err
 	}
-	output, err := runGit(ctx, repo, nil, nil, "diff", "--numstat", "-z", "--no-renames", snapshot.BaseTree, snapshot.CandidateTree, "--")
+	isolation, cleanup, err := isolatedImmutableTreeGit(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	output, err := runGitIsolated(ctx, repo, isolation, nil, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", snapshot.BaseTree, snapshot.CandidateTree, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +381,7 @@ func (builder SnapshotBuilder) DiffStats(ctx context.Context, snapshot Snapshot)
 		}
 		statsByPath[stat.Path] = stat
 	}
-	rawOutput, err := runGit(ctx, repo, nil, nil, "diff", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--no-renames", snapshot.BaseTree, snapshot.CandidateTree, "--")
+	rawOutput, err := runGitIsolated(ctx, repo, isolation, nil, "diff", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", snapshot.BaseTree, snapshot.CandidateTree, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -385,6 +410,7 @@ func (builder SnapshotBuilder) DiffStats(ctx context.Context, snapshot Snapshot)
 }
 
 type rawDiffModes struct {
+	status               CandidatePathStatus
 	oldMode, newMode     string
 	oldObject, newObject string
 }
@@ -417,7 +443,8 @@ func parseRawDiffModes(payload []byte) (map[string]rawDiffModes, error) {
 			return nil, fmt.Errorf("duplicate immutable raw diff path %q", logicalPath)
 		}
 		modes[logicalPath] = rawDiffModes{
-			oldMode: oldMode, newMode: newMode, oldObject: string(fields[2]), newObject: string(fields[3]),
+			status: CandidatePathStatus(fields[4]), oldMode: oldMode, newMode: newMode,
+			oldObject: string(fields[2]), newObject: string(fields[3]),
 		}
 	}
 	return modes, nil
@@ -523,11 +550,36 @@ func canonicalRepositoryPath(path string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
-func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string, allowStagedIntended bool, projection Projection) (string, string, string, error) {
-	baseTree, err := builder.resolveTree(ctx, "HEAD")
+func readSnapshotIndex(path string) ([]byte, time.Time, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	payload, err := io.ReadAll(file)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(payload)) != after.Size() {
+		return nil, time.Time{}, errors.New("real index changed while being copied")
+	}
+	return payload, after.ModTime(), nil
+}
+
+func (builder *SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string, allowStagedIntended bool, projection Projection) (string, string, string, error) {
+	baseTree, unborn, err := builder.resolveCurrentChangesBase(ctx, projection)
 	if err != nil {
 		return "", "", "", err
 	}
+	builder.unbornHead = unborn
 	indexPathOutput, err := runGit(ctx, builder.Repo, nil, nil, "rev-parse", "--git-path", "index")
 	if err != nil {
 		return "", "", "", fmt.Errorf("locate real index: %w", err)
@@ -536,8 +588,9 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 	if !filepath.IsAbs(indexPath) {
 		indexPath = filepath.Join(builder.Repo, indexPath)
 	}
-	indexContent, err := os.ReadFile(indexPath)
-	if err != nil {
+	indexContent, indexModTime, err := readSnapshotIndex(indexPath)
+	missingIndex := errors.Is(err, os.ErrNotExist)
+	if err != nil && !missingIndex {
 		return "", "", "", fmt.Errorf("read real index: %w", err)
 	}
 
@@ -573,13 +626,29 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 	}
 	tempIndex := temp.Name()
 	defer os.Remove(tempIndex)
-	if _, err := temp.Write(indexContent); err != nil {
-		return "", "", "", err
-	}
 	if err := temp.Close(); err != nil {
 		return "", "", "", err
 	}
 	env := []string{"GIT_INDEX_FILE=" + tempIndex}
+	if missingIndex {
+		if err := os.Remove(tempIndex); err != nil {
+			return "", "", "", err
+		}
+		if _, err := runGit(ctx, builder.Repo, env, nil, "read-tree", "--empty"); err != nil {
+			return "", "", "", err
+		}
+	} else {
+		if err := os.WriteFile(tempIndex, indexContent, 0o600); err != nil {
+			return "", "", "", err
+		}
+		// Git's racily-clean check compares cached entry timestamps with the
+		// index timestamp. Preserve the real index timestamp: leaving the copied
+		// index freshly dated can make a rapid same-stat rewrite look safely old
+		// and let `git add -u` reuse stale cached content.
+		if err := os.Chtimes(tempIndex, indexModTime, indexModTime); err != nil {
+			return "", "", "", err
+		}
+	}
 	if projection != ProjectionStaged {
 		if _, err := runGit(ctx, builder.Repo, env, nil, "add", "-u", "--", "."); err != nil {
 			return "", "", "", err
@@ -596,6 +665,9 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		return "", "", "", err
 	}
 	candidateTree := strings.TrimSpace(string(candidateOutput))
+	if unborn && candidateTree == baseTree {
+		return "", "", "", errors.New("unborn repository has no staged changes; stage the review candidate with git add")
+	}
 	if allowStagedIntended && projection != ProjectionStaged {
 		if _, err := runGit(ctx, builder.Repo, nil, nil, "diff", "--cached", "--quiet", candidateTree, "--"); err != nil {
 			return "", "", "", errors.New("staged tree does not exactly match the complete reviewed candidate")
@@ -606,6 +678,43 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		return "", "", "", err
 	}
 	return baseTree, candidateTree, proof, nil
+}
+
+func (builder SnapshotBuilder) resolveCurrentChangesBase(ctx context.Context, projection Projection) (string, bool, error) {
+	baseTree, headErr := builder.resolveTree(ctx, "HEAD")
+	if headErr == nil || projection != ProjectionStaged {
+		return baseTree, false, headErr
+	}
+
+	refOutput, err := runGit(ctx, builder.Repo, nil, nil, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return "", false, headErr
+	}
+	ref := strings.TrimSpace(string(refOutput))
+	if !strings.HasPrefix(ref, "refs/heads/") || strings.TrimPrefix(ref, "refs/heads/") == "" {
+		return "", false, headErr
+	}
+	if _, err := runGit(ctx, builder.Repo, nil, nil, "show-ref", "--verify", "--quiet", "--", ref); err == nil {
+		return "", false, headErr
+	} else {
+		var commandErr *GitCommandError
+		if !errors.As(err, &commandErr) || commandErr.ExitCode != 1 {
+			return "", false, err
+		}
+	}
+	emptyTree, err := builder.emptyTree(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	return emptyTree, true, nil
+}
+
+func (builder SnapshotBuilder) emptyTree(ctx context.Context) (string, error) {
+	output, err := runGit(ctx, builder.Repo, nil, []byte{}, "mktree")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func (builder SnapshotBuilder) resolveExactRevision(ctx context.Context, revision string) (string, string, error) {
@@ -662,7 +771,7 @@ func (builder SnapshotBuilder) resolveTree(ctx context.Context, revision string)
 }
 
 func (builder SnapshotBuilder) changedPaths(ctx context.Context, baseTree, candidateTree string) ([]string, error) {
-	output, err := runGit(ctx, builder.Repo, nil, nil, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", baseTree, candidateTree)
+	output, err := runGit(ctx, builder.Repo, nil, nil, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", "--ignore-submodules=none", baseTree, candidateTree)
 	if err != nil {
 		return nil, err
 	}
@@ -810,7 +919,9 @@ func snapshotIdentity(kind TargetKind, baseTree, candidateTree, pathsDigest, pro
 
 func snapshotIdentityForProjection(kind TargetKind, projection Projection, baseTree, candidateTree, pathsDigest, proof string, intended, ledgerIDs []string) string {
 	hash := sha256.New()
-	if projection == ProjectionStaged {
+	if kind == TargetBaseWorkspaceOverlay {
+		hash.Write([]byte("gentle-ai.review-snapshot/base-workspace-overlay/v1\x00"))
+	} else if projection == ProjectionStaged {
 		hash.Write([]byte("gentle-ai.review-snapshot/v2\x00"))
 	} else {
 		hash.Write([]byte("gentle-ai.review-snapshot/v1\x00"))
@@ -894,12 +1005,60 @@ func (err *GitCommandError) Error() string {
 
 func (err *GitCommandError) Unwrap() error { return err.Cause }
 
+var ErrGitOutputLimit = errors.New("git output exceeded deterministic byte limit")
+
+// GitOutputLimitError reports that a bounded Git capture produced more bytes
+// than the caller permits. The capture retains at most Limit bytes while the
+// child is drained, so oversized output cannot grow process memory without
+// bound.
+type GitOutputLimitError struct {
+	Args  []string
+	Limit int
+}
+
+func (err *GitOutputLimitError) Error() string {
+	return fmt.Sprintf("git %s output exceeds deterministic %d-byte limit", strings.Join(err.Args, " "), err.Limit)
+}
+
+func (err *GitOutputLimitError) Unwrap() error { return ErrGitOutputLimit }
+
+// GitProcessControlError reports that a git subprocess could not be started or
+// its process tree could not be brought under control before it produced any
+// result, e.g. Windows job-object or NtResumeProcess failures. It carries the
+// underlying cause so failure envelopes stay diagnosable.
+type GitProcessControlError struct {
+	Args  []string
+	Cause error
+}
+
+func (err *GitProcessControlError) Error() string {
+	return fmt.Sprintf("git %s subprocess start or process-tree control failed: %v", strings.Join(err.Args, " "), err.Cause)
+}
+
+func (err *GitProcessControlError) Unwrap() error { return err.Cause }
+
 var localGitCommandTimeout = 15 * time.Second
 var remoteGitCommandTimeout = 20 * time.Second
 var gitCommandWaitDelay = time.Second
 var gitCommandContext = exec.CommandContext
+var gitProcessTreeStarter = startGitProcessTree
 
 func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, args ...string) ([]byte, error) {
+	return runGitCaptured(ctx, repo, extraEnv, stdin, 0, false, args...)
+}
+
+func runGitIsolated(ctx context.Context, repo string, extraEnv []string, stdin []byte, args ...string) ([]byte, error) {
+	return runGitCaptured(ctx, repo, extraEnv, stdin, 0, true, args...)
+}
+
+func runGitLimited(ctx context.Context, repo string, extraEnv []string, stdin []byte, outputLimit int, args ...string) ([]byte, error) {
+	if outputLimit <= 0 {
+		return nil, &GitOutputLimitError{Args: append([]string{}, args...), Limit: outputLimit}
+	}
+	return runGitCaptured(ctx, repo, extraEnv, stdin, outputLimit, true, args...)
+}
+
+func runGitCaptured(ctx context.Context, repo string, extraEnv []string, stdin []byte, outputLimit int, isolateConfig bool, args ...string) ([]byte, error) {
 	remote := len(args) > 0 && args[0] == "ls-remote"
 	timeout := localGitCommandTimeout
 	if remote {
@@ -910,13 +1069,21 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 	command := gitCommandContext(commandContext, "git", append([]string{"--no-replace-objects", "-C", repo}, args...)...)
 	command.Cancel = nil
 	command.WaitDelay = gitCommandWaitDelay
-	command.Env = sanitizedGitEnvironment(os.Environ(), extraEnv)
+	command.Env = sanitizedGitEnvironmentForRun(os.Environ(), extraEnv, isolateConfig)
 	if stdin != nil {
 		command.Stdin = bytes.NewReader(stdin)
 	}
-	var buffer bytes.Buffer
-	command.Stdout, command.Stderr = &buffer, &buffer
-	release, err := startGitProcessTree(command)
+	var combined bytes.Buffer
+	var stdout, stderr *boundedGitOutput
+	if outputLimit > 0 {
+		stdout = &boundedGitOutput{limit: outputLimit}
+		stderr = &boundedGitOutput{limit: 64 << 10}
+		command.Stdout, command.Stderr = stdout, stderr
+	} else {
+		command.Stdout, command.Stderr = &combined, &combined
+	}
+	release, startErr := gitProcessTreeStarter(command)
+	err := startErr
 	if err == nil {
 		released := make(chan struct{})
 		stopRelease := context.AfterFunc(commandContext, func() { _ = release(); close(released) })
@@ -934,7 +1101,10 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 		_ = command.Process.Kill()
 		_ = command.Wait()
 	}
-	output := buffer.Bytes()
+	output, diagnostic := combined.Bytes(), combined.Bytes()
+	if stdout != nil {
+		output, diagnostic = stdout.Bytes(), stderr.Bytes()
+	}
 	if errors.Is(err, exec.ErrWaitDelay) && commandContext.Err() == nil {
 		err = nil
 	}
@@ -949,6 +1119,9 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 				Args: append([]string{}, args...), Timeout: timeout, Remote: remote, Aggregate: aggregate, Cause: cause,
 			}
 		}
+		if startErr != nil {
+			return nil, &GitProcessControlError{Args: append([]string{}, args...), Cause: startErr}
+		}
 		exitCode := -1
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -956,13 +1129,43 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 		}
 		return nil, &GitCommandError{
 			Args: append([]string{}, args...), ExitCode: exitCode, Remote: remote, Cause: err,
-			Output: strings.TrimSpace(string(output)),
+			Output: strings.TrimSpace(string(diagnostic)),
 		}
+	}
+	if stdout != nil && stdout.exceeded {
+		return nil, &GitOutputLimitError{Args: append([]string{}, args...), Limit: outputLimit}
 	}
 	return output, nil
 }
 
+type boundedGitOutput struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (output *boundedGitOutput) Write(payload []byte) (int, error) {
+	written := len(payload)
+	remaining := output.limit - output.buffer.Len()
+	if remaining > 0 {
+		if remaining > len(payload) {
+			remaining = len(payload)
+		}
+		_, _ = output.buffer.Write(payload[:remaining])
+	}
+	if len(payload) > remaining {
+		output.exceeded = true
+	}
+	return written, nil
+}
+
+func (output *boundedGitOutput) Bytes() []byte { return output.buffer.Bytes() }
+
 func sanitizedGitEnvironment(environment, extra []string) []string {
+	return sanitizedGitEnvironmentForRun(environment, extra, false)
+}
+
+func sanitizedGitEnvironmentForRun(environment, extra []string, isolateConfig bool) []string {
 	unsafe := map[string]struct{}{
 		"GIT_ALTERNATE_OBJECT_DIRECTORIES": {},
 		"GIT_CEILING_DIRECTORIES":          {},
@@ -985,7 +1188,9 @@ func sanitizedGitEnvironment(environment, extra []string) []string {
 	result := make([]string, 0, len(environment)+len(extra)+1)
 	for _, entry := range environment {
 		name, _, _ := strings.Cut(entry, "=")
-		if _, remove := unsafe[name]; !remove && name != "LC_ALL" {
+		_, remove := unsafe[name]
+		isolatedOverride := isolateConfig && (strings.HasPrefix(name, "GIT_CONFIG_") || strings.HasPrefix(name, "GIT_ATTR_") || name == "GIT_DIFF_OPTS")
+		if !remove && name != "LC_ALL" && !isolatedOverride {
 			result = append(result, entry)
 		}
 	}

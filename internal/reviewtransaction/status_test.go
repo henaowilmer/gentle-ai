@@ -2,10 +2,12 @@ package reviewtransaction
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -122,18 +124,43 @@ func TestInventoryAuthorityDistinguishesReleasedBusyAndMalformedLockTruth(t *tes
 				if err := os.WriteFile(lockPath, []byte(tt.content), 0o600); err != nil {
 					t.Fatal(err)
 				}
-			}
-			var held *storeLock
-			if tt.hold {
-				held, err = acquireStoreLock(lockPath)
-				if err != nil {
+			} else if tt.hold {
+				if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
-				defer held.release()
 			}
 			before, err := os.ReadFile(lockPath)
 			if err != nil {
 				t.Fatal(err)
+			}
+			var release func() error
+			if tt.hold {
+				if runtime.GOOS == "windows" {
+					file, openErr := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+					if openErr != nil {
+						t.Fatal(openErr)
+					}
+					locked, lockErr := tryLockFile(file)
+					if lockErr != nil || !locked {
+						t.Fatalf("hold advisory lock = %t, %v", locked, lockErr)
+					}
+					release = func() error { return errors.Join(unlockFile(file), file.Close()) }
+				} else {
+					held, lockErr := acquireStoreLock(lockPath)
+					if lockErr != nil {
+						t.Fatal(lockErr)
+					}
+					before, err = os.ReadFile(lockPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					release = held.release
+				}
+				defer func() {
+					if release != nil {
+						_ = release()
+					}
+				}()
 			}
 			report, err := InventoryAuthority(context.Background(), repo)
 			if err != nil {
@@ -142,6 +169,10 @@ func TestInventoryAuthorityDistinguishesReleasedBusyAndMalformedLockTruth(t *tes
 			if len(report.Locks) != 1 || report.Locks[0].Status != tt.want || report.Locks[0].Owner != nil ||
 				report.Complete != tt.complete || (report.Locks[0].Problem != "") != tt.wantProblem {
 				t.Fatalf("lock report = %#v", report)
+			}
+			if release != nil {
+				_ = release()
+				release = nil
 			}
 			after, err := os.ReadFile(lockPath)
 			if err != nil {
@@ -189,7 +220,11 @@ func TestInventoryAuthorityRejectsStructurallyValidReceiptsThatMismatchTerminalA
 				t.Helper()
 				_, store, receipt := approvedCompactCurrentChangesFixture(t, repo, "compact-stale-receipt", []string{})
 				receipt.PolicyHash = "sha256:" + strings.Repeat("a", 64)
-				if err := WriteCompactReceiptAtomic(store.ReceiptPath(), receipt); err != nil {
+				payload, err := json.MarshalIndent(receipt, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(store.ReceiptPath(), append(payload, '\n'), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -330,6 +365,95 @@ func TestInventoryAuthorityReportsRecoveredInvalidatedSuccessorAndSupersededPred
 	if !report.Complete || !report.Authoritative || !hasAuthorityInventoryStatus(report.Entries, predecessor.LineageID, AuthorityStatusSuperseded) ||
 		!hasAuthorityInventoryStatus(report.Entries, successor.LineageID, AuthorityStatusRecovered) {
 		t.Fatalf("invalidated recovery report = %#v", report)
+	}
+}
+
+func TestInventoryAuthorityKeepsReceiptlessTerminalLegacyChainReadableAsHistorical(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transaction, _, _ := nativeGateFixture(t, repo, "legacy-pre-receipt")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	root, _, err := reviewAuthorityRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := authorityBytes(t, root)
+
+	report, err := InventoryAuthority(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Complete || !report.Authoritative || report.Status != AuthorityStatusHistorical ||
+		!hasAuthorityInventoryStatus(report.Entries, "legacy-pre-receipt", AuthorityStatusHistorical) {
+		t.Fatalf("receiptless terminal legacy report = %#v", report)
+	}
+	for _, entry := range report.Entries {
+		if entry.LineageID == "legacy-pre-receipt" && len(entry.Problems) != 0 {
+			t.Fatalf("historical entry reported problems = %#v", entry.Problems)
+		}
+	}
+	if after := authorityBytes(t, root); !reflect.DeepEqual(before, after) {
+		t.Fatal("read-only authority inventory changed authority bytes")
+	}
+}
+
+func TestInventoryAuthorityKeepsPresentButMalformedLegacyReceiptInvalid(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transaction, _, _ := nativeGateFixture(t, repo, "legacy-corrupt-receipt")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	receiptPath := filepath.Join(store.Dir, "artifacts", "receipt.json")
+	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, []byte("{broken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := InventoryAuthority(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Complete || report.Authoritative || report.Status != AuthorityStatusInvalid ||
+		!hasAuthorityInventoryStatus(report.Entries, "legacy-corrupt-receipt", AuthorityStatusInvalid) {
+		t.Fatalf("malformed present receipt report = %#v", report)
+	}
+}
+
+func TestInventoryAuthorityKeepsNonTerminalReceiptlessLegacyChainActive(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transaction, _, _ := nativeGateFixture(t, repo, "legacy-open-review")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewing := transaction
+	reviewing.LensResults = nil
+	for _, lens := range supportedLenses {
+		setLensCounter(&reviewing.Counters, lens, 0)
+	}
+	reviewing.State = StateReviewing
+	reviewing.LedgerHash = ""
+	reviewing.EvidenceHash = ""
+	reviewing.Release = nil
+	reviewing.Counters.FinalVerifications = 0
+	if _, err := store.Append("", Record{Operation: "review/start", Transaction: reviewing}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := InventoryAuthority(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Complete || !report.Authoritative ||
+		!hasAuthorityInventoryStatus(report.Entries, "legacy-open-review", AuthorityStatusActive) {
+		t.Fatalf("non-terminal receiptless legacy report = %#v", report)
 	}
 }
 

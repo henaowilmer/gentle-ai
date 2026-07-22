@@ -2,6 +2,7 @@ package assets
 
 import (
 	"encoding/json"
+	"io/fs"
 	"regexp"
 	"strings"
 	"testing"
@@ -49,13 +50,15 @@ func TestOrchestratorsRequireNonSkippableGeneralDelegationTriggers(t *testing.T)
 			"stage every reviewed path",
 			"without changing content or mode",
 			"gentle-ai review validate --gate pre-commit --cwd <repo>",
+			"--lineage <known-lineage>",
 			"before push, PR, or release",
 			"content-bound receipt",
 			"gentle-ai review validate --gate <gate> --cwd <repo>",
-			"facade discover authority and artifacts",
+			"same exact `--lineage`",
+			"Never fall back to inventory discovery",
 			"launch a lens",
 			"Judgment Day",
-			"new budget at the gate",
+			"new budget at a repeated gate",
 		)(lifecycleLine) {
 			t.Fatalf("%s lifecycle gate must validate the existing receipt without launching a lens, Judgment Day, or a new budget: %q", path, lifecycleLine)
 		}
@@ -77,6 +80,15 @@ func TestOrchestratorsRequireNonSkippableGeneralDelegationTriggers(t *testing.T)
 			"`review/start(target)`",
 		)(freshReviewLine) {
 			t.Fatalf("%s fresh review rule must bind adversarial review to one explicit review/start target: %q", path, freshReviewLine)
+		}
+	}
+}
+
+func TestOrchestratorLifecycleGatesRetainKnownLineage(t *testing.T) {
+	for _, agent := range []string{"antigravity", "claude", "codex", "cursor", "gemini", "generic", "hermes", "kimi", "kiro", "opencode", "qwen", "windsurf"} {
+		content := MustRead(agent + "/sdd-orchestrator.md")
+		if !strings.Contains(content, "--lineage <known-lineage>") || strings.Contains(content, "Let the facade discover authority") {
+			t.Errorf("%s orchestrator does not retain exact lineage", agent)
 		}
 	}
 }
@@ -396,13 +408,96 @@ func TestOpenCodeEmbeddedAssetLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir(opencode/plugins) error = %v", err)
 	}
-	if len(pluginEntries) != 2 {
-		t.Fatalf("opencode plugins count = %d, want 2", len(pluginEntries))
+	if len(pluginEntries) != 3 {
+		t.Fatalf("opencode plugins count = %d, want 3", len(pluginEntries))
 	}
-	wantPlugins := map[string]bool{"model-variants.ts": true, "skill-registry.ts": true}
+	wantPlugins := map[string]bool{"model-variants.ts": true, "review-result-artifacts.ts": true, "skill-registry.ts": true}
 	for _, entry := range pluginEntries {
 		if !wantPlugins[entry.Name()] {
 			t.Fatalf("unexpected plugin entry = %q", entry.Name())
+		}
+	}
+}
+
+func TestReviewResultArtifactsPluginContract(t *testing.T) {
+	source, err := Read("opencode/plugins/review-result-artifacts.ts")
+	if err != nil {
+		t.Fatalf("Read(review-result-artifacts.ts) error = %v", err)
+	}
+	for _, want := range []string{
+		`spawn("gentle-ai"`,
+		`"review", "capture-result"`,
+		`"review", "preserve-result"`,
+		`"--repository-context", binding.repository_context`,
+		`"--expected-revision", binding.revision`,
+		`return ["--cwd", cwd]`,
+		`const current = fields === "lens,lineage,order,repository_context,revision,subject_hash,target"`,
+		`typeof subject.subject_hash !== "string"`,
+		`subject.subject_hash !== binding.subject_hash`,
+		`const FROZEN_CONTEXT = "GENTLE_AI_FROZEN_CANDIDATE_CONTEXT "`,
+		`artifact_subject`,
+		`candidate_diff`,
+		`changed_path_manifest`,
+		`output.args.prompt = await injectReviewerContext(`,
+		`"--lineage", binding.lineage`,
+		`"--target", binding.target`,
+		`"--lens", binding.lens`,
+		`"--order", String(binding.order)`,
+		`"--input", "-"`,
+		`"--preflight"`,
+		`GENTLE_AI_REVIEW_CWD`,
+		`"tool.execute.before"`,
+		`output.args.background === true`,
+		`!BINDING.test(input.args.prompt)`,
+		`const lens = input.args.subagent_type`,
+		`const binding = parseBinding(input.args.prompt, lens)`,
+		`const cwd = captureCwd(worktree, directory)`,
+		// The replayable payload is extracted exactly once before capture, so a
+		// capture failure preserves the extracted strict JSON, never the task
+		// envelope that `review capture-result --input` would reject on replay.
+		`result = reviewerResult(output.output)`,
+		`output.output = await captureResult(cwd, binding, result)`,
+		`throw await preservedCaptureFailure(cwd, binding, result, cause)`,
+		// Envelope extraction itself can fail; only then is the raw envelope
+		// preserved, under a distinct extraction-failure cause.
+		`throw await preservedCaptureFailure(cwd, binding, output.output, cause)`,
+		`function sessionErrorMessage(binding: ReviewBinding, cause: unknown, code: string): string`,
+		`sessionErrorMessage(binding, cause, "repository_context_preflight_failed")`,
+		`parsed.reference`,
+		`raw reviewer result preserved for recovery`,
+		`raw reviewer result could not be preserved`,
+		// The previously conflated empty/nested-envelope branch must throw two
+		// distinct, machine-readable classified errors instead of one free-text
+		// message, and the plugin must thread that class into --class.
+		`"reviewer task result is empty"`,
+		`"reviewer task result contains a nested task envelope"`,
+		`reviewClass`,
+		`extractionClass(cause)`,
+		`"--class"`,
+		// Double failure (capture and preserve both failed) must embed the
+		// bounded raw payload in the thrown error so the transcript retains it.
+		`raw reviewer result follows for manual recovery`,
+		`PRESERVE_EMBED_LIMIT`,
+		// An older installed gentle-ai without --preflight must degrade
+		// gracefully instead of hard-blocking every bound lens launch.
+		`flag provided but not defined`,
+		`export default ReviewResultArtifactsPlugin`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("review-result-artifacts.ts missing %q", want)
+		}
+	}
+	if strings.Contains(source, `.slice("review-".length)`) {
+		t.Fatal("review-result-artifacts.ts must preserve the exact full selected lens; found review- prefix stripping")
+	}
+	// Pin the split: the previously conflated empty/nested-envelope message
+	// must never regress back into one indistinguishable free-text throw.
+	if strings.Contains(source, `reviewer task result is empty or contains a nested envelope`) {
+		t.Fatal("review-result-artifacts.ts regressed to the conflated empty/nested-envelope error message")
+	}
+	for _, forbidden := range []string{"writeFile", "link(", "chmod(", "createHash", "export {", "export const"} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("review-result-artifacts.ts must delegate native persistence; found %q", forbidden)
 		}
 	}
 }
@@ -717,6 +812,77 @@ func TestOpenCodeSDDOrchestratorPreflightDoesNotUseVisibleCodesOrCanonicalUIValu
 	}
 }
 
+func TestClaudeSDDWorkflowRequiresSessionPreflight(t *testing.T) {
+	content := MustRead("claude/sdd-orchestrator-workflow.md")
+
+	for _, required := range []string{
+		"### SDD Session Preflight (HARD GATE)",
+		"Before executing ANY SDD command or natural-language SDD request",
+		"**Execution mode**",
+		"**Artifact store**",
+		"**Chained PR strategy**",
+		"**Review budget**",
+		"`openspec/config.yaml`, existing SDD artifacts, previous `sdd-init` results, or installed SDD assets do NOT satisfy session preflight",
+		"Use the built-in `AskUserQuestion` tool for SDD Session Preflight",
+		"Do NOT render the full preflight menu as plain chat text",
+		"Ask all four preflight groups in one single `AskUserQuestion` tool call",
+		"Do NOT run this as a sequential wizard",
+		"Do NOT issue four separate `AskUserQuestion` tool calls",
+		"Match the user's current language and active persona",
+		"Do NOT show option codes",
+		"Do NOT show canonical values",
+		"map the selected human labels to canonical values internally",
+		"1. Pace: Interactive, Automatic.",
+		"2. Artifacts: OpenSpec, Engram, Both.",
+		"3. PRs: Ask me, Single PR, Chained, Auto.",
+		"4. Review: 400 lines, 800 lines, Other.",
+		"### SDD Entry Routing (MANDATORY)",
+		"Never launch `sdd-apply` just because the user asked to implement a feature",
+		"Only launch `sdd-apply` when all are true",
+		"If any dependency is missing, STOP and propose `/sdd-new` or `/sdd-ff`; do not implement",
+		"or `hybrid` when Engram is callable",
+		"Both -> `hybrid`",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("claude/sdd-orchestrator-workflow.md missing required preflight wording %q", required)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"`question` tool",
+		"groups as tabs",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("claude/sdd-orchestrator-workflow.md must use Claude Code's AskUserQuestion mechanics, not OpenCode wording %q", forbidden)
+		}
+	}
+
+	if strings.Contains(content, "`both`") {
+		t.Fatal("claude/sdd-orchestrator-workflow.md must not use `both` as a canonical artifact-store value; the Claude asset vocabulary is `hybrid` end to end (Dispatcher Guard, Artifact Store Policy/Mode)")
+	}
+
+	for _, section := range []string{"### Execution Mode", "### Artifact Store Mode"} {
+		idx := strings.Index(content, section)
+		if idx < 0 {
+			t.Fatalf("claude/sdd-orchestrator-workflow.md missing section %q", section)
+		}
+		body := content[idx+len(section):]
+		if end := strings.Index(body, "\n### "); end >= 0 {
+			body = body[:end]
+		}
+		if !strings.Contains(body, "This is collected by `SDD Session Preflight`") {
+			t.Fatalf("claude/sdd-orchestrator-workflow.md section %q must state its value is collected by SDD Session Preflight instead of independently re-asking", section)
+		}
+	}
+
+	preflight := strings.Index(content, "### SDD Session Preflight (HARD GATE)")
+	routing := strings.Index(content, "### SDD Entry Routing (MANDATORY)")
+	initGuard := strings.Index(content, "### SDD Init Guard (MANDATORY)")
+	if !(preflight < routing && routing < initGuard) {
+		t.Fatalf("claude/sdd-orchestrator-workflow.md section order must be preflight (%d) < entry routing (%d) < init guard (%d)", preflight, routing, initGuard)
+	}
+}
+
 func TestSDDFFCommandsHonorInteractiveMode(t *testing.T) {
 	for _, path := range []string{
 		"opencode/commands/sdd-ff.md",
@@ -861,6 +1027,33 @@ func TestNonClaudeSDDOrchestratorChainStrategyParity(t *testing.T) {
 	}
 }
 
+func TestSDDOrchestratorsUseTheZeroHelpNativeTransitionBootstrap(t *testing.T) {
+	paths := []string{
+		"antigravity/sdd-orchestrator.md", "claude/sdd-orchestrator.md", "codex/sdd-orchestrator.md",
+		"cursor/sdd-orchestrator.md", "gemini/sdd-orchestrator.md", "generic/sdd-orchestrator.md",
+		"hermes/sdd-orchestrator.md", "kimi/sdd-orchestrator.md", "kiro/sdd-orchestrator.md",
+		"opencode/sdd-orchestrator.md", "qwen/sdd-orchestrator.md", "windsurf/sdd-orchestrator.md",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			content := MustRead(path)
+			for _, required := range []string{
+				"gentle-ai review status --cwd <repo> --contract gentle-ai.review-integration/v1 --next-transition",
+				"native_next_transition", "gentle-ai review capabilities --contract gentle-ai.review-integration/v1", "unsupported-capability",
+				"parent orchestrator alone executes only the exact native `next_transition`", "never infer flags, construct authorization or bindings, or call `gentle-ai ... --help`",
+				"Reviewers, validators, executors, and refuters receive role inputs and return artifacts; they never call review lifecycle commands",
+			} {
+				if !strings.Contains(content, required) {
+					t.Fatalf("%s missing native transition routing guard %q", path, required)
+				}
+			}
+			if strings.Contains(content, "gentle-ai review --help") || strings.Contains(content, "gentle-ai --help") {
+				t.Fatalf("%s suggests help-based lifecycle exploration", path)
+			}
+		})
+	}
+}
+
 func TestPlatformNativeSDDOrchestratorsAvoidOpenCodePersistenceClaims(t *testing.T) {
 	tests := []struct {
 		path     string
@@ -974,6 +1167,21 @@ func TestGentlemanLanguageInstructionsDoNotBiasEnglishSessions(t *testing.T) {
 				if !strings.Contains(content, required) {
 					t.Fatalf("%s missing output-style guardrail %q", path, required)
 				}
+			}
+		})
+	}
+
+	orchestratorPaths, err := fs.Glob(FS, "*/sdd-orchestrator.md")
+	if err != nil {
+		t.Fatalf("glob SDD orchestrator assets: %v", err)
+	}
+	if len(orchestratorPaths) == 0 {
+		t.Fatal("no SDD orchestrator assets found")
+	}
+	for _, path := range orchestratorPaths {
+		t.Run(path, func(t *testing.T) {
+			if strings.Contains(MustRead(path), "haceme un SDD para X") {
+				t.Fatalf("%s still contains a Spanish example that biases English sessions", path)
 			}
 		})
 	}
@@ -1277,6 +1485,10 @@ func TestSDDStatusContractMatchesNativeShape(t *testing.T) {
 		"relationships:",
 		"dependsOn: []",
 		"sameDomainActiveChanges: []",
+		"runtimeStatus:",
+		"active_attempt:",
+		"decision_required: false",
+		"next_action: begin | finish | reset | complete",
 		"phaseInstructions:",
 		"blockedReasons: []",
 		"Manual fallback status MUST stay shape-compatible with native `gentle-ai.sdd-status` JSON",
@@ -1523,6 +1735,54 @@ func TestOrchestratorsRequireAutomaticGatekeeper(t *testing.T) {
 	}
 }
 
+func TestSDDOrchestratorsUseNativeRuntimeAttemptAuthority(t *testing.T) {
+	paths := []string{
+		"antigravity/sdd-orchestrator.md",
+		"claude/sdd-orchestrator.md",
+		"codex/sdd-orchestrator.md",
+		"cursor/sdd-orchestrator.md",
+		"gemini/sdd-orchestrator.md",
+		"generic/sdd-orchestrator.md",
+		"hermes/sdd-orchestrator.md",
+		"kimi/sdd-orchestrator.md",
+		"kiro/sdd-orchestrator.md",
+		"opencode/sdd-orchestrator.md",
+		"qwen/sdd-orchestrator.md",
+		"windsurf/sdd-orchestrator.md",
+	}
+	required := []string{
+		"Native Runtime Attempt Authority",
+		"gentle-ai sdd-attempt status",
+		"gentle-ai sdd-attempt begin",
+		"gentle-ai sdd-attempt finish",
+		"gentle-ai sdd-attempt reset",
+		"decision_required",
+		"expected-binding-revision",
+		"successor-lineage",
+		"remediates-evidence-revision",
+	}
+	for _, path := range paths {
+		content := MustRead(path)
+		if path == "claude/sdd-orchestrator.md" {
+			content += "\n" + MustRead("claude/sdd-orchestrator-workflow.md")
+		}
+		for _, want := range required {
+			if !strings.Contains(content, want) {
+				t.Fatalf("%s missing native runtime-attempt authority wording %q", path, want)
+			}
+		}
+		for _, forbidden := range []string{
+			"gentle-ai.sdd-attempt-ledger/v1",
+			"attempt-ledger-{work-unit}.json",
+			"sdd/{change-name}/attempt-ledger",
+		} {
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("%s still delegates native authority to mutable artifact %q", path, forbidden)
+			}
+		}
+	}
+}
+
 func TestSDDOrchestratorsRouteFreshReviewsToConcreteReviewLenses(t *testing.T) {
 	t.Run("rejects lifecycle gates that reopen review", func(t *testing.T) {
 		weakContent := `### Mandatory Delegation Triggers (Non-Skippable)
@@ -1647,11 +1907,13 @@ func boundedReviewRoutingProblems(content string) []string {
 				"before push, PR, or release",
 				"content-bound receipt",
 				"gentle-ai review validate --gate pre-commit --cwd <repo>",
+				"--lineage <known-lineage>",
 				"gentle-ai review validate --gate <gate> --cwd <repo>",
-				"facade discover authority and artifacts",
+				"same exact `--lineage`",
+				"Never fall back to inventory discovery",
 				"never launch a lens",
 				"Judgment Day",
-				"new budget at the gate",
+				"new budget at a repeated gate",
 				"stage every reviewed path",
 				"without changing content or mode",
 			),

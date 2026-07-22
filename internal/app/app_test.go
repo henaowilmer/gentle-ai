@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -24,39 +25,6 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/update"
 	"github.com/gentleman-programming/gentle-ai/internal/update/upgrade"
 )
-
-func tomlSection(text, header string) string {
-	start := strings.Index(text, header)
-	if start == -1 {
-		return ""
-	}
-	section := text[start+len(header):]
-	if next := strings.Index(section, "\n["); next != -1 {
-		section = section[:next]
-	}
-	return section
-}
-
-func assertCodexWorkspaceWriteRulesScoped(t *testing.T, text string) {
-	t.Helper()
-
-	rootFilesystem := tomlSection(text, `[permissions.gentle-dev.filesystem]`)
-	for _, rule := range []string{`"." = "write"`, `".git/**" = "write"`} {
-		if strings.Contains(rootFilesystem, rule) {
-			t.Fatalf("root filesystem table contains workspace write rule %q; got:\n%s", rule, rootFilesystem)
-		}
-	}
-
-	scopedFilesystem := tomlSection(text, `[permissions.gentle-dev.filesystem.":workspace_roots"]`)
-	if scopedFilesystem == "" {
-		t.Fatalf("config.toml missing workspace-scoped filesystem table; got:\n%s", text)
-	}
-	for _, rule := range []string{`"." = "write"`, `".git/**" = "write"`} {
-		if !strings.Contains(scopedFilesystem, rule) {
-			t.Fatalf("workspace-scoped filesystem table missing workspace write rule %q; got:\n%s", rule, scopedFilesystem)
-		}
-	}
-}
 
 // TestListBackupsNewestFirst verifies that ListBackups returns manifests sorted
 // newest-first by CreatedAt timestamp, matching the spec "newest first" ordering.
@@ -256,6 +224,31 @@ func TestRunArgsUninstallBypassesPlatformValidation(t *testing.T) {
 	// If we got here, uninstall bypassed the platform validation.
 }
 
+func TestRunArgsUninstallReportsBackupOnFailure(t *testing.T) {
+	home := t.TempDir()
+	setupMockHome(t, home)
+	t.Chdir(t.TempDir())
+
+	statePath := state.Path(home)
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	err := RunArgs([]string{"uninstall", "--agent", "codex", "--yes"}, &output)
+	if err == nil || !strings.Contains(err.Error(), "read install state") {
+		t.Fatalf("RunArgs(uninstall) error = %v, want install state read failure", err)
+	}
+	for _, want := range []string{"Backup:", "Backup path:"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("RunArgs(uninstall) output missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
 func TestRunArgsInstallHelpPrintsInstallSpecificHelp(t *testing.T) {
 	origEnsure := ensureCurrentOSSupported
 	t.Cleanup(func() { ensureCurrentOSSupported = origEnsure })
@@ -297,6 +290,25 @@ func TestRunArgsSDDStatusIsDispatchedBeforePlatformValidation(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "## SDD Status: add-auth") {
 		t.Fatalf("sdd-status output missing markdown status:\n%s", buf.String())
+	}
+}
+
+func TestRunArgsSDDAttemptIsDispatchedBeforePlatformValidation(t *testing.T) {
+	origEnsure := ensureCurrentOSSupported
+	t.Cleanup(func() { ensureCurrentOSSupported = origEnsure })
+	ensureCurrentOSSupported = func() error { return fmt.Errorf("unsupported platform") }
+
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-q", root)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	var buf bytes.Buffer
+	if err := RunArgs([]string{"sdd-attempt", "status", "--cwd", root, "--change", "app-attempt"}, &buf); err != nil {
+		t.Fatalf("RunArgs(sdd-attempt) error = %v", err)
+	}
+	if !strings.Contains(buf.String(), `"schema": "gentle-ai.sdd-runtime-status/v1"`) || !strings.Contains(buf.String(), `"change": "app-attempt"`) {
+		t.Fatalf("sdd-attempt output missing native status:\n%s", buf.String())
 	}
 }
 
@@ -371,8 +383,12 @@ func TestRunArgsDispatchesCompactReviewFacadeBeforePlatformValidation(t *testing
 	if err := RunArgs([]string{"review", "--help"}, &output); err != nil {
 		t.Fatalf("RunArgs(review --help) error = %v", err)
 	}
-	if !strings.Contains(output.String(), "review <capabilities|start|finalize|validate|status|invalidate|recover|schema|bind-sdd>") {
+	if !strings.Contains(output.String(), "review <capabilities|start|finalize|validate|status|repair|invalidate|abandon|recover|reclaim|inspect-authority|reconcile-authority|reconcile-authority-batch|dispose-result|reopen-results|quarantine-legacy|quarantine-legacy-fix-scope|repair-legacy-alias|schema|bind-sdd>") {
 		t.Fatalf("compact review help missing:\n%s", output.String())
+	}
+	output.Reset()
+	if err := RunArgs([]string{"review", "repair", "--help"}, &output); err != nil || !strings.Contains(output.String(), "provider-owned") {
+		t.Fatalf("RunArgs(review repair --help) = %v\n%s", err, output.String())
 	}
 }
 
@@ -535,7 +551,7 @@ func TestTUIExecutePersistsConfiguredSelection(t *testing.T) {
 	}
 }
 
-func TestTuiSyncIncludesCodexPermissions(t *testing.T) {
+func TestTuiSyncRemovesCodexGentleDevProfile(t *testing.T) {
 	t.Cleanup(codex.SetRuntimeVersionCommandForTest("codex-cli 0.144.0", nil))
 	home := t.TempDir()
 	if err := state.Write(home, state.InstallState{InstalledAgents: []string{string(model.AgentCodex)}}); err != nil {
@@ -545,7 +561,10 @@ func TestTuiSyncIncludesCodexPermissions(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	initial := `[permissions.gentle-dev.filesystem]
+	initial := `model = "gpt-5.5"
+default_permissions = "gentle-dev"
+
+[permissions.gentle-dev.filesystem]
 ":slash_tmp" = "write"
 ":tmpdir" = "write"
 
@@ -562,7 +581,7 @@ func TestTuiSyncIncludesCodexPermissions(t *testing.T) {
 		t.Fatalf("tuiSync Codex permissions error: %v", err)
 	}
 	if len(changed) == 0 {
-		t.Fatal("tuiSync Codex permissions changed 0 files, want config.toml updated")
+		t.Fatal("tuiSync Codex permissions changed 0 files, want config.toml cleaned")
 	}
 
 	body, err := os.ReadFile(configPath)
@@ -570,37 +589,26 @@ func TestTuiSyncIncludesCodexPermissions(t *testing.T) {
 		t.Fatalf("ReadFile(%s): %v", configPath, err)
 	}
 	text := string(body)
-	if !strings.Contains(text, `[permissions.gentle-dev.filesystem]`) || !strings.Contains(text, `":minimal" = "read"`) || !strings.Contains(text, `":tmpdir" = "write"`) || !strings.Contains(text, `":slash_tmp" = "write"`) || !strings.Contains(text, `[permissions.gentle-dev.filesystem.":workspace_roots"]`) || !strings.Contains(text, `"**/*.key" = "deny"`) {
-		t.Fatalf("Codex permissions sync should add valid filesystem reads; got:\n%s", text)
+	if strings.Contains(text, "gentle-dev") {
+		t.Fatalf("Codex permissions sync should remove the gentle-dev profile; got:\n%s", text)
 	}
-	assertCodexWorkspaceWriteRulesScoped(t, text)
-	rootFilesystem := tomlSection(text, `[permissions.gentle-dev.filesystem]`)
-	if strings.Contains(rootFilesystem, `"**/*.key" = "deny"`) || strings.Contains(rootFilesystem, `"**/*.pem" = "deny"`) {
-		t.Fatalf("Codex root filesystem table should not contain secret glob denies; got:\n%s", rootFilesystem)
-	}
-	for _, invalid := range []string{`"**/.git" = "write"`, `"**/.git/**" = "write"`} {
-		if strings.Contains(text, invalid) {
-			t.Fatalf("Codex permissions sync should remove invalid entry %q; got:\n%s", invalid, text)
-		}
+	if !strings.Contains(text, `model = "gpt-5.5"`) {
+		t.Fatalf("Codex permissions sync should preserve user config; got:\n%s", text)
 	}
 
-	changed, err = tuiSync(home)(nil)
-	if err != nil {
+	if _, err := tuiSync(home)(nil); err != nil {
 		t.Fatalf("second tuiSync Codex permissions error: %v", err)
 	}
-	body, err = os.ReadFile(configPath)
+	second, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("ReadFile(%s) after second sync: %v", configPath, err)
 	}
-	text = string(body)
-	for _, invalid := range []string{`"**/.git" = "write"`, `"**/.git/**" = "write"`} {
-		if strings.Contains(text, invalid) {
-			t.Fatalf("second sync should keep invalid entry %q removed; got:\n%s", invalid, text)
-		}
+	if string(second) != text {
+		t.Fatalf("second sync modified cleaned config:\nfirst:\n%s\nsecond:\n%s", text, second)
 	}
 }
 
-func TestTuiSyncIncludesCodexPermissionsForTargetedOverrides(t *testing.T) {
+func TestTuiSyncRemovesCodexGentleDevProfileForTargetedOverrides(t *testing.T) {
 	t.Cleanup(codex.SetRuntimeVersionCommandForTest("codex-cli 0.144.0", nil))
 	home := t.TempDir()
 	if err := state.Write(home, state.InstallState{InstalledAgents: []string{string(model.AgentPi)}}); err != nil {
@@ -610,7 +618,10 @@ func TestTuiSyncIncludesCodexPermissionsForTargetedOverrides(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	initial := `[permissions.gentle-dev.filesystem]
+	initial := `model = "gpt-5.5"
+approval_policy = "on-request"
+
+[permissions.gentle-dev.filesystem]
 ":slash_tmp" = "write"
 ":tmpdir" = "write"
 
@@ -631,18 +642,11 @@ func TestTuiSyncIncludesCodexPermissionsForTargetedOverrides(t *testing.T) {
 		t.Fatalf("ReadFile(%s): %v", configPath, err)
 	}
 	text := string(body)
-	if !strings.Contains(text, `":minimal" = "read"`) || !strings.Contains(text, `":tmpdir" = "write"`) || !strings.Contains(text, `":slash_tmp" = "write"`) || !strings.Contains(text, `[permissions.gentle-dev.workspace_roots]`) || !strings.Contains(text, `[permissions.gentle-dev.filesystem.":workspace_roots"]`) || !strings.Contains(text, `"**/*.key" = "deny"`) {
-		t.Fatalf("targeted sync should add valid Codex permissions profile; got:\n%s", text)
+	if strings.Contains(text, "gentle-dev") || strings.Contains(text, `approval_policy = "on-request"`) {
+		t.Fatalf("targeted sync should remove the injected Codex permissions profile; got:\n%s", text)
 	}
-	assertCodexWorkspaceWriteRulesScoped(t, text)
-	rootFilesystem := tomlSection(text, `[permissions.gentle-dev.filesystem]`)
-	if strings.Contains(rootFilesystem, `"**/*.key" = "deny"`) {
-		t.Fatalf("targeted sync root filesystem table should not contain secret glob denies; got:\n%s", rootFilesystem)
-	}
-	for _, invalid := range []string{`"**/.git" = "write"`, `"**/.git/**" = "write"`} {
-		if strings.Contains(text, invalid) {
-			t.Fatalf("targeted sync should remove invalid entry %q; got:\n%s", invalid, text)
-		}
+	if !strings.Contains(text, `model = "gpt-5.5"`) {
+		t.Fatalf("targeted sync should preserve user config; got:\n%s", text)
 	}
 }
 
@@ -1935,7 +1939,7 @@ func TestRunArgs_PendingSync_RunsSyncAndClearsFlag(t *testing.T) {
 	}
 }
 
-func TestRunArgsPendingSyncRepairsCodexPermissions(t *testing.T) {
+func TestRunArgsPendingSyncCleansCodexPermissions(t *testing.T) {
 	t.Cleanup(codex.SetRuntimeVersionCommandForTest("codex-cli 0.144.0", nil))
 	home := t.TempDir()
 	setupMockHome(t, home)
@@ -1950,7 +1954,10 @@ func TestRunArgsPendingSyncRepairsCodexPermissions(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	initial := `[permissions.gentle-dev.filesystem]
+	initial := `model = "gpt-5.5"
+default_permissions = "gentle-dev"
+
+[permissions.gentle-dev.filesystem]
 ":slash_tmp" = "write"
 ":tmpdir" = "write"
 
@@ -1994,18 +2001,11 @@ func TestRunArgsPendingSyncRepairsCodexPermissions(t *testing.T) {
 		t.Fatalf("ReadFile(%s): %v", configPath, err)
 	}
 	text := string(body)
-	if !strings.Contains(text, `":minimal" = "read"`) || !strings.Contains(text, `":tmpdir" = "write"`) || !strings.Contains(text, `":slash_tmp" = "write"`) || !strings.Contains(text, `[permissions.gentle-dev.workspace_roots]`) || !strings.Contains(text, `[permissions.gentle-dev.filesystem.":workspace_roots"]`) || !strings.Contains(text, `"**/*.key" = "deny"`) {
-		t.Fatalf("deferred sync should add valid Codex permissions profile; got:\n%s", text)
+	if strings.Contains(text, "gentle-dev") {
+		t.Fatalf("deferred sync should remove the gentle-dev profile; got:\n%s", text)
 	}
-	assertCodexWorkspaceWriteRulesScoped(t, text)
-	rootFilesystem := tomlSection(text, `[permissions.gentle-dev.filesystem]`)
-	if strings.Contains(rootFilesystem, `"**/*.key" = "deny"`) || strings.Contains(rootFilesystem, `"**/*.pem" = "deny"`) {
-		t.Fatalf("deferred sync root filesystem table should not contain secret glob denies; got:\n%s", rootFilesystem)
-	}
-	for _, invalid := range []string{`"**/.git" = "write"`, `"**/.git/**" = "write"`} {
-		if strings.Contains(text, invalid) {
-			t.Fatalf("deferred sync should remove invalid entry %q; got:\n%s", invalid, text)
-		}
+	if !strings.Contains(text, `model = "gpt-5.5"`) {
+		t.Fatalf("deferred sync should preserve user config; got:\n%s", text)
 	}
 
 	s, err := state.Read(home)
