@@ -27,15 +27,16 @@ const (
 type TargetStatusAction string
 
 const (
-	TargetStatusActionStart             TargetStatusAction = "start"
-	TargetStatusActionFinalize          TargetStatusAction = "finalize"
-	TargetStatusActionValidate          TargetStatusAction = "validate"
-	TargetStatusActionRecover           TargetStatusAction = "recover"
-	TargetStatusActionMaintainer        TargetStatusAction = "maintainer_action"
-	TargetStatusActionSelectLineage     TargetStatusAction = "select_lineage"
-	TargetStatusActionRepairAuthority   TargetStatusAction = "repair_authority"
-	TargetStatusActionReconcileFinalize TargetStatusAction = "reconcile_finalize"
-	TargetStatusActionStop              TargetStatusAction = "stop"
+	TargetStatusActionStart                  TargetStatusAction = "start"
+	TargetStatusActionFinalize               TargetStatusAction = "finalize"
+	TargetStatusActionValidate               TargetStatusAction = "validate"
+	TargetStatusActionRecover                TargetStatusAction = "recover"
+	TargetStatusActionRetryFinalVerification TargetStatusAction = "retry_final_verification"
+	TargetStatusActionMaintainer             TargetStatusAction = "maintainer_action"
+	TargetStatusActionSelectLineage          TargetStatusAction = "select_lineage"
+	TargetStatusActionRepairAuthority        TargetStatusAction = "repair_authority"
+	TargetStatusActionReconcileFinalize      TargetStatusAction = "reconcile_finalize"
+	TargetStatusActionStop                   TargetStatusAction = "stop"
 )
 
 type Replayability string
@@ -67,23 +68,25 @@ type TargetProjectionStatus struct {
 }
 
 type TargetStatusResult struct {
-	Applicability        TargetApplicability    `json:"applicability"`
-	AuthorityVersion     AuthorityVersion       `json:"authority_version,omitempty"`
-	LineageID            string                 `json:"lineage_id,omitempty"`
-	State                State                  `json:"state,omitempty"`
-	Generation           int                    `json:"generation,omitempty"`
-	Revision             string                 `json:"revision,omitempty"`
-	ReceiptIdentity      string                 `json:"receipt_identity,omitempty"`
-	Action               TargetStatusAction     `json:"action"`
-	ActionDisposition    RecoveryDisposition    `json:"action_disposition,omitempty"`
-	Replayability        Replayability          `json:"replayability"`
-	OriginalChangedLines int                    `json:"original_changed_lines,omitempty"`
-	Tier                 RiskLevel              `json:"tier,omitempty"`
-	CorrectionBudget     int                    `json:"correction_budget,omitempty"`
-	SelectedLenses       []string               `json:"selected_lenses,omitempty"`
-	TargetIdentity       string                 `json:"target_identity"`
-	Projection           TargetProjectionStatus `json:"projection"`
-	CandidateLineageIDs  []string               `json:"candidate_lineage_ids"`
+	Applicability           TargetApplicability                `json:"applicability"`
+	AuthorityVersion        AuthorityVersion                   `json:"authority_version,omitempty"`
+	LineageID               string                             `json:"lineage_id,omitempty"`
+	State                   State                              `json:"state,omitempty"`
+	Generation              int                                `json:"generation,omitempty"`
+	Revision                string                             `json:"revision,omitempty"`
+	ReceiptIdentity         string                             `json:"receipt_identity,omitempty"`
+	Action                  TargetStatusAction                 `json:"action"`
+	ActionDisposition       RecoveryDisposition                `json:"action_disposition,omitempty"`
+	Replayability           Replayability                      `json:"replayability"`
+	OriginalChangedLines    int                                `json:"original_changed_lines,omitempty"`
+	Tier                    RiskLevel                          `json:"tier,omitempty"`
+	CorrectionBudget        int                                `json:"correction_budget,omitempty"`
+	SelectedLenses          []string                           `json:"selected_lenses,omitempty"`
+	TargetIdentity          string                             `json:"target_identity"`
+	AuthorityTargetIdentity string                             `json:"authority_target_identity,omitempty"`
+	Projection              TargetProjectionStatus             `json:"projection"`
+	CandidateLineageIDs     []string                           `json:"candidate_lineage_ids"`
+	FinalVerificationRetry  *FinalVerificationRetryEligibility `json:"final_verification_retry,omitempty"`
 }
 
 type targetStatusCandidate struct {
@@ -94,13 +97,15 @@ type targetStatusCandidate struct {
 	legacyStore        *Store
 	receiptIdentity    string
 	receiptPublished   bool
+	receiptCanonical   bool
 	receiptReplayable  bool
 	pendingFinalize    bool
 	correctionRecovery bool
 	// recoveryDisposition names the `review recover --disposition` value the
 	// recovery rules accept for this candidate. It is only set when the
 	// recommended action is recovery; guidance never invents a disposition.
-	recoveryDisposition RecoveryDisposition
+	recoveryDisposition    RecoveryDisposition
+	finalVerificationRetry *FinalVerificationRetryEligibility
 }
 
 // AssessTargetStatus classifies the selected live Git projection against
@@ -120,7 +125,7 @@ func AssessTargetStatusWithSnapshot(ctx context.Context, repo string, request Ta
 			return TargetStatusResult{}, Snapshot{}, err
 		}
 	}
-	live, err := (SnapshotBuilder{Repo: repo}).Build(ctx, request.Target)
+	live, err := (SnapshotBuilder{Repo: repo}).BuildStoredSnapshot(ctx, request.Target)
 	if err != nil {
 		return TargetStatusResult{}, Snapshot{}, err
 	}
@@ -147,6 +152,27 @@ func assessTargetStatusSnapshot(ctx context.Context, repo string, request Target
 			continue
 		}
 		state := candidate.compact.State
+		if state.State == StateInvalidated && state.InitialSnapshot.Kind == TargetBaseWorkspaceOverlay &&
+			state.InitialSnapshot.Projection == ProjectionStaged && live.Kind == TargetBaseWorkspaceOverlay &&
+			live.Projection == ProjectionStaged && state.InitialSnapshot.BaseTree == live.BaseTree &&
+			live.Identity != state.CurrentSnapshot.Identity &&
+			(compactLiveTargetMatchesValidatedSnapshot(state, live, false) || compactRecoveryAddsGenesisPath(state, live)) {
+			candidate.correctionRecovery, candidate.recoveryDisposition = true, RecoveryInvalidated
+			candidates = append(candidates, candidate)
+			continue
+		}
+		if state.State == StateApproved && candidate.receiptPublished && candidate.receiptCanonical {
+			eligible, eligibilityErr := compactApprovedStagedScopeRecovery(ctx, repo, state, live)
+			if eligibilityErr != nil {
+				return targetStatusFailure(base, eligibilityErr)
+			}
+			if eligible {
+				candidate.correctionRecovery = true
+				candidate.recoveryDisposition = RecoveryScopeChanged
+				candidates = append(candidates, candidate)
+				continue
+			}
+		}
 		if state.State == StateEscalated {
 			requested := state
 			requested.InitialSnapshot = live
@@ -154,6 +180,10 @@ func assessTargetStatusSnapshot(ctx context.Context, repo string, request Target
 				candidate.correctionRecovery = compactEscalatedRecoveryTargetChanged(state.CurrentSnapshot, live)
 				if candidate.correctionRecovery {
 					candidate.recoveryDisposition = RecoveryEscalated
+				} else if eligibility, ok, inspectErr := InspectCompactFinalVerificationRetrySource(ctx, repo, state.LineageID, candidate.compact.Revision); inspectErr != nil {
+					return targetStatusFailure(base, inspectErr)
+				} else if ok {
+					candidate.finalVerificationRetry = &eligibility
 				}
 				candidates = append(candidates, candidate)
 				continue
@@ -225,8 +255,10 @@ func assessTargetStatusSnapshot(ctx context.Context, repo string, request Target
 	switch len(candidates) {
 	case 0:
 		base.Applicability = TargetApplicabilityUnrelated
-		base.Action = TargetStatusActionStart
-		base.Replayability = ReplayabilityNotReplayable
+		base.Action, base.Replayability = TargetStatusActionStart, ReplayabilityNotReplayable
+		if live.Kind == TargetBaseWorkspaceOverlay && live.Projection == ProjectionStaged {
+			base.Action, base.Replayability = TargetStatusActionStop, ReplayabilityManualActionRequired
+		}
 		return base, nil
 	case 1:
 		return targetStatusForCandidate(base, candidates[0]), nil
@@ -256,12 +288,20 @@ func targetStatusForCandidate(result TargetStatusResult, candidate targetStatusC
 		record := *candidate.compact
 		state := record.State
 		result.State, result.Generation, result.Revision = state.State, state.Generation, record.Revision
+		result.AuthorityTargetIdentity = state.CurrentSnapshot.Identity
 		result.OriginalChangedLines, result.Tier, result.CorrectionBudget = state.OriginalChangedLines, state.RiskLevel, state.CorrectionBudget
 		result.SelectedLenses = append([]string{}, state.SelectedLenses...)
 		result.Projection = targetProjectionFromCompact(state, result.Projection)
 		result.ReceiptIdentity = candidate.receiptIdentity
 		if candidate.pendingFinalize {
 			result.Action, result.Replayability = TargetStatusActionReconcileFinalize, ReplayabilityStatusRequired
+			return result
+		}
+		if candidate.finalVerificationRetry != nil {
+			eligibility := *candidate.finalVerificationRetry
+			result.FinalVerificationRetry = &eligibility
+			result.Action, result.Replayability = TargetStatusActionRetryFinalVerification, ReplayabilityManualActionRequired
+			result.ActionDisposition = RecoveryFinalVerificationRetry
 			return result
 		}
 		if candidate.correctionRecovery {

@@ -22,9 +22,10 @@ const ReviewIntegrationFailureSchema = "gentle-ai.review-integration.failure/v1"
 const ReviewIntegrationFailureSchemaID = "https://gentle-ai.dev/contracts/review-integration/v1/schemas/failure.schema.json"
 
 const (
-	ReviewIntegrationOperationFinalize = "review.finalize"
-	ReviewIntegrationOperationValidate = "review.validate"
-	ReviewIntegrationOperationBindSDD  = "review.bind_sdd"
+	ReviewIntegrationOperationFinalize               = "review.finalize"
+	ReviewIntegrationOperationValidate               = "review.validate"
+	ReviewIntegrationOperationBindSDD                = "review.bind_sdd"
+	ReviewIntegrationOperationRetryFinalVerification = "review.retry_final_verification"
 )
 
 type reviewIntegrationOperationMetadata struct {
@@ -48,7 +49,8 @@ var reviewIntegrationOperationRegistry = []reviewIntegrationOperationMetadata{
 	{Command: "capabilities", Operation: "review.capabilities", Label: "Review CAPABILITIES"},
 	{Command: "finalize", Operation: ReviewIntegrationOperationFinalize, Label: "Review FINALIZE", ValueFlags: []string{"cwd", "lineage", "validation", "refuter", "evidence", "trace", "result"}, BoolFlags: []string{"failed"}, IntFlags: []string{"correction-lines"}, MutatesAuthority: true},
 	{Command: "repair", Operation: "review.repair", Label: "Review REPAIR", ValueFlags: []string{"cwd", "class", "lineage", "expected-revision", "cause", "disposition", "repository-binding", "actor", "reason", "maintainer-authorization"}, BoolFlags: []string{"preflight"}, MutatesAuthority: true, JoinOnTimeout: true, ReadOnlyFlag: "preflight"},
-	{Command: "start", Operation: "review.start", Label: "Review START", ValueFlags: []string{"cwd", "lineage", "policy", "focus", "base-ref", "projection", "trace"}, BoolFlags: []string{"committed-only", "workspace-overlay"}, MutatesAuthority: true},
+	{Command: "retry-final-verification", Operation: ReviewIntegrationOperationRetryFinalVerification, Label: "Review RETRY-FINAL-VERIFICATION", ValueFlags: []string{"cwd", "predecessor-lineage", "expected-predecessor-revision", "successor-lineage", "incident", "actor", "reason", "maintainer-authorization"}, MutatesAuthority: true, JoinOnTimeout: true},
+	{Command: "start", Operation: "review.start", Label: "Review START", ValueFlags: []string{"cwd", "target", "lineage", "policy", "focus", "base-ref", "projection", "trace"}, BoolFlags: []string{"committed-only", "workspace-overlay"}, MutatesAuthority: true},
 	{Command: "status", Operation: "review.status", Label: "Review STATUS", ValueFlags: []string{"cwd", "lineage", "projection", "base-ref", "base-tree", "gate", "recovery-successor-lineage", "recovery-reason", "recovery-actor", "recovery-authorization", "repair-actor", "repair-reason", "repair-authorization"}, BoolFlags: []string{"workspace-overlay", "action-eligibility", "next-transition"}},
 	{Command: "validate", Operation: ReviewIntegrationOperationValidate, Label: "Review VALIDATE", ValueFlags: []string{"cwd", "lineage", "gate", "base-ref", "pre-pr-ci-attestation", "policy", "release-configuration", "release-generated", "release-provenance", "release-publication-boundary", "release-evidence-freshness"}},
 }
@@ -232,6 +234,19 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		Replayability: reviewtransaction.ReplayabilityStatusRequired, RequiredInputs: []string{}, NextAction: "review.status",
 	}
 	failure.LineageID = safeReviewIntegrationLineage(operation, args)
+	var retryDenied *reviewtransaction.FinalVerificationRetryDeniedError
+	if errors.As(runErr, &retryDenied) {
+		failure.Phase = "pre_native"
+		failure.Code = "final_verification_retry_denied"
+		failure.Message = "The final-verification retry did not satisfy the exact provider-owned admission boundary."
+		failure.MutationOutcome = ReviewMutationNotStarted
+		failure.AuthorityApplicability = "current_target"
+		failure.RetrySafe = false
+		failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
+		failure.RequiredInputs = []string{}
+		failure.NextAction = "stop"
+		return failure
+	}
 	var bindingConflict *sddstatus.BindingRevisionConflictError
 	if errors.As(runErr, &bindingConflict) {
 		failure.Phase = "pre_native"
@@ -468,6 +483,19 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		}
 		return failure
 	}
+	var targetResolution *reviewtransaction.GateTargetResolutionError
+	if errors.As(runErr, &targetResolution) {
+		failure.Phase = "pre_native"
+		failure.Code = "target_resolution_failed"
+		failure.Message = "The pre-push target cannot be resolved; configure an upstream or pass --base-ref <remote>/<branch>."
+		failure.MutationOutcome = ReviewMutationNotStarted
+		failure.AuthorityApplicability = "not_evaluated"
+		failure.RetrySafe = true
+		failure.Replayability = reviewtransaction.ReplayabilityNotReplayable
+		failure.RequiredInputs = []string{"base_ref"}
+		failure.NextAction = "correct_request"
+		return failure
+	}
 	var denied ReviewGateDeniedError
 	if errors.As(runErr, &denied) {
 		failure.Phase = "preflight"
@@ -598,6 +626,9 @@ func safeReviewIntegrationLineage(operation string, args []string) string {
 		return ""
 	}
 	value := values["lineage"]
+	if operation == ReviewIntegrationOperationRetryFinalVerification {
+		value = values["predecessor-lineage"]
+	}
 	if !validReviewIntegrationLineage(value) {
 		return ""
 	}
@@ -846,7 +877,7 @@ func validOptionalReviewSHA256(value string) bool {
 
 func supportedReviewIntegrationFailureInput(input string) bool {
 	switch input {
-	case "lineage_id", "change", "expected_binding_revision", "predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor":
+	case "lineage_id", "change", "expected_binding_revision", "predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor", "incident", "maintainer_authorization", "base_ref":
 		return true
 	default:
 		return false
@@ -1000,6 +1031,14 @@ func (result ReviewIntegrationOperationResult) Validate() error {
 			!validReviewCapabilitySHA256(binding.Revision) || !validReviewCapabilitySHA256(binding.AuthorityRevision) ||
 			!validReviewCapabilitySHA256(binding.ReceiptHash) || binding.GateContext.Gate != reviewtransaction.GatePostApply {
 			return errors.New("negotiated bind-sdd result is incomplete")
+		}
+	case ReviewIntegrationOperationRetryFinalVerification:
+		var retried ReviewFinalVerificationRetryResult
+		if err := decodeStrictReviewIntegrationResult(result.Result, &retried); err != nil {
+			return err
+		}
+		if err := retried.Validate(); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("unsupported negotiated review operation %q", result.Operation)
